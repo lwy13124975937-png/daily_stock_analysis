@@ -69,6 +69,12 @@ class AccountPage:
     counts: dict[str, int]
 
 
+@dataclass(frozen=True)
+class MarkdownSection:
+    heading: str
+    body: str
+
+
 def _load_markdown_renderer():
     """Prefer the project's existing renderer, then fall back to markdown2."""
     if str(ROOT_DIR) not in sys.path:
@@ -176,13 +182,25 @@ def _account_items(groups: dict, allowed_types: set[str] | None = None) -> list[
     if not isinstance(groups, dict):
         return []
     items: list[dict] = []
-    for asset_type in TYPE_ORDER:
+    ordered_types = list(TYPE_ORDER)
+    for asset_type in groups:
+        if asset_type not in ordered_types:
+            ordered_types.append(asset_type)
+    for asset_type in ordered_types:
         if allowed_types is not None and asset_type not in allowed_types:
             continue
         type_items = groups.get(asset_type, []) or []
         if isinstance(type_items, list):
             items.extend(item for item in type_items if isinstance(item, dict))
     return items
+
+
+def _ordered_account_names(accounts: dict) -> list[str]:
+    if not isinstance(accounts, dict):
+        return []
+    ordered = [account for account in ACCOUNT_ORDER if account in accounts]
+    ordered.extend(account for account in accounts if account not in ordered)
+    return ordered
 
 
 def _latest_report(pages: list[ReportPage], kind: str) -> ReportPage | None:
@@ -226,10 +244,58 @@ def _is_global_ai_heading(text: str) -> bool:
     return any(keyword in compact for keyword in GLOBAL_SECTION_KEYWORDS)
 
 
+def _clean_heading_text(text: str) -> str:
+    return re.sub(r"[*_`~]+", "", text or "").strip()
+
+
+def _markdown_sections(markdown_text: str) -> list[MarkdownSection]:
+    sections: list[MarkdownSection] = []
+    current_heading = ""
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        body = "\n".join(current_lines).strip()
+        if current_heading or body:
+            sections.append(MarkdownSection(current_heading, body))
+
+    for line in markdown_text.splitlines():
+        heading = _heading_text(line)
+        if heading is not None:
+            flush()
+            current_heading = _clean_heading_text(heading)
+            current_lines = []
+            continue
+        current_lines.append(line)
+
+    flush()
+    return sections
+
+
+def _short_paragraphs(text: str) -> list[str]:
+    paragraphs = [block.strip() for block in re.split(r"\n\s*\n", text or "") if block.strip()]
+    if paragraphs:
+        return paragraphs
+    return [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+
+def _holding_name_code_pairs(holdings: list[dict] | None) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for item in holdings or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        code = str(item.get("code", "") or "").strip()
+        if name and code:
+            pairs.append((name, code))
+    return pairs
+
+
 def _append_ai_snippet(by_code: dict[str, list[str]], code: str, snippet: str) -> None:
     text = snippet.strip()
-    if not text or len(text) > MAX_AI_SNIPPET_CHARS:
+    if not text:
         return
+    if len(text) > MAX_AI_SNIPPET_CHARS:
+        text = text[:MAX_AI_SNIPPET_CHARS].rstrip() + "..."
     if re.fullmatch(r"[\s|:：\-]+", text):
         return
     existing = by_code.setdefault(code, [])
@@ -238,72 +304,81 @@ def _append_ai_snippet(by_code: dict[str, list[str]], code: str, snippet: str) -
     existing.append(text)
 
 
-def _extract_ai_snippets(markdown_text: str) -> dict[str, list[str]]:
-    by_code: dict[str, list[str]] = {}
-
-    current_section_code: str | None = None
-    current_section_is_global = False
-    paragraph_lines: list[str] = []
-
-    def flush_paragraph() -> None:
-        nonlocal paragraph_lines
-        paragraph = "\n".join(line.strip() for line in paragraph_lines if line.strip()).strip()
-        paragraph_lines = []
-        if not paragraph or current_section_is_global:
-            return
-
+def _append_section_snippets(
+    by_code: dict[str, list[str]],
+    code: str,
+    body: str,
+    *,
+    allow_code_less_paragraphs: bool,
+) -> None:
+    for paragraph in _short_paragraphs(body):
         codes = _codes_in_text(paragraph)
         if len(codes) > 1:
-            return
-        if len(codes) == 1:
-            code = codes[0]
-            if current_section_code and code != current_section_code:
-                return
-            _append_ai_snippet(by_code, code, paragraph)
-            return
-        if current_section_code:
-            _append_ai_snippet(by_code, current_section_code, paragraph)
+            continue
+        if len(codes) == 1 and codes[0] != code:
+            continue
+        if len(codes) == 0 and not allow_code_less_paragraphs:
+            continue
+        _append_ai_snippet(by_code, code, paragraph)
 
-    for line in markdown_text.splitlines():
-        heading = _heading_text(line)
-        if heading is not None:
-            flush_paragraph()
-            heading_codes = _codes_in_text(heading)
-            current_section_code = heading_codes[0] if len(heading_codes) == 1 else None
-            current_section_is_global = current_section_code is None and _is_global_ai_heading(heading)
+
+def _extract_ai_snippets(markdown_text: str, holdings: list[dict] | None = None) -> dict[str, list[str]]:
+    by_code: dict[str, list[str]] = {}
+    name_code_pairs = _holding_name_code_pairs(holdings)
+
+    for section in _markdown_sections(markdown_text):
+        heading = section.heading
+        body = section.body
+        heading_codes = _codes_in_text(heading)
+        if len(heading_codes) == 1:
+            _append_section_snippets(
+                by_code,
+                heading_codes[0],
+                body,
+                allow_code_less_paragraphs=True,
+            )
+            continue
+        if heading_codes or _is_global_ai_heading(heading):
             continue
 
-        if not line.strip():
-            flush_paragraph()
+        body_codes = _codes_in_text(body)
+        matched = [
+            code
+            for name, code in name_code_pairs
+            if name and name in heading and code in body_codes
+        ]
+        if len(set(matched)) == 1:
+            _append_section_snippets(
+                by_code,
+                matched[0],
+                body,
+                allow_code_less_paragraphs=True,
+            )
             continue
 
-        paragraph_lines.append(line)
+        for paragraph in _short_paragraphs(body):
+            codes = _codes_in_text(paragraph)
+            if len(codes) == 1:
+                _append_ai_snippet(by_code, codes[0], paragraph)
 
-    flush_paragraph()
     return by_code
 
 
 def _extract_ai_summary_items(markdown_text: str) -> dict[str, list[str]]:
     by_code: dict[str, list[str]] = {}
-    in_summary = False
-
-    for line in markdown_text.splitlines():
-        heading = _heading_text(line)
-        if heading is not None:
-            in_summary = "分析结果摘要" in re.sub(r"\s+", "", heading)
+    for section in _markdown_sections(markdown_text):
+        if "分析结果摘要" not in re.sub(r"\s+", "", section.heading):
             continue
-        if not in_summary:
-            continue
-
-        stripped = line.strip()
-        if not stripped:
-            continue
-        item = re.sub(r"^[-*+]\s+", "", stripped)
-        item = re.sub(r"^\d+[.)、]\s+", "", item)
-        codes = _codes_in_text(item)
-        if len(codes) != 1:
-            continue
-        _append_ai_snippet(by_code, codes[0], item)
+        for line in section.body.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            item = re.sub(r"^[-*+]\s+", "", stripped)
+            item = re.sub(r"^\d+[.)、]\s+", "", item)
+            codes = _codes_in_text(item)
+            if len(codes) != 1:
+                continue
+            _append_ai_snippet(by_code, codes[0], item)
 
     return by_code
 
@@ -327,7 +402,7 @@ def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
 
 def _render_text_snippets(snippets: list[str], code: str) -> str:
     if not snippets:
-        return '<p class="muted">暂无单项 AI 分析，仅展示持仓清单。</p>'
+        return '<p class="muted">AI 暂未输出该标的分析，仅展示持仓清单。</p>'
     rendered = []
     for snippet in snippets:
         safe_text = escape(_sanitize_ai_snippet_for_holding(snippet, code))
@@ -576,9 +651,28 @@ def _render_unmatched_ai_details(unmatched: dict[str, list[str]]) -> str:
 """
 
 
-def _holding_analysis_card(item: dict, snippets_by_code: dict[str, list[str]]) -> str:
+def _render_summary_fallback(summary_by_code: dict[str, list[str]], code: str) -> str:
+    summaries = summary_by_code.get(code, [])
+    if not summaries:
+        return '<p class="muted">AI 暂未输出该标的分析，仅展示持仓清单。</p>'
+    snippets = []
+    for summary in summaries[:MAX_AI_SNIPPETS_PER_CODE]:
+        detail = _summary_detail_text(summary, code)
+        snippets.append(f'<pre class="ai-snippet">{escape(detail)}</pre>')
+    return (
+        '<p class="muted">暂无完整单项分析，以下为 AI 摘要：</p>'
+        + "".join(snippets)
+    )
+
+
+def _holding_analysis_card(
+    item: dict,
+    snippets_by_code: dict[str, list[str]],
+    summary_by_code: dict[str, list[str]],
+) -> str:
     name = str(item.get("name", "") or "-")
     code = str(item.get("code", "") or "-")
+    account = str(item.get("account", "") or "")
     asset_type = str(item.get("type", "") or "")
     label = TYPE_LABELS.get(asset_type, asset_type or "-")
     if asset_type == "otc":
@@ -586,10 +680,12 @@ def _holding_analysis_card(item: dict, snippets_by_code: dict[str, list[str]]) -
             '<p class="note">场外基金暂未接入股票日报分析。本页仅展示来自 '
             "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
         )
-    else:
+    elif snippets_by_code.get(code):
         analysis = _render_text_snippets(snippets_by_code.get(code, []), code)
+    else:
+        analysis = _render_summary_fallback(summary_by_code, code)
     return f"""
-<article class="holding-item">
+<article class="holding-item" data-account="{escape(account, quote=True)}" data-code="{escape(code, quote=True)}" data-type="{escape(asset_type, quote=True)}">
   <h4>{escape(name)}</h4>
   <p class="muted">代码：{escape(code)} ｜ 类型：{escape(label)}</p>
   <div>{analysis}</div>
@@ -597,10 +693,17 @@ def _holding_analysis_card(item: dict, snippets_by_code: dict[str, list[str]]) -
 """
 
 
-def _render_holding_cards(items: list[dict], snippets_by_code: dict[str, list[str]]) -> str:
+def _render_holding_cards(
+    items: list[dict],
+    snippets_by_code: dict[str, list[str]],
+    summary_by_code: dict[str, list[str]],
+) -> str:
     if not items:
         return '<p class="muted">暂无持仓。</p>'
-    return "".join(_holding_analysis_card(item, snippets_by_code) for item in items)
+    return "".join(
+        _holding_analysis_card(item, snippets_by_code, summary_by_code)
+        for item in items
+    )
 
 
 def _render_account_summary(
@@ -609,27 +712,29 @@ def _render_account_summary(
     summary_by_code: dict[str, list[str]],
 ) -> str:
     rows = []
-    seen: set[str] = set()
     for item in items:
         code = str(item.get("code", "") or "").strip()
-        if not code or code in seen:
-            continue
-        seen.add(code)
-        summaries = summary_by_code.get(code, [])
-        if not summaries:
-            continue
         name = str(item.get("name", "") or "-")
-        for summary in summaries[:MAX_AI_SNIPPETS_PER_CODE]:
-            detail = _summary_detail_text(summary, code)
-            rows.append(
-                "<li>"
-                f"<strong>{escape(name)}（{escape(code)}）</strong>：{escape(detail)}"
-                "</li>"
+        asset_type = str(item.get("type", "") or "")
+        label = TYPE_LABELS.get(asset_type, asset_type or "-")
+        summaries = summary_by_code.get(code, [])
+        if asset_type == "otc":
+            detail = "场外基金暂未接入股票日报分析，仅展示持仓清单。"
+        elif summaries:
+            detail = "；".join(
+                _summary_detail_text(summary, code)
+                for summary in summaries[:MAX_AI_SNIPPETS_PER_CODE]
             )
-    if rows:
-        body = f'<ul class="link-list">{"".join(rows)}</ul>'
-    else:
-        body = '<p class="muted">暂无该账户摘要项。</p>'
+        else:
+            detail = "AI摘要缺失"
+        rows.append(
+            f'<li class="summary-item" data-account="{escape(account, quote=True)}" '
+            f'data-code="{escape(code, quote=True)}" data-type="{escape(asset_type, quote=True)}">'
+            f"<strong>{escape(name)}（{escape(code)}）</strong>"
+            f" <span class=\"muted\">{escape(label)}</span>：{escape(detail)}"
+            "</li>"
+        )
+    body = f'<ul class="link-list">{"".join(rows)}</ul>' if rows else '<p class="muted">暂无持仓。</p>'
     return f"""
 <section class="panel">
   <h3>{escape(account)}分析结果摘要</h3>
@@ -653,35 +758,7 @@ def _render_standard_account_section(
     {_render_account_summary(account, items, summary_by_code)}
     <section class="panel">
       <h3>{escape(account)}持仓明细与分析</h3>
-      {_render_holding_cards(items, snippets_by_code)}
-    </section>
-  </div>
-</details>
-"""
-
-
-def _render_alipay_account_section(
-    account: str,
-    groups: dict,
-    snippets_by_code: dict[str, list[str]],
-    is_open: bool,
-) -> str:
-    items = _account_items(groups, {"otc"})
-    note = (
-        "场外基金暂未接入股票日报分析。本页仅展示来自 stock-dashboard 的最新持仓清单，"
-        "后续可接入基金净值、重仓行业和基金经理复盘。"
-    )
-    return f"""
-<details {"open" if is_open else ""}>
-  <summary>{escape(account)}</summary>
-  <div class="details-body">
-    <section class="panel">
-      <h3>{escape(account)}基金复盘说明</h3>
-      <p class="note">{escape(note)}</p>
-    </section>
-    <section class="panel">
-      <h3>{escape(account)}场外基金清单</h3>
-      {_render_holding_cards(items, snippets_by_code)}
+      {_render_holding_cards(items, snippets_by_code, summary_by_code)}
     </section>
   </div>
 </details>
@@ -694,38 +771,37 @@ def _build_holding_report_page(
     raw_report_html: str,
     snapshot: dict,
 ) -> str:
-    snippets_by_code = _extract_ai_snippets(markdown_text)
+    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+    account_names = _ordered_account_names(accounts)
+    all_holdings: list[dict] = []
+    if isinstance(accounts, dict):
+        for account in account_names:
+            groups = accounts.get(account, {})
+            all_holdings.extend(_account_items(groups))
+
+    snippets_by_code = _extract_ai_snippets(markdown_text, all_holdings)
     summary_by_code = _extract_ai_summary_items(markdown_text)
     snapshot_codes = _all_snapshot_codes(snapshot)
-    unmatched = {
-        code: snippets
-        for code, snippets in snippets_by_code.items()
-        if code not in snapshot_codes
-    }
-    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+    unmatched: dict[str, list[str]] = {}
+    for source in (summary_by_code, snippets_by_code):
+        for code, snippets in source.items():
+            if code in snapshot_codes:
+                continue
+            for snippet in snippets:
+                _append_ai_snippet(unmatched, code, snippet)
 
     sections = []
-    for account in ACCOUNT_ORDER:
+    for idx, account in enumerate(account_names):
         groups = accounts.get(account, {}) if isinstance(accounts, dict) else {}
         if not isinstance(groups, dict):
             groups = {}
-        if account == "支付宝":
-            sections.append(
-                _render_alipay_account_section(
-                    account,
-                    groups,
-                    snippets_by_code,
-                    account == ACCOUNT_ORDER[0],
-                )
-            )
-            continue
         sections.append(
             _render_standard_account_section(
                 account,
                 groups,
                 summary_by_code,
                 snippets_by_code,
-                account == ACCOUNT_ORDER[0],
+                idx == 0,
             )
         )
 
