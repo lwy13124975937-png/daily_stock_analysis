@@ -480,8 +480,11 @@ jobs:
             python main.py $FORCE_RUN_ARG
           fi
 
+      - name: 检查有效股票日报
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'market-only' }}
+        run: python scripts/check_report_valid.py
+
       - name: 生成静态报告网页
-        if: always()
         run: python scripts/build_pages_report.py
 
       - name: 上传分析报告

@@ -25,7 +25,7 @@ import pandas as pd
 from src.config import FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT, get_config, Config
 from src.storage import get_db
 from data_provider import DataFetcherManager
-from data_provider.base import normalize_stock_code
+from data_provider.base import _is_etf_code, normalize_stock_code
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
@@ -265,6 +265,81 @@ class StockAnalysisPipeline:
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"{stock_name}({code}) {error_msg}")
             return False, error_msg
+
+    @staticmethod
+    def _is_exchange_traded_fund_code(code: str) -> bool:
+        try:
+            return _is_etf_code(normalize_stock_code(code))
+        except Exception:
+            return False
+
+    def _resolve_fallback_fund_name(self, code: str) -> str:
+        try:
+            name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
+            if name:
+                return str(name)
+        except Exception:
+            pass
+        return f"场内基金{normalize_stock_code(code)}"
+
+    def _build_exchange_fund_fallback_result(
+        self,
+        code: str,
+        *,
+        stock_name: Optional[str] = None,
+        reason: Optional[str] = None,
+        query_id: Optional[str] = None,
+        trend_result: Optional[TrendAnalysisResult] = None,
+    ) -> AnalysisResult:
+        """Return a successful placeholder for ETF/LOF codes when full analysis fails."""
+        normalized_code = normalize_stock_code(code)
+        report_language = normalize_report_language(getattr(self.config, "report_language", "zh"))
+        name = stock_name or self._resolve_fallback_fund_name(normalized_code)
+        summary = (
+            "该场内基金/ETF/LOF 本次未取得完整股票分析数据，已生成数据不足占位复盘。"
+            "后续可接入基金净值、跟踪指数、重仓行业和基金经理复盘。"
+        )
+        if trend_result is not None:
+            trend_label = self._trend_label_fallback(trend_result, report_language)
+        else:
+            trend_label = ""
+        result = AnalysisResult(
+            code=normalized_code,
+            name=name,
+            sentiment_score=50,
+            trend_prediction=trend_label or ("Data insufficient" if report_language == "en" else "数据不足"),
+            operation_advice="Watch" if report_language == "en" else "观望",
+            decision_type="hold",
+            confidence_level=localize_confidence_level("low", report_language),
+            report_language=report_language,
+            dashboard={
+                "intelligence": {
+                    "sentiment_summary": "基金专属数据暂未完整接入。",
+                    "earnings_outlook": "不适用，场内基金应关注净值、跟踪标的和持仓行业。",
+                },
+                "core_conclusion": {
+                    "one_sentence": summary,
+                    "time_sensitivity": "不急",
+                    "position_advice": {
+                        "no_position": "数据不足，暂不作为买入依据。",
+                        "has_position": "仅作持仓清单占位复盘，等待基金专属分析能力补齐。",
+                    },
+                },
+                "data_perspective": {
+                    "trend_status": {
+                        "ma_alignment": trend_label or "数据不足",
+                        "trend_strength": 0,
+                    }
+                },
+            },
+            analysis_summary=summary,
+            risk_warning="数据不足，占位内容不构成投资建议。",
+            data_sources="exchange_fund:fallback",
+            success=True,
+            error_message=reason,
+        )
+        result.query_id = query_id
+        return result
     
     def analyze_stock(
         self,
@@ -2242,6 +2317,19 @@ class StockAnalysisPipeline:
                         report_type=report_type,
                         fallback_code=code,
                     )
+            elif self._is_exchange_traded_fund_code(code):
+                reason = (
+                    result.error_message
+                    if result and result.error_message
+                    else "交易所基金完整分析未返回成功结果"
+                )
+                logger.warning("[%s] 场内基金/ETF/LOF 分析降级为占位结果: %s", code, reason)
+                result = self._build_exchange_fund_fallback_result(
+                    code,
+                    stock_name=getattr(result, "name", None) if result else None,
+                    reason=reason,
+                    query_id=effective_query_id,
+                )
             elif result:
                 logger.warning(
                     f"[{code}] 分析未成功: {result.error_message or '未知错误'}"
@@ -2252,6 +2340,13 @@ class StockAnalysisPipeline:
         except Exception as e:
             # 捕获所有异常，确保单股失败不影响整体
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
+            if self._is_exchange_traded_fund_code(code):
+                logger.warning("[%s] 场内基金/ETF/LOF 异常降级为占位结果: %s", code, e)
+                return self._build_exchange_fund_fallback_result(
+                    code,
+                    reason=str(e),
+                    query_id=effective_query_id,
+                )
             return None
         finally:
             reset_run_diagnostic_context(diag_token)

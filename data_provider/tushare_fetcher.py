@@ -41,9 +41,9 @@ logger = logging.getLogger(__name__)
 
 
 # ETF code prefixes by exchange
-# Shanghai: 51xxxx, 52xxxx, 56xxxx, 58xxxx
+# Shanghai: 50xxxx, 51xxxx, 52xxxx, 56xxxx, 58xxxx
 # Shenzhen: 15xxxx, 16xxxx, 18xxxx
-_ETF_SH_PREFIXES = ('51', '52', '56', '58')
+_ETF_SH_PREFIXES = ('50', '51', '52', '56', '58')
 _ETF_SZ_PREFIXES = ('15', '16', '18')
 _ETF_ALL_PREFIXES = _ETF_SH_PREFIXES + _ETF_SZ_PREFIXES
 
@@ -53,7 +53,7 @@ def _is_etf_code(stock_code: str) -> bool:
     Check if the code is an ETF fund code.
 
     ETF code ranges:
-    - Shanghai ETF: 51xxxx, 52xxxx, 56xxxx, 58xxxx
+    - Shanghai ETF/LOF: 50xxxx, 51xxxx, 52xxxx, 56xxxx, 58xxxx
     - Shenzhen ETF: 15xxxx, 16xxxx, 18xxxx
     """
     code = normalize_stock_code(stock_code)

@@ -100,7 +100,7 @@ def _is_etf_code(stock_code: str) -> bool:
     判断代码是否为 ETF 基金
     
     ETF 代码规则：
-    - 上交所 ETF: 51xxxx, 52xxxx, 56xxxx, 58xxxx
+    - 上交所 ETF/LOF: 50xxxx, 51xxxx, 52xxxx, 56xxxx, 58xxxx
     - 深交所 ETF: 15xxxx, 16xxxx, 18xxxx
     
     Args:
@@ -109,7 +109,7 @@ def _is_etf_code(stock_code: str) -> bool:
     Returns:
         True 表示是 ETF 代码，False 表示是普通股票代码
     """
-    etf_prefixes = ('51', '52', '56', '58', '15', '16', '18')
+    etf_prefixes = ('50', '51', '52', '56', '58', '15', '16', '18')
     code = stock_code.strip().split('.')[0]
     return code.startswith(etf_prefixes) and len(code) == 6
 

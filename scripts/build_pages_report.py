@@ -73,6 +73,14 @@ class AccountPage:
 class MarkdownSection:
     heading: str
     body: str
+    level: int = 0
+
+
+@dataclass(frozen=True)
+class MarkdownHeading:
+    line_index: int
+    level: int
+    text: str
 
 
 def _load_markdown_renderer():
@@ -230,11 +238,18 @@ def _codes_in_text(text: str) -> list[str]:
     return list(dict.fromkeys(CODE_RE.findall(text)))
 
 
-def _heading_text(line: str) -> str | None:
-    match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+def _heading_match(line: str) -> tuple[int, str] | None:
+    match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$", line)
     if not match:
         return None
-    return match.group(1).strip()
+    return len(match.group(1)), match.group(2).strip()
+
+
+def _heading_text(line: str) -> str | None:
+    heading = _heading_match(line)
+    if heading is None:
+        return None
+    return heading[1]
 
 
 def _is_global_ai_heading(text: str) -> bool:
@@ -248,21 +263,34 @@ def _clean_heading_text(text: str) -> str:
     return re.sub(r"[*_`~]+", "", text or "").strip()
 
 
+def _markdown_headings(markdown_text: str) -> list[MarkdownHeading]:
+    headings: list[MarkdownHeading] = []
+    for idx, line in enumerate(markdown_text.splitlines()):
+        heading = _heading_match(line)
+        if heading is None:
+            continue
+        level, text = heading
+        headings.append(MarkdownHeading(idx, level, _clean_heading_text(text)))
+    return headings
+
+
 def _markdown_sections(markdown_text: str) -> list[MarkdownSection]:
     sections: list[MarkdownSection] = []
     current_heading = ""
+    current_level = 0
     current_lines: list[str] = []
 
     def flush() -> None:
         body = "\n".join(current_lines).strip()
         if current_heading or body:
-            sections.append(MarkdownSection(current_heading, body))
+            sections.append(MarkdownSection(current_heading, body, current_level))
 
     for line in markdown_text.splitlines():
-        heading = _heading_text(line)
+        heading = _heading_match(line)
         if heading is not None:
             flush()
-            current_heading = _clean_heading_text(heading)
+            current_level, heading_text = heading
+            current_heading = _clean_heading_text(heading_text)
             current_lines = []
             continue
         current_lines.append(line)
@@ -290,12 +318,18 @@ def _holding_name_code_pairs(holdings: list[dict] | None) -> list[tuple[str, str
     return pairs
 
 
-def _append_ai_snippet(by_code: dict[str, list[str]], code: str, snippet: str) -> None:
+def _append_ai_snippet(
+    by_code: dict[str, list[str]],
+    code: str,
+    snippet: str,
+    *,
+    max_chars: int | None = MAX_AI_SNIPPET_CHARS,
+) -> None:
     text = snippet.strip()
     if not text:
         return
-    if len(text) > MAX_AI_SNIPPET_CHARS:
-        text = text[:MAX_AI_SNIPPET_CHARS].rstrip() + "..."
+    if max_chars is not None and len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "..."
     if re.fullmatch(r"[\s|:：\-]+", text):
         return
     existing = by_code.setdefault(code, [])
@@ -322,15 +356,125 @@ def _append_section_snippets(
         _append_ai_snippet(by_code, code, paragraph)
 
 
-def _extract_ai_snippets(markdown_text: str, holdings: list[dict] | None = None) -> dict[str, list[str]]:
+def _holding_code_from_title(text: str, name_code_pairs: list[tuple[str, str]]) -> str | None:
+    clean = _clean_heading_text(text)
+    codes = _codes_in_text(clean)
+    if len(codes) == 1:
+        return codes[0]
+    if codes:
+        return None
+    matches = [code for name, code in name_code_pairs if name and name in clean]
+    unique = list(dict.fromkeys(matches))
+    if len(unique) == 1:
+        return unique[0]
+    return None
+
+
+def _ordered_title_text(line: str) -> str | None:
+    match = re.match(r"^\s*\d+[.)、]\s+(.+?)\s*$", line)
+    if not match:
+        return None
+    title = _clean_heading_text(match.group(1))
+    # Numbered summary rows usually include a colon and should not become
+    # per-holding sections.
+    if "：" in title or ":" in title or "|" in title:
+        return None
+    return title
+
+
+def _append_full_markdown_section(
+    by_code: dict[str, list[str]],
+    code: str | None,
+    title: str,
+    lines: list[str],
+    start: int,
+    end: int,
+    name_code_pairs: list[tuple[str, str]],
+) -> None:
+    if code is None:
+        return
+    if _is_global_ai_heading(title):
+        return
+    section_text = "\n".join(lines[start:end]).strip()
+    if not section_text:
+        return
+    body_text = "\n".join(lines[start + 1:end]).strip()
+    if not _codes_in_text(title):
+        # Name-only headings must be confirmed by the body/nearby content.
+        if code not in _codes_in_text(body_text):
+            return
+    _append_ai_snippet(by_code, code, section_text, max_chars=None)
+
+
+def _extract_heading_sections(
+    markdown_text: str,
+    name_code_pairs: list[tuple[str, str]],
+) -> dict[str, list[str]]:
     by_code: dict[str, list[str]] = {}
+    lines = markdown_text.splitlines()
+    headings = _markdown_headings(markdown_text)
+
+    for pos, heading in enumerate(headings):
+        code = _holding_code_from_title(heading.text, name_code_pairs)
+        if code is None:
+            continue
+        end = len(lines)
+        for next_heading in headings[pos + 1:]:
+            if next_heading.level <= heading.level:
+                end = next_heading.line_index
+                break
+        _append_full_markdown_section(
+            by_code,
+            code,
+            heading.text,
+            lines,
+            heading.line_index,
+            end,
+            name_code_pairs,
+        )
+
+    ordered_indices: list[tuple[int, str, str]] = []
+    for idx, line in enumerate(lines):
+        title = _ordered_title_text(line)
+        if not title:
+            continue
+        code = _holding_code_from_title(title, name_code_pairs)
+        if code:
+            ordered_indices.append((idx, title, code))
+
+    heading_starts = [heading.line_index for heading in headings]
+    ordered_starts = [idx for idx, _, _ in ordered_indices]
+    for pos, (idx, title, code) in enumerate(ordered_indices):
+        end = len(lines)
+        later_boundaries = [
+            boundary
+            for boundary in heading_starts + ordered_starts[pos + 1:]
+            if boundary > idx
+        ]
+        if later_boundaries:
+            end = min(later_boundaries)
+        _append_full_markdown_section(
+            by_code,
+            code,
+            title,
+            lines,
+            idx,
+            end,
+            name_code_pairs,
+        )
+
+    return by_code
+
+
+def _extract_ai_snippets(markdown_text: str, holdings: list[dict] | None = None) -> dict[str, list[str]]:
     name_code_pairs = _holding_name_code_pairs(holdings)
+    by_code = _extract_heading_sections(markdown_text, name_code_pairs)
 
     for section in _markdown_sections(markdown_text):
         heading = section.heading
         body = section.body
         heading_codes = _codes_in_text(heading)
-        if len(heading_codes) == 1:
+        if len(heading_codes) == 1 and heading_codes[0] not in by_code:
             _append_section_snippets(
                 by_code,
                 heading_codes[0],
@@ -358,7 +502,7 @@ def _extract_ai_snippets(markdown_text: str, holdings: list[dict] | None = None)
 
         for paragraph in _short_paragraphs(body):
             codes = _codes_in_text(paragraph)
-            if len(codes) == 1:
+            if len(codes) == 1 and codes[0] not in by_code:
                 _append_ai_snippet(by_code, codes[0], paragraph)
 
     return by_code
