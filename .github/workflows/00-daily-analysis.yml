@@ -60,6 +60,13 @@ jobs:
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
+
+      - name: 生成持仓自选股列表
+        env:
+          MANUAL_STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
+          STOCK_LIST_FALLBACK: '600519'
+          HOLDINGS_DATA_URL: https://raw.githubusercontent.com/lwy13124975937-png/stock-dashboard/main/holdings_data.json
+        run: python scripts/build_stock_list_from_holdings.py
       
       - name: 执行股票分析
         env:
@@ -352,7 +359,6 @@ jobs:
           # ==========================================
           # 自选股配置
           # ==========================================
-          STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
           MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'cn' }}
           MARKET_REVIEW_COLOR_SCHEME: ${{ vars.MARKET_REVIEW_COLOR_SCHEME || secrets.MARKET_REVIEW_COLOR_SCHEME || 'green_up' }}
           
