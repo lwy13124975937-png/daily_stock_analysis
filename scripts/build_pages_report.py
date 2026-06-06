@@ -172,6 +172,19 @@ def _counts_for_account(groups: dict) -> dict[str, int]:
     return {asset_type: len(groups.get(asset_type, []) or []) for asset_type in TYPE_ORDER}
 
 
+def _account_items(groups: dict, allowed_types: set[str] | None = None) -> list[dict]:
+    if not isinstance(groups, dict):
+        return []
+    items: list[dict] = []
+    for asset_type in TYPE_ORDER:
+        if allowed_types is not None and asset_type not in allowed_types:
+            continue
+        type_items = groups.get(asset_type, []) or []
+        if isinstance(type_items, list):
+            items.extend(item for item in type_items if isinstance(item, dict))
+    return items
+
+
 def _latest_report(pages: list[ReportPage], kind: str) -> ReportPage | None:
     return next((page for page in pages if page.kind == kind), None)
 
@@ -270,6 +283,31 @@ def _extract_ai_snippets(markdown_text: str) -> dict[str, list[str]]:
     return by_code
 
 
+def _extract_ai_summary_items(markdown_text: str) -> dict[str, list[str]]:
+    by_code: dict[str, list[str]] = {}
+    in_summary = False
+
+    for line in markdown_text.splitlines():
+        heading = _heading_text(line)
+        if heading is not None:
+            in_summary = "分析结果摘要" in re.sub(r"\s+", "", heading)
+            continue
+        if not in_summary:
+            continue
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+        item = re.sub(r"^[-*+]\s+", "", stripped)
+        item = re.sub(r"^\d+[.)、]\s+", "", item)
+        codes = _codes_in_text(item)
+        if len(codes) != 1:
+            continue
+        _append_ai_snippet(by_code, codes[0], item)
+
+    return by_code
+
+
 def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
     """Keep analysis text, but remove AI-provided display names adjacent to code."""
     escaped_code = re.escape(code)
@@ -295,6 +333,16 @@ def _render_text_snippets(snippets: list[str], code: str) -> str:
         safe_text = escape(_sanitize_ai_snippet_for_holding(snippet, code))
         rendered.append(f'<pre class="ai-snippet">{safe_text}</pre>')
     return "".join(rendered)
+
+
+def _summary_detail_text(summary: str, code: str) -> str:
+    escaped_code = re.escape(code)
+    text = summary.strip()
+    text = re.sub(r"^[-*+]\s+", "", text)
+    text = re.sub(r"^\d+[.)、]\s+", "", text)
+    text = re.sub(rf"^.*?[（(]\s*{escaped_code}\s*[）)]\s*[:：]\s*", "", text)
+    text = re.sub(rf"^{escaped_code}\s*[:：]\s*", "", text)
+    return text.strip() or "有 AI 摘要项，详见原始股票日报。"
 
 
 def _wrap_html(title: str, body: str) -> str:
@@ -549,6 +597,97 @@ def _holding_analysis_card(item: dict, snippets_by_code: dict[str, list[str]]) -
 """
 
 
+def _render_holding_cards(items: list[dict], snippets_by_code: dict[str, list[str]]) -> str:
+    if not items:
+        return '<p class="muted">暂无持仓。</p>'
+    return "".join(_holding_analysis_card(item, snippets_by_code) for item in items)
+
+
+def _render_account_summary(
+    account: str,
+    items: list[dict],
+    summary_by_code: dict[str, list[str]],
+) -> str:
+    rows = []
+    seen: set[str] = set()
+    for item in items:
+        code = str(item.get("code", "") or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        summaries = summary_by_code.get(code, [])
+        if not summaries:
+            continue
+        name = str(item.get("name", "") or "-")
+        for summary in summaries[:MAX_AI_SNIPPETS_PER_CODE]:
+            detail = _summary_detail_text(summary, code)
+            rows.append(
+                "<li>"
+                f"<strong>{escape(name)}（{escape(code)}）</strong>：{escape(detail)}"
+                "</li>"
+            )
+    if rows:
+        body = f'<ul class="link-list">{"".join(rows)}</ul>'
+    else:
+        body = '<p class="muted">暂无该账户摘要项。</p>'
+    return f"""
+<section class="panel">
+  <h3>{escape(account)}分析结果摘要</h3>
+  {body}
+</section>
+"""
+
+
+def _render_standard_account_section(
+    account: str,
+    groups: dict,
+    summary_by_code: dict[str, list[str]],
+    snippets_by_code: dict[str, list[str]],
+    is_open: bool,
+) -> str:
+    items = _account_items(groups)
+    return f"""
+<details {"open" if is_open else ""}>
+  <summary>{escape(account)}</summary>
+  <div class="details-body">
+    {_render_account_summary(account, items, summary_by_code)}
+    <section class="panel">
+      <h3>{escape(account)}持仓明细与分析</h3>
+      {_render_holding_cards(items, snippets_by_code)}
+    </section>
+  </div>
+</details>
+"""
+
+
+def _render_alipay_account_section(
+    account: str,
+    groups: dict,
+    snippets_by_code: dict[str, list[str]],
+    is_open: bool,
+) -> str:
+    items = _account_items(groups, {"otc"})
+    note = (
+        "场外基金暂未接入股票日报分析。本页仅展示来自 stock-dashboard 的最新持仓清单，"
+        "后续可接入基金净值、重仓行业和基金经理复盘。"
+    )
+    return f"""
+<details {"open" if is_open else ""}>
+  <summary>{escape(account)}</summary>
+  <div class="details-body">
+    <section class="panel">
+      <h3>{escape(account)}基金复盘说明</h3>
+      <p class="note">{escape(note)}</p>
+    </section>
+    <section class="panel">
+      <h3>{escape(account)}场外基金清单</h3>
+      {_render_holding_cards(items, snippets_by_code)}
+    </section>
+  </div>
+</details>
+"""
+
+
 def _build_holding_report_page(
     title: str,
     markdown_text: str,
@@ -556,6 +695,7 @@ def _build_holding_report_page(
     snapshot: dict,
 ) -> str:
     snippets_by_code = _extract_ai_snippets(markdown_text)
+    summary_by_code = _extract_ai_summary_items(markdown_text)
     snapshot_codes = _all_snapshot_codes(snapshot)
     unmatched = {
         code: snippets
@@ -569,30 +709,24 @@ def _build_holding_report_page(
         groups = accounts.get(account, {}) if isinstance(accounts, dict) else {}
         if not isinstance(groups, dict):
             groups = {}
-        type_sections = []
-        for asset_type in TYPE_ORDER:
-            label = TYPE_LABELS[asset_type]
-            items = groups.get(asset_type, []) or []
-            cards = "".join(_holding_analysis_card(item, snippets_by_code) for item in items)
-            if not cards:
-                cards = '<p class="muted">暂无该类型持仓。</p>'
-            type_sections.append(
-                f"""
-<details>
-  <summary>{escape(label)}（{len(items)}）</summary>
-  <div class="details-body">{cards}</div>
-</details>
-"""
+        if account == "支付宝":
+            sections.append(
+                _render_alipay_account_section(
+                    account,
+                    groups,
+                    snippets_by_code,
+                    account == ACCOUNT_ORDER[0],
+                )
             )
+            continue
         sections.append(
-            f"""
-<details {"open" if account == ACCOUNT_ORDER[0] else ""}>
-  <summary>{escape(account)}</summary>
-  <div class="details-body">
-    {''.join(type_sections)}
-  </div>
-</details>
-"""
+            _render_standard_account_section(
+                account,
+                groups,
+                summary_by_code,
+                snippets_by_code,
+                account == ACCOUNT_ORDER[0],
+            )
         )
 
     body = f"""
