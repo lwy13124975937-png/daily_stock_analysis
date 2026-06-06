@@ -121,7 +121,7 @@ def _friendly_report_title(path: Path, markdown_text: str) -> str:
     if kind == "market":
         return f"{date_text} 大盘复盘"
     if kind == "stock":
-        return f"{date_text} 股票日报"
+        return f"{date_text} 持仓日报"
     return _extract_title(markdown_text, path.stem)
 
 
@@ -162,6 +162,68 @@ def _counts_for_account(groups: dict) -> dict[str, int]:
 
 def _latest_report(pages: list[ReportPage], kind: str) -> ReportPage | None:
     return next((page for page in pages if page.kind == kind), None)
+
+
+def _all_snapshot_codes(snapshot: dict) -> set[str]:
+    codes: set[str] = set()
+    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+    if not isinstance(accounts, dict):
+        return codes
+    for groups in accounts.values():
+        if not isinstance(groups, dict):
+            continue
+        for items in groups.values():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, dict):
+                    code = str(item.get("code", "")).strip()
+                    if code:
+                        codes.add(code)
+    return codes
+
+
+def _split_markdown_blocks(markdown_text: str) -> list[str]:
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", markdown_text) if block.strip()]
+    if blocks:
+        return blocks
+    return [line.strip() for line in markdown_text.splitlines() if line.strip()]
+
+
+def _extract_ai_snippets(markdown_text: str) -> dict[str, list[str]]:
+    by_code: dict[str, list[str]] = {}
+    for block in _split_markdown_blocks(markdown_text):
+        codes = list(dict.fromkeys(re.findall(r"(?<!\d)(\d{6})(?!\d)", block)))
+        for code in codes:
+            by_code.setdefault(code, []).append(block)
+    return by_code
+
+
+def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
+    """Keep analysis text, but remove AI-provided display names adjacent to code."""
+    escaped_code = re.escape(code)
+    text = snippet
+    text = re.sub(
+        rf"[\u4e00-\u9fffA-Za-z0-9*·_\-/\s]{{1,40}}[（(]\s*{escaped_code}\s*[）)]",
+        code,
+        text,
+    )
+    text = re.sub(
+        rf"{escaped_code}\s*[-—:：]\s*[^\n|，。；;]{{1,40}}",
+        code,
+        text,
+    )
+    return text.strip()
+
+
+def _render_text_snippets(snippets: list[str], code: str) -> str:
+    if not snippets:
+        return '<p class="muted">暂无单项 AI 分析，仅展示持仓清单。</p>'
+    rendered = []
+    for snippet in snippets:
+        safe_text = escape(_sanitize_ai_snippet_for_holding(snippet, code))
+        rendered.append(f'<pre class="ai-snippet">{safe_text}</pre>')
+    return "".join(rendered)
 
 
 def _wrap_html(title: str, body: str) -> str:
@@ -273,6 +335,27 @@ def _wrap_html(title: str, body: str) -> str:
       border: 1px solid #eac54f;
       border-radius: 8px;
     }}
+    .holding-item {{
+      margin: 12px 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--card);
+    }}
+    .holding-item h4 {{
+      margin: 0 0 6px;
+      font-size: 16px;
+    }}
+    .ai-snippet {{
+      margin: 10px 0 0;
+      padding: 10px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      background: var(--soft);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font: 14px/1.65 SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+    }}
     .disclaimer {{
       margin-top: 30px;
       padding-top: 16px;
@@ -338,6 +421,124 @@ def _enhance_report_html(html: str, title: str) -> str:
     return html
 
 
+def _render_raw_report_details(raw_report_html: str) -> str:
+    return f"""
+<details>
+  <summary>原始 AI 股票日报</summary>
+  <div class="details-body raw-report">
+    {raw_report_html}
+  </div>
+</details>
+"""
+
+
+def _render_unmatched_ai_details(unmatched: dict[str, list[str]]) -> str:
+    if not unmatched:
+        return """
+<details>
+  <summary>未匹配 AI 报告项</summary>
+  <div class="details-body">
+    <p class="muted">暂无未匹配内容。</p>
+  </div>
+</details>
+"""
+    rows = []
+    for code, snippets in sorted(unmatched.items()):
+        snippet_html = "".join(f'<pre class="ai-snippet">{escape(snippet)}</pre>' for snippet in snippets)
+        rows.append(f"<h3>{escape(code)}</h3>{snippet_html}")
+    return f"""
+<details>
+  <summary>未匹配 AI 报告项</summary>
+  <div class="details-body">
+    <p class="muted">以下内容来自 AI 原始报告，但未在当前 holdings_data.json 持仓中匹配到，仅供排查。</p>
+    {''.join(rows)}
+  </div>
+</details>
+"""
+
+
+def _holding_analysis_card(item: dict, snippets_by_code: dict[str, list[str]]) -> str:
+    name = str(item.get("name", "") or "-")
+    code = str(item.get("code", "") or "-")
+    asset_type = str(item.get("type", "") or "")
+    label = TYPE_LABELS.get(asset_type, asset_type or "-")
+    if asset_type == "otc":
+        analysis = (
+            '<p class="note">场外基金暂未接入股票日报分析。本页仅展示来自 '
+            "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
+        )
+    else:
+        analysis = _render_text_snippets(snippets_by_code.get(code, []), code)
+    return f"""
+<article class="holding-item">
+  <h4>{escape(name)}</h4>
+  <p class="muted">代码：{escape(code)} ｜ 类型：{escape(label)}</p>
+  <div>{analysis}</div>
+</article>
+"""
+
+
+def _build_holding_report_page(
+    title: str,
+    markdown_text: str,
+    raw_report_html: str,
+    snapshot: dict,
+) -> str:
+    snippets_by_code = _extract_ai_snippets(markdown_text)
+    snapshot_codes = _all_snapshot_codes(snapshot)
+    unmatched = {
+        code: snippets
+        for code, snippets in snippets_by_code.items()
+        if code not in snapshot_codes
+    }
+    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+
+    sections = []
+    for account in ACCOUNT_ORDER:
+        groups = accounts.get(account, {}) if isinstance(accounts, dict) else {}
+        if not isinstance(groups, dict):
+            groups = {}
+        type_sections = []
+        for asset_type in TYPE_ORDER:
+            label = TYPE_LABELS[asset_type]
+            items = groups.get(asset_type, []) or []
+            cards = "".join(_holding_analysis_card(item, snippets_by_code) for item in items)
+            if not cards:
+                cards = '<p class="muted">暂无该类型持仓。</p>'
+            type_sections.append(
+                f"""
+<details>
+  <summary>{escape(label)}（{len(items)}）</summary>
+  <div class="details-body">{cards}</div>
+</details>
+"""
+            )
+        sections.append(
+            f"""
+<details {"open" if account == ACCOUNT_ORDER[0] else ""}>
+  <summary>{escape(account)}</summary>
+  <div class="details-body">
+    {''.join(type_sections)}
+  </div>
+</details>
+"""
+        )
+
+    body = f"""
+<nav class="page-nav"><a href="../index.html">返回首页</a></nav>
+<header class="hero">
+  <h1>{escape(title)}</h1>
+  <p class="muted">生成时间：{escape(_now_text())}</p>
+  <p class="muted">本页根据 stock-dashboard 最新 holdings_data.json 生成。持仓名称、代码、账户和类型以 holdings_data.json 为准。AI 分析仅作复盘参考，不构成投资建议。</p>
+</header>
+{''.join(sections)}
+{_render_raw_report_details(raw_report_html)}
+{_render_unmatched_ai_details(unmatched)}
+<footer class="disclaimer">{escape(DISCLAIMER)}</footer>
+"""
+    return _wrap_html(title, body)
+
+
 def _discover_reports() -> list[Path]:
     if not REPORTS_DIR.exists():
         print(f"No reports directory found: {REPORTS_DIR}")
@@ -348,7 +549,7 @@ def _discover_reports() -> list[Path]:
     return reports
 
 
-def _build_report_pages() -> list[ReportPage]:
+def _build_report_pages(snapshot: dict) -> list[ReportPage]:
     report_paths = _discover_reports()
     renderer = _load_markdown_renderer() if report_paths else None
     SITE_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -357,15 +558,20 @@ def _build_report_pages() -> list[ReportPage]:
     for report_path in report_paths:
         markdown_text = report_path.read_text(encoding="utf-8")
         title = _friendly_report_title(report_path, markdown_text)
+        kind = _report_kind(report_path)
         output_path = SITE_REPORTS_DIR / _html_name(report_path)
-        html = renderer(markdown_text) if renderer else _wrap_html(title, escape(markdown_text))
-        output_path.write_text(_enhance_report_html(html, title), encoding="utf-8")
+        raw_html = renderer(markdown_text) if renderer else _wrap_html(title, escape(markdown_text))
+        if kind == "stock":
+            html = _build_holding_report_page(title, markdown_text, raw_html, snapshot)
+        else:
+            html = _enhance_report_html(raw_html, title)
+        output_path.write_text(html, encoding="utf-8")
         pages.append(
             ReportPage(
                 source=report_path,
                 output=output_path,
                 title=title,
-                kind=_report_kind(report_path),
+                kind=kind,
                 sort_key=(
                     _extract_date_key(report_path),
                     report_path.stat().st_mtime,
@@ -479,10 +685,10 @@ def _reports_index_block(pages: list[ReportPage]) -> str:
     items = []
     if latest_stock:
         items.append(
-            f'<li>股票日报：<a href="{escape(_relative_href(latest_stock.output))}">{escape(latest_stock.title)}</a></li>'
+            f'<li>最新持仓日报：<a href="{escape(_relative_href(latest_stock.output))}">{escape(latest_stock.title)}</a></li>'
         )
     else:
-        items.append('<li>股票日报：<span class="muted">暂无</span></li>')
+        items.append('<li>最新持仓日报：<span class="muted">暂无</span></li>')
     if latest_market:
         items.append(
             f'<li>大盘复盘：<a href="{escape(_relative_href(latest_market.output))}">{escape(latest_market.title)}</a></li>'
@@ -540,8 +746,8 @@ def build_pages() -> list[Path]:
     SITE_DIR.mkdir(parents=True, exist_ok=True)
     (SITE_DIR / ".nojekyll").write_text("", encoding="utf-8")
 
-    report_pages = _build_report_pages()
     snapshot = _load_holdings_snapshot()
+    report_pages = _build_report_pages(snapshot)
     account_pages = _build_account_pages(snapshot, report_pages)
 
     index_path = SITE_DIR / "index.html"
