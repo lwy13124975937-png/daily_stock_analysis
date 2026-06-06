@@ -23,6 +23,11 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
 # 并发控制：同一时间只运行一个分析任务
 concurrency:
   group: stock-analysis
@@ -473,6 +478,18 @@ jobs:
       - name: 生成静态报告网页
         if: always()
         run: python scripts/build_pages_report.py
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
       
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
