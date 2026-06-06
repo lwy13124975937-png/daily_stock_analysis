@@ -65,11 +65,26 @@ def _extract_title(markdown_text: str, fallback: str) -> str:
     return fallback
 
 
+def _format_date(date_key: str) -> str:
+    if re.fullmatch(r"20\d{6}", date_key):
+        return f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+    return date_key
+
+
 def _extract_date_key(path: Path) -> str:
     match = re.search(r"(20\d{6})", path.stem)
     if match:
         return match.group(1)
     return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d")
+
+
+def _friendly_report_title(path: Path, markdown_text: str) -> str:
+    date_text = _format_date(_extract_date_key(path))
+    if re.fullmatch(r"market_review_20\d{6}", path.stem):
+        return f"{date_text} 大盘复盘"
+    if re.fullmatch(r"report_20\d{6}", path.stem):
+        return f"{date_text} 股票日报"
+    return _extract_title(markdown_text, path.stem)
 
 
 def _html_name(path: Path) -> str:
@@ -80,6 +95,7 @@ def _html_name(path: Path) -> str:
 def _enhance_report_html(html: str, title: str) -> str:
     """Add mobile viewport, Pages-friendly CSS, and a home link."""
     escaped_title = escape(title)
+    generated_at = escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     additions = """
             html {
                 -webkit-text-size-adjust: 100%;
@@ -88,10 +104,25 @@ def _enhance_report_html(html: str, title: str) -> str:
                 box-sizing: border-box;
                 width: min(100%, 960px);
                 font-size: 16px;
-                line-height: 1.65;
+                line-height: 1.75;
                 overflow-wrap: anywhere;
             }
+            h1 {
+                font-size: 28px;
+                line-height: 1.25;
+                margin-top: 0;
+            }
+            h2 {
+                font-size: 22px;
+                line-height: 1.35;
+            }
+            h3 {
+                font-size: 18px;
+                line-height: 1.45;
+            }
             table {
+                display: block;
+                overflow-x: auto;
                 width: max-content;
                 min-width: 100%;
                 max-width: 100%;
@@ -107,23 +138,50 @@ def _enhance_report_html(html: str, title: str) -> str:
                 font-weight: 600;
                 text-decoration: none;
             }
+            .report-header {
+                margin-bottom: 20px;
+                padding-bottom: 16px;
+                border-bottom: 1px solid #d8dee4;
+            }
+            .report-header h1 {
+                margin-bottom: 8px;
+            }
+            .muted {
+                color: #6e7781;
+            }
+            .disclaimer {
+                margin-top: 32px;
+                padding-top: 16px;
+                border-top: 1px solid #d8dee4;
+                color: #6e7781;
+                font-size: 14px;
+            }
             @media (max-width: 640px) {
                 body {
-                    padding: 12px;
+                    padding: 16px;
                     font-size: 15px;
                 }
                 h1 {
-                    font-size: 21px;
+                    font-size: 24px;
                 }
                 h2 {
-                    font-size: 18px;
+                    font-size: 20px;
                 }
                 th, td {
                     padding: 6px 8px;
                 }
             }
         """
-    nav = f'<nav class="page-nav"><a href="../index.html">返回首页</a></nav>'
+    header = f"""
+            <nav class="page-nav"><a href="../index.html">返回首页</a></nav>
+            <header class="report-header">
+                <h1>{escaped_title}</h1>
+                <p class="muted">生成时间：{generated_at}</p>
+            </header>
+            """
+    footer = """
+            <footer class="disclaimer">本页面内容由 AI 自动生成，仅作复盘参考，不构成投资建议。</footer>
+            """
 
     if "<head>" in html and "<meta charset=" in html:
         html = re.sub(
@@ -138,7 +196,10 @@ def _enhance_report_html(html: str, title: str) -> str:
     if "</style>" in html:
         html = html.replace("</style>", additions + "\n            </style>", 1)
     if "<body>" in html:
-        html = html.replace("<body>", f"<body>\n            {nav}", 1)
+        html = re.sub(r"<h1\b[^>]*>.*?</h1>\s*", "", html, count=1, flags=re.IGNORECASE | re.DOTALL)
+        html = html.replace("<body>", f"<body>\n            {header}", 1)
+    if "</body>" in html:
+        html = html.replace("</body>", f"{footer}\n        </body>", 1)
     return html
 
 
@@ -156,15 +217,33 @@ def _wrap_html(title: str, body: str) -> str:
       margin: 0 auto;
       padding: 16px;
       color: #24292f;
-      font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
       overflow-wrap: anywhere;
     }}
     a {{ color: #0969da; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
+    h1 {{ font-size: 30px; line-height: 1.25; margin: 0 0 12px; }}
+    h2 {{ font-size: 22px; line-height: 1.35; margin-top: 28px; }}
     .muted {{ color: #6e7781; }}
+    .hero {{ border-bottom: 1px solid #d8dee4; margin-bottom: 22px; padding-bottom: 16px; }}
+    .latest-report {{
+      border: 1px solid #d8dee4;
+      border-radius: 8px;
+      margin: 18px 0 26px;
+      padding: 16px;
+      background: #f6f8fa;
+    }}
+    .latest-report a {{ font-size: 18px; font-weight: 700; }}
     .report-list {{ list-style: none; padding: 0; margin: 18px 0; }}
     .report-list li {{ border-bottom: 1px solid #d8dee4; padding: 12px 0; }}
     .report-list a {{ font-weight: 600; }}
+    .disclaimer {{
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid #d8dee4;
+      color: #6e7781;
+      font-size: 14px;
+    }}
     table {{
       display: block;
       width: max-content;
@@ -177,8 +256,9 @@ def _wrap_html(title: str, body: str) -> str:
     th, td {{ border: 1px solid #d8dee4; padding: 6px 8px; }}
     th {{ background: #f6f8fa; }}
     @media (max-width: 640px) {{
-      body {{ padding: 12px; font-size: 15px; }}
-      h1 {{ font-size: 22px; }}
+      body {{ padding: 16px; font-size: 15px; }}
+      h1 {{ font-size: 25px; }}
+      h2 {{ font-size: 20px; }}
     }}
   </style>
 </head>
@@ -193,29 +273,44 @@ def _build_index(pages: list[ReportPage]) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if not pages:
         body = f"""
-<h1>Daily Stock Analysis Reports</h1>
-<p class="muted">Generated at {escape(generated_at)}</p>
-<p>No Markdown reports were found under <code>reports/</code>.</p>
+<header class="hero">
+  <h1>每日股票分析报告</h1>
+  <p class="muted">最新生成时间：{escape(generated_at)}</p>
+</header>
+<p>暂未在 <code>reports/</code> 目录下发现 Markdown 报告。</p>
+<footer class="disclaimer">本页面内容由 AI 自动生成，仅作复盘参考，不构成投资建议。</footer>
 """
-        return _wrap_html("Daily Stock Analysis Reports", body)
+        return _wrap_html("每日股票分析报告", body)
 
     items = []
-    for page in pages:
+    for page in pages[1:]:
         href = f"reports/{escape(page.output.name)}"
-        source_name = escape(page.source.name)
         title = escape(page.title)
-        items.append(
-            f'<li><a href="{href}">{title}</a><br><span class="muted">{source_name}</span></li>'
-        )
+        items.append(f'<li><a href="{href}">{title}</a></li>')
+
+    latest = pages[0]
+    latest_href = f"reports/{escape(latest.output.name)}"
+    latest_title = escape(latest.title)
+    history = chr(10).join(items) if items else '<li><span class="muted">暂无更多历史报告</span></li>'
 
     body = f"""
-<h1>Daily Stock Analysis Reports</h1>
-<p class="muted">Generated at {escape(generated_at)}</p>
+<header class="hero">
+  <h1>每日股票分析报告</h1>
+  <p class="muted">最新生成时间：{escape(generated_at)}</p>
+</header>
+<section class="latest-report">
+  <h2>最新报告入口</h2>
+  <p><a href="{latest_href}">{latest_title}</a></p>
+</section>
+<section>
+<h2>历史报告列表</h2>
 <ul class="report-list">
-{chr(10).join(items)}
+{history}
 </ul>
+</section>
+<footer class="disclaimer">本页面内容由 AI 自动生成，仅作复盘参考，不构成投资建议。</footer>
 """
-    return _wrap_html("Daily Stock Analysis Reports", body)
+    return _wrap_html("每日股票分析报告", body)
 
 
 def _discover_reports() -> list[Path]:
@@ -239,7 +334,7 @@ def build_pages() -> list[Path]:
 
     for report_path in report_paths:
         markdown_text = report_path.read_text(encoding="utf-8")
-        title = _extract_title(markdown_text, report_path.stem)
+        title = _friendly_report_title(report_path, markdown_text)
         output_path = SITE_REPORTS_DIR / _html_name(report_path)
         html = renderer(markdown_text) if renderer else _wrap_html(title, escape(markdown_text))
         output_path.write_text(_enhance_report_html(html, title), encoding="utf-8")
