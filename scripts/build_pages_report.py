@@ -885,43 +885,33 @@ def _account_items_table(items: list[dict]) -> str:
 
 
 def _build_account_page(account: str, groups: dict, latest_stock_report: ReportPage | None) -> str:
-    report_link = ""
+    report_link = '<p class="muted">本次构建未发现 report_*.md，最新持仓日报暂不可用。</p>'
     if latest_stock_report:
         href = f"../{_relative_href(latest_stock_report.output)}"
-        report_link = f'<p><a href="{escape(href)}">查看股票日报</a></p>'
+        report_link = f'<p><a href="{escape(href)}">查看最新持仓日报</a></p>'
 
-    sections = []
-    for asset_type in TYPE_ORDER:
-        label = TYPE_LABELS[asset_type]
-        items = groups.get(asset_type, []) or []
-        note = ""
-        if asset_type == "lof" and items:
-            note = '<p class="note">场内基金/LOF，分析仅作参考。</p>'
-        if asset_type == "otc" and items:
-            note = (
-                '<p class="note">场外基金暂未接入股票日报分析。本页仅展示来自 '
-                "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
-            )
-        sections.append(
-            f"""
-<details>
-  <summary>{escape(label)}（{len(items)}）</summary>
-  <div class="details-body">
-    {note}
-    {_account_items_table(items)}
-  </div>
-</details>
-"""
+    items = _account_items(groups)
+    notes = []
+    if any(str(item.get("type", "")) == "lof" for item in items):
+        notes.append('<p class="note">场内基金/ETF/LOF 已纳入持仓日报分析，结论仅作复盘参考。</p>')
+    if any(str(item.get("type", "")) == "otc" for item in items):
+        notes.append(
+            '<p class="note">场外基金暂未接入股票日报分析。本页仅展示来自 '
+            "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
         )
 
     body = f"""
 <nav class="page-nav"><a href="../index.html">返回首页</a></nav>
 <header class="hero">
   <h1>{escape(account)}持仓复盘</h1>
-  <p class="muted">仅展示公开持仓字段。</p>
+  <p class="muted">仅展示公开持仓字段。完整 AI 分析请查看最新持仓日报。</p>
   {report_link}
 </header>
-{''.join(sections)}
+<section class="panel">
+  <h2>{escape(account)}持仓清单</h2>
+  {''.join(notes)}
+  {_account_items_table(items)}
+</section>
 <footer class="disclaimer">{escape(DISCLAIMER)}</footer>
 """
     return _wrap_html(f"{account}持仓复盘", body)
@@ -1016,8 +1006,8 @@ def _build_index(snapshot: dict, pages: list[ReportPage], account_pages: list[Ac
   <p class="muted">生成时间：{escape(generated_at)}</p>
   <p class="muted">数据来源：{source_line}</p>
 </header>
-{_account_cards(account_pages)}
 {_reports_index_block(pages)}
+{_account_cards(account_pages)}
 <footer class="disclaimer">{escape(DISCLAIMER)}</footer>
 """
     return _wrap_html("每日持仓复盘", body)
