@@ -63,7 +63,6 @@ jobs:
 
       - name: 生成持仓自选股列表
         env:
-          MANUAL_STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST }}
           STOCK_LIST_FALLBACK: '600519'
           HOLDINGS_DATA_URL: https://raw.githubusercontent.com/lwy13124975937-png/stock-dashboard/main/holdings_data.json
         run: python scripts/build_stock_list_from_holdings.py
@@ -485,6 +484,17 @@ jobs:
         if: always()
         run: python scripts/build_pages_report.py
 
+      - name: 上传分析报告
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: analysis-reports-${{ github.run_number }}
+          path: |
+            reports/
+            logs/
+            site/
+          retention-days: 30
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
@@ -496,17 +506,6 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-      
-      - name: 上传分析报告
-        uses: actions/upload-artifact@v6
-        if: always()
-        with:
-          name: analysis-reports-${{ github.run_number }}
-          path: |
-            reports/
-            logs/
-            site/
-          retention-days: 30
       
       - name: 显示运行结果
         if: always()

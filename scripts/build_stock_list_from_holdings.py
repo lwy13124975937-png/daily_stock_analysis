@@ -1,7 +1,8 @@
-"""Build STOCK_LIST from stock-dashboard holdings for GitHub Actions.
+"""Build STOCK_LIST and a public holdings snapshot from stock-dashboard.
 
-Only holdings with ``type == "stock"`` are included in the first version.
-Manual STOCK_LIST values from GitHub Variables/Secrets take precedence.
+The GitHub Actions workflow uses this script before running analysis. It reads
+the latest holdings JSON, includes ``stock`` and ``lof`` codes in STOCK_LIST,
+and writes a sanitized snapshot for the static Pages builder.
 """
 
 from __future__ import annotations
@@ -9,15 +10,27 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SITE_DATA_DIR = ROOT_DIR / "site_data"
+SNAPSHOT_PATH = SITE_DATA_DIR / "holdings_snapshot.json"
 
 DEFAULT_HOLDINGS_URL = (
     "https://raw.githubusercontent.com/"
     "lwy13124975937-png/stock-dashboard/main/holdings_data.json"
 )
 DEFAULT_FALLBACK_STOCK_LIST = "600519"
+ANALYZED_TYPES = {"stock", "lof"}
+SNAPSHOT_TYPES = ("stock", "lof", "otc")
+TYPE_LABELS = {
+    "stock": "A股个股",
+    "lof": "场内基金/ETF/LOF",
+    "otc": "场外基金",
+}
 
 
 def _is_enabled(record: dict) -> bool:
@@ -31,6 +44,10 @@ def _normalize_code(value: object) -> str:
     return code
 
 
+def _clean_text(value: object) -> str:
+    return str(value or "").strip()
+
+
 def _download_json(url: str) -> dict:
     request = Request(url, headers={"User-Agent": "daily-stock-analysis-actions"})
     with urlopen(request, timeout=20) as response:
@@ -38,30 +55,69 @@ def _download_json(url: str) -> dict:
         return json.loads(response.read().decode(charset))
 
 
-def extract_stock_codes(data: dict) -> list[str]:
-    codes: list[str] = []
-    seen: set[str] = set()
+def _empty_account() -> dict[str, list[dict[str, str]]]:
+    return {asset_type: [] for asset_type in SNAPSHOT_TYPES}
 
-    holdings = data.get("holdings", [])
-    if not isinstance(holdings, list):
-        return codes
 
-    for record in holdings:
-        if not isinstance(record, dict):
-            continue
-        if not _is_enabled(record):
-            continue
-        if str(record.get("type", "")).strip().lower() != "stock":
-            continue
-
-        code = _normalize_code(record.get("code"))
-        if not code or code in seen:
-            continue
-
+def _append_unique_code(codes: list[str], seen: set[str], code: str) -> None:
+    if code and code not in seen:
         seen.add(code)
         codes.append(code)
 
-    return codes
+
+def build_holdings_snapshot(data: dict, source_url: str) -> tuple[dict, dict[str, list[str]], list[str]]:
+    accounts: dict[str, dict[str, list[dict[str, str]]]] = {}
+    type_codes: dict[str, list[str]] = {asset_type: [] for asset_type in SNAPSHOT_TYPES}
+    seen_by_type: dict[str, set[str]] = {asset_type: set() for asset_type in SNAPSHOT_TYPES}
+    stock_list: list[str] = []
+    seen_analysis_codes: set[str] = set()
+
+    holdings = data.get("holdings", [])
+    if not isinstance(holdings, list):
+        holdings = []
+
+    for record in holdings:
+        if not isinstance(record, dict) or not _is_enabled(record):
+            continue
+
+        asset_type = _clean_text(record.get("type")).lower()
+        if asset_type not in SNAPSHOT_TYPES:
+            continue
+
+        code = _normalize_code(record.get("code"))
+        name = _clean_text(record.get("name"))
+        account = _clean_text(record.get("account")) or "未分组账户"
+        if not code:
+            continue
+
+        public_item = {
+            "account": account,
+            "type": asset_type,
+            "name": name,
+            "code": code,
+        }
+        accounts.setdefault(account, _empty_account())[asset_type].append(public_item)
+        _append_unique_code(type_codes[asset_type], seen_by_type[asset_type], code)
+
+        if asset_type in ANALYZED_TYPES:
+            _append_unique_code(stock_list, seen_analysis_codes, code)
+
+    snapshot = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source_url": source_url,
+        "accounts": accounts,
+        "type_labels": TYPE_LABELS,
+    }
+    return snapshot, type_codes, stock_list
+
+
+def write_snapshot(snapshot: dict) -> None:
+    SITE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_PATH.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Holdings snapshot written: {SNAPSHOT_PATH.relative_to(ROOT_DIR)}")
 
 
 def _write_github_env(name: str, value: str) -> None:
@@ -80,11 +136,13 @@ def _set_stock_list(value: str, source: str) -> str:
     return stock_list
 
 
-def build_stock_list() -> str:
-    manual_stock_list = os.environ.get("MANUAL_STOCK_LIST", "").strip()
-    if manual_stock_list:
-        return _set_stock_list(manual_stock_list, "manual")
+def _print_type_codes(label: str, codes: list[str]) -> None:
+    joined = ",".join(codes) if codes else "(none)"
+    print(f"{label} count: {len(codes)}")
+    print(f"{label} codes: {joined}")
 
+
+def build_stock_list() -> str:
     fallback = os.environ.get("STOCK_LIST_FALLBACK", DEFAULT_FALLBACK_STOCK_LIST).strip()
     fallback = fallback or DEFAULT_FALLBACK_STOCK_LIST
     url = os.environ.get("HOLDINGS_DATA_URL", DEFAULT_HOLDINGS_URL).strip()
@@ -92,16 +150,21 @@ def build_stock_list() -> str:
 
     try:
         data = _download_json(url)
-        codes = extract_stock_codes(data)
+        snapshot, type_codes, stock_list = build_holdings_snapshot(data, url)
+        write_snapshot(snapshot)
     except Exception as exc:
         print(f"Failed to download or parse holdings data: {type(exc).__name__}: {exc}", file=sys.stderr)
         return _set_stock_list(fallback, "fallback")
 
-    if not codes:
-        print("No enabled stock holdings found; using fallback STOCK_LIST.", file=sys.stderr)
+    _print_type_codes("stock", type_codes["stock"])
+    _print_type_codes("lof", type_codes["lof"])
+    _print_type_codes("otc", type_codes["otc"])
+
+    if not stock_list:
+        print("No enabled stock or lof holdings found; using fallback STOCK_LIST.", file=sys.stderr)
         return _set_stock_list(fallback, "fallback")
 
-    return _set_stock_list(",".join(codes), "holdings")
+    return _set_stock_list(",".join(stock_list), "holdings")
 
 
 def main() -> int:
