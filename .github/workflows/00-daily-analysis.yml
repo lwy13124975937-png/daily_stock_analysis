@@ -469,6 +469,10 @@ jobs:
           else
             python main.py $FORCE_RUN_ARG
           fi
+
+      - name: 生成静态报告网页
+        if: always()
+        run: python scripts/build_pages_report.py
       
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
@@ -478,6 +482,7 @@ jobs:
           path: |
             reports/
             logs/
+            site/
           retention-days: 30
       
       - name: 显示运行结果
