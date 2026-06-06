@@ -39,6 +39,18 @@ TYPE_LABELS = {
     "otc": "场外基金",
 }
 TYPE_ORDER = ("stock", "lof", "otc")
+CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+GLOBAL_SECTION_KEYWORDS = (
+    "摘要",
+    "总结",
+    "汇总",
+    "总览",
+    "整体",
+    "概览",
+    "榜单",
+)
+MAX_AI_SNIPPETS_PER_CODE = 3
+MAX_AI_SNIPPET_CHARS = 500
 
 
 @dataclass(frozen=True)
@@ -183,19 +195,78 @@ def _all_snapshot_codes(snapshot: dict) -> set[str]:
     return codes
 
 
-def _split_markdown_blocks(markdown_text: str) -> list[str]:
-    blocks = [block.strip() for block in re.split(r"\n\s*\n", markdown_text) if block.strip()]
-    if blocks:
-        return blocks
-    return [line.strip() for line in markdown_text.splitlines() if line.strip()]
+def _codes_in_text(text: str) -> list[str]:
+    return list(dict.fromkeys(CODE_RE.findall(text)))
+
+
+def _heading_text(line: str) -> str | None:
+    match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _is_global_ai_heading(text: str) -> bool:
+    if _codes_in_text(text):
+        return False
+    compact = re.sub(r"\s+", "", text)
+    return any(keyword in compact for keyword in GLOBAL_SECTION_KEYWORDS)
+
+
+def _append_ai_snippet(by_code: dict[str, list[str]], code: str, snippet: str) -> None:
+    text = snippet.strip()
+    if not text or len(text) > MAX_AI_SNIPPET_CHARS:
+        return
+    if re.fullmatch(r"[\s|:：\-]+", text):
+        return
+    existing = by_code.setdefault(code, [])
+    if text in existing or len(existing) >= MAX_AI_SNIPPETS_PER_CODE:
+        return
+    existing.append(text)
 
 
 def _extract_ai_snippets(markdown_text: str) -> dict[str, list[str]]:
     by_code: dict[str, list[str]] = {}
-    for block in _split_markdown_blocks(markdown_text):
-        codes = list(dict.fromkeys(re.findall(r"(?<!\d)(\d{6})(?!\d)", block)))
-        for code in codes:
-            by_code.setdefault(code, []).append(block)
+
+    current_section_code: str | None = None
+    current_section_is_global = False
+    paragraph_lines: list[str] = []
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_lines
+        paragraph = "\n".join(line.strip() for line in paragraph_lines if line.strip()).strip()
+        paragraph_lines = []
+        if not paragraph or current_section_is_global:
+            return
+
+        codes = _codes_in_text(paragraph)
+        if len(codes) > 1:
+            return
+        if len(codes) == 1:
+            code = codes[0]
+            if current_section_code and code != current_section_code:
+                return
+            _append_ai_snippet(by_code, code, paragraph)
+            return
+        if current_section_code:
+            _append_ai_snippet(by_code, current_section_code, paragraph)
+
+    for line in markdown_text.splitlines():
+        heading = _heading_text(line)
+        if heading is not None:
+            flush_paragraph()
+            heading_codes = _codes_in_text(heading)
+            current_section_code = heading_codes[0] if len(heading_codes) == 1 else None
+            current_section_is_global = current_section_code is None and _is_global_ai_heading(heading)
+            continue
+
+        if not line.strip():
+            flush_paragraph()
+            continue
+
+        paragraph_lines.append(line)
+
+    flush_paragraph()
     return by_code
 
 
