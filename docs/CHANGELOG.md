@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] GitHub Actions 日报覆盖检查改为只认可原始 Markdown 中的分析结果摘要、单项分析标题或“未完成分析标的”，避免页面兜底文本掩盖 stock/lof 持仓 code 漏分析。
 - [修复] 综合情报搜索中的机构分析与业绩预期维度改用 180 天 provider 请求窗口，避免默认短新闻窗口漏掉财报、研报等周期性财经材料。
 - [改进] 多股通知报告将市场阶段收敛为总览下方单行 `市场状态`，不再在每只股票摘要下重复展示数据质量和限制详情。
 - [修复] Web 个股栏和历史卡片在窄布局下不再让市场阶段标签遮挡股票名称。

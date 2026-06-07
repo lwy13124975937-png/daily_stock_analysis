@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that the latest stock report mentions every reportable holding code."""
+"""Check that the latest stock report formally covers every reportable holding code."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ DEFAULT_SNAPSHOT_PATH = ROOT_DIR / "site_data" / "holdings_snapshot.json"
 DEFAULT_REPORTS_DIR = ROOT_DIR / "reports"
 REPORTABLE_TYPES = {"stock", "lof"}
 CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+HEADING_RE = re.compile(r"^(#{2,6})\s+(.+?)\s*$", re.MULTILINE)
 
 
 def latest_report(reports_dir: Path) -> Path | None:
@@ -74,6 +75,41 @@ def unique_by_code(holdings: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
     return unique
 
 
+def section_after_heading(report_text: str, heading_keyword: str) -> str:
+    for match in HEADING_RE.finditer(report_text):
+        title = match.group(2)
+        if heading_keyword not in title:
+            continue
+        start = match.end()
+        next_heading = HEADING_RE.search(report_text, start)
+        end = next_heading.start() if next_heading else len(report_text)
+        return report_text[start:end]
+    return ""
+
+
+def codes_in_single_analysis_headings(report_text: str) -> set[str]:
+    codes = set()
+    for match in HEADING_RE.finditer(report_text):
+        title = match.group(2)
+        if "分析结果摘要" in title or "未完成分析标的" in title:
+            continue
+        codes.update(CODE_RE.findall(title))
+    return codes
+
+
+def formally_covered_codes(report_text: str) -> Dict[str, set[str]]:
+    summary_section = section_after_heading(report_text, "分析结果摘要")
+    unfinished_section = section_after_heading(report_text, "未完成分析标的")
+    summary_codes = set(CODE_RE.findall(summary_section))
+    single_heading_codes = codes_in_single_analysis_headings(report_text)
+    unfinished_codes = set(CODE_RE.findall(unfinished_section))
+    return {
+        "summary": summary_codes,
+        "single_analysis_heading": single_heading_codes,
+        "unfinished": unfinished_codes,
+    }
+
+
 def check_coverage(snapshot_path: Path, reports_dir: Path) -> Tuple[bool, List[Dict[str, str]]]:
     snapshot = load_snapshot(snapshot_path)
     required_holdings = unique_by_code(iter_reportable_holdings(snapshot))
@@ -85,14 +121,19 @@ def check_coverage(snapshot_path: Path, reports_dir: Path) -> Tuple[bool, List[D
         raise RuntimeError(f"no report_*.md files found in {reports_dir}")
 
     report_text = report_path.read_text(encoding="utf-8", errors="ignore")
-    report_codes = set(CODE_RE.findall(report_text))
-    missing = [holding for holding in required_holdings if holding["code"] not in report_codes]
+    covered_by = formally_covered_codes(report_text)
+    success_codes = covered_by["summary"] | covered_by["single_analysis_heading"]
+    failed_codes = covered_by["unfinished"]
+    covered_codes = success_codes | failed_codes
+    missing = [holding for holding in required_holdings if holding["code"] not in covered_codes]
 
     print(f"latest report: {report_path}")
     print(f"reportable holdings: {len(required_holdings)}")
-    print(f"codes found in report: {len(report_codes)}")
+    print(f"summary-covered codes: {len(covered_by['summary'])}")
+    print(f"single-analysis-heading codes: {len(covered_by['single_analysis_heading'])}")
+    print(f"unfinished-covered codes: {len(covered_by['unfinished'])}")
     if missing:
-        print("ERROR: report is missing holding codes:")
+        print("ERROR: report is missing formally covered holding codes:")
         for holding in missing:
             print(
                 "- "
