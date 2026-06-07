@@ -15,9 +15,11 @@ import logging
 import threading
 import time
 import uuid
+import json
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Callable
 
 import pandas as pd
@@ -3088,15 +3090,86 @@ class StockAnalysisPipeline:
         generator = getattr(self.notifier, "generate_aggregate_report", None)
         if callable(generator):
             report = generator(results, report_type)
+            report = self._append_lof_etf_portfolio_review_section(report)
             return self._append_unfinished_analysis_section(report, failed_results)
         if report_type == ReportType.BRIEF and hasattr(self.notifier, "generate_brief_report"):
             report = self.notifier.generate_brief_report(results)
+            report = self._append_lof_etf_portfolio_review_section(report)
             return self._append_unfinished_analysis_section(report, failed_results)
         if results:
             report = self.notifier.generate_dashboard_report(results)
         else:
             report = "# 股票分析日报\n\n> 本次没有成功完成的股票分析。\n"
+        report = self._append_lof_etf_portfolio_review_section(report)
         return self._append_unfinished_analysis_section(report, failed_results)
+
+    @staticmethod
+    def _append_lof_etf_portfolio_review_section(report: str) -> str:
+        snapshot_path = Path(__file__).resolve().parents[2] / "site_data" / "holdings_snapshot.json"
+        try:
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return report
+        except Exception as exc:
+            logger.warning("读取 LOF/ETF 持仓快照失败，跳过组合复盘: %s", exc)
+            return report
+
+        accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(accounts, dict):
+            return report
+
+        sections = []
+        for account, groups in accounts.items():
+            if not isinstance(groups, dict):
+                continue
+            holdings = groups.get("lof", [])
+            if not isinstance(holdings, list) or not holdings:
+                continue
+
+            public_items = []
+            names = []
+            codes = set()
+            for item in holdings:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "") or "").strip()
+                code = str(item.get("code", "") or "").strip()
+                if not code:
+                    continue
+                names.append(name or code)
+                codes.add(code)
+                public_items.append(f"- {name or code}({code})")
+            if not public_items:
+                continue
+
+            repeated_exposure = "未发现同一代码重复暴露。"
+            if len(codes) < len(public_items):
+                repeated_exposure = "存在同一代码在本账户内重复出现，需合并查看真实暴露。"
+
+            topic_hint = "、".join(names[:5]) if names else "暂无可识别主题"
+            sections.append(
+                "\n".join(
+                    [
+                        f"### {account}",
+                        "",
+                        f"本账户持有以下 LOF/ETF（共 {len(public_items)} 只）：",
+                        "",
+                        *public_items,
+                        "",
+                        "组合复盘：",
+                        f"- 主题/行业暴露：从名称观察，主要暴露在 {topic_hint} 等方向，需结合跟踪指数和重仓行业继续复核。",
+                        f"- 重复暴露：{repeated_exposure}",
+                        "- 配置节奏：LOF/ETF 更适合作为账户级低频配置观察，不按 A股个股技术面逐只打分。",
+                        "- 分析口径：本小节为 LOF/ETF 组合级复盘，不输出逐只股票评分或交易评级。",
+                    ]
+                )
+            )
+
+        if not sections:
+            return report
+
+        section = "\n\n## LOF/ETF 组合复盘\n\n" + "\n\n".join(sections) + "\n"
+        return report.rstrip() + section
 
     @staticmethod
     def _append_unfinished_analysis_section(

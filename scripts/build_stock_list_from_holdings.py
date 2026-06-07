@@ -1,7 +1,7 @@
 """Build STOCK_LIST and a public holdings snapshot from stock-dashboard.
 
 The GitHub Actions workflow uses this script before running analysis. It reads
-the latest holdings JSON, includes ``stock`` and ``lof`` codes in STOCK_LIST,
+the latest holdings JSON, includes only ``stock`` codes in STOCK_LIST,
 and writes a sanitized snapshot for the static Pages builder.
 """
 
@@ -24,7 +24,7 @@ DEFAULT_HOLDINGS_URL = (
     "lwy13124975937-png/stock-dashboard/main/holdings_data.json"
 )
 DEFAULT_FALLBACK_STOCK_LIST = "600519"
-ANALYZED_TYPES = {"stock", "lof"}
+ANALYZED_TYPES = {"stock"}
 SNAPSHOT_TYPES = ("stock", "lof", "otc")
 TYPE_LABELS = {
     "stock": "A股个股",
@@ -138,8 +138,8 @@ def _set_stock_list(value: str, source: str) -> str:
 
 def _print_type_codes(label: str, codes: list[str]) -> None:
     joined = ",".join(codes) if codes else "(none)"
-    print(f"{label} count: {len(codes)}")
-    print(f"{label} codes: {joined}")
+    print(f"{label}数量: {len(codes)}")
+    print(f"{label}代码: {joined}")
 
 
 def build_stock_list() -> str:
@@ -156,12 +156,12 @@ def build_stock_list() -> str:
         print(f"Failed to download or parse holdings data: {type(exc).__name__}: {exc}", file=sys.stderr)
         return _set_stock_list(fallback, "fallback")
 
-    _print_type_codes("stock", type_codes["stock"])
-    _print_type_codes("lof", type_codes["lof"])
-    _print_type_codes("otc", type_codes["otc"])
+    _print_type_codes("A股逐只分析", type_codes["stock"])
+    _print_type_codes("LOF/ETF 组合复盘", type_codes["lof"])
+    _print_type_codes("场外基金清单", type_codes["otc"])
 
     if not stock_list:
-        print("No enabled stock or lof holdings found; using fallback STOCK_LIST.", file=sys.stderr)
+        print("No enabled stock holdings found; using fallback STOCK_LIST.", file=sys.stderr)
         return _set_stock_list(fallback, "fallback")
 
     return _set_stock_list(",".join(stock_list), "holdings")

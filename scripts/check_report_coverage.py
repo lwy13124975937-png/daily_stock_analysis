@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that the latest stock report formally covers every reportable holding code."""
+"""Check that the latest stock report formally covers stock holdings."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Dict, Iterable, List, Tuple
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_SNAPSHOT_PATH = ROOT_DIR / "site_data" / "holdings_snapshot.json"
 DEFAULT_REPORTS_DIR = ROOT_DIR / "reports"
-REPORTABLE_TYPES = {"stock", "lof"}
+REPORTABLE_TYPES = {"stock"}
 CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 HEADING_RE = re.compile(r"^(#{2,6})\s+(.+?)\s*$", re.MULTILINE)
 
@@ -110,11 +110,32 @@ def formally_covered_codes(report_text: str) -> Dict[str, set[str]]:
     }
 
 
+def has_lof_holdings(snapshot: dict) -> bool:
+    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+    if not isinstance(accounts, dict):
+        return False
+    for groups in accounts.values():
+        if not isinstance(groups, dict):
+            continue
+        holdings = groups.get("lof", [])
+        if isinstance(holdings, list) and holdings:
+            return True
+    return False
+
+
+def has_lof_portfolio_review(report_text: str) -> bool:
+    for match in HEADING_RE.finditer(report_text):
+        compact = re.sub(r"\s+", "", match.group(2))
+        if "LOF/ETF组合复盘" in compact:
+            return True
+    return False
+
+
 def check_coverage(snapshot_path: Path, reports_dir: Path) -> Tuple[bool, List[Dict[str, str]]]:
     snapshot = load_snapshot(snapshot_path)
     required_holdings = unique_by_code(iter_reportable_holdings(snapshot))
     if not required_holdings:
-        raise RuntimeError("no reportable stock/lof holdings found in holdings snapshot")
+        raise RuntimeError("no reportable stock holdings found in holdings snapshot")
 
     report_path = latest_report(reports_dir)
     if report_path is None:
@@ -142,13 +163,17 @@ def check_coverage(snapshot_path: Path, reports_dir: Path) -> Tuple[bool, List[D
             )
         return False, missing
 
+    if has_lof_holdings(snapshot) and not has_lof_portfolio_review(report_text):
+        print("ERROR: LOF/ETF holdings exist but report is missing ## LOF/ETF 组合复盘")
+        return False, []
+
     print("report coverage check passed")
     return True, []
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Verify latest report_*.md covers every stock/lof code from holdings_snapshot.json."
+        description="Verify latest report_*.md covers every stock code and includes LOF/ETF portfolio review when needed."
     )
     parser.add_argument(
         "--snapshot",

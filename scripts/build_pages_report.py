@@ -563,6 +563,66 @@ def _render_failure_snippets(failures: list[str], code: str) -> str:
     return "".join(rendered)
 
 
+def _extract_lof_portfolio_reviews(markdown_text: str) -> dict[str, str]:
+    lines = markdown_text.splitlines()
+    start = None
+    for idx, line in enumerate(lines):
+        heading = _heading_match(line)
+        if heading is None:
+            continue
+        level, text = heading
+        compact = re.sub(r"\s+", "", _clean_heading_text(text))
+        if level == 2 and "LOF/ETF组合复盘" in compact:
+            start = idx + 1
+            break
+    if start is None:
+        return {}
+
+    end = len(lines)
+    for idx in range(start, len(lines)):
+        heading = _heading_match(lines[idx])
+        if heading is not None and heading[0] <= 2:
+            end = idx
+            break
+
+    reviews: dict[str, list[str]] = {}
+    current_account = ""
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        if current_account and current_lines:
+            reviews[current_account] = current_lines.copy()
+
+    for line in lines[start:end]:
+        heading = _heading_match(line)
+        if heading is not None and heading[0] == 3:
+            flush()
+            current_account = _clean_heading_text(heading[1])
+            current_lines = []
+            continue
+        if current_account:
+            current_lines.append(line)
+    flush()
+
+    return {
+        account: "\n".join(body).strip()
+        for account, body in reviews.items()
+        if "\n".join(body).strip()
+    }
+
+
+def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
+    if not review_text:
+        return ""
+    safe = escape(review_text)
+    return f"""
+<section class="panel">
+  <h3>{escape(account)} LOF/ETF 组合复盘</h3>
+  <pre class="ai-snippet">{safe}</pre>
+</section>
+"""
+
+
 def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
     """Keep analysis text, but remove AI-provided display names adjacent to code."""
     escaped_code = re.escape(code)
@@ -861,6 +921,11 @@ def _holding_analysis_card(
             '<p class="note">场外基金暂未接入股票日报分析。本页仅展示来自 '
             "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
         )
+    elif asset_type == "lof":
+        analysis = (
+            '<p class="note">本标的属于 LOF/ETF，已纳入账户级 LOF/ETF 组合复盘，'
+            "不进行逐只股票评分。</p>"
+        )
     elif snippets_by_code.get(code):
         analysis = _render_text_snippets(snippets_by_code.get(code, []), code)
     elif unfinished_by_code.get(code):
@@ -905,6 +970,8 @@ def _render_account_summary(
         summaries = summary_by_code.get(code, [])
         if asset_type == "otc":
             detail = "场外基金暂未接入股票日报分析，仅展示持仓清单。"
+        elif asset_type == "lof":
+            detail = "已纳入账户级 LOF/ETF 组合复盘，不进行逐只股票评分。"
         elif summaries:
             detail = "；".join(
                 _summary_detail_text(summary, code)
@@ -939,14 +1006,18 @@ def _render_standard_account_section(
     summary_by_code: dict[str, list[str]],
     snippets_by_code: dict[str, list[str]],
     unfinished_by_code: dict[str, list[str]],
+    lof_reviews_by_account: dict[str, str],
     is_open: bool,
 ) -> str:
     items = _account_items(groups)
+    has_lof = any(str(item.get("type", "")) == "lof" for item in items)
+    lof_review = _render_lof_portfolio_review(account, lof_reviews_by_account.get(account)) if has_lof else ""
     return f"""
 <details {"open" if is_open else ""}>
   <summary>{escape(account)}</summary>
   <div class="details-body">
     {_render_account_summary(account, items, summary_by_code, unfinished_by_code)}
+    {lof_review}
     <section class="panel">
       <h3>{escape(account)}持仓明细与分析</h3>
       {_render_holding_cards(items, snippets_by_code, summary_by_code, unfinished_by_code)}
@@ -973,6 +1044,7 @@ def _build_holding_report_page(
     snippets_by_code = _extract_ai_snippets(markdown_text, all_holdings)
     summary_by_code = _extract_ai_summary_items(markdown_text)
     unfinished_by_code = _extract_unfinished_items(markdown_text)
+    lof_reviews_by_account = _extract_lof_portfolio_reviews(markdown_text)
     snapshot_codes = _all_snapshot_codes(snapshot)
     unmatched: dict[str, list[str]] = {}
     for source in (summary_by_code, snippets_by_code, unfinished_by_code):
@@ -994,6 +1066,7 @@ def _build_holding_report_page(
                 summary_by_code,
                 snippets_by_code,
                 unfinished_by_code,
+                lof_reviews_by_account,
                 idx == 0,
             )
         )
