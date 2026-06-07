@@ -12,7 +12,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_REPORTS_DIR = ROOT_DIR / "reports"
 DEFAULT_LOGS_DIR = ROOT_DIR / "logs"
 MIN_REPORT_BYTES = 500
-ZERO_SUCCESS_RE = re.compile(r"(成功\s*[:：]\s*0|success\s*[=:]\s*0)", re.IGNORECASE)
+SUCCESS_SUMMARY_RE = re.compile(
+    r"(?:成功|success)\s*[:：=]\s*(\d+)\s*[,，]\s*(?:失败|fail(?:ed|ure)?|failed)\s*[:：=]\s*(\d+)",
+    re.IGNORECASE,
+)
 
 
 def _latest_report(reports_dir: Path) -> Path | None:
@@ -24,26 +27,29 @@ def _latest_report(reports_dir: Path) -> Path | None:
     return reports[0] if reports else None
 
 
-def _iter_log_files(logs_dir: Path) -> list[Path]:
+def _latest_log(logs_dir: Path) -> Path | None:
     if not logs_dir.exists():
-        return []
-    patterns = ("*.log", "*.txt", "*.out")
-    files: list[Path] = []
-    for pattern in patterns:
-        files.extend(path for path in logs_dir.rglob(pattern) if path.is_file())
-    return sorted(set(files), key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+        return None
+    debug_logs = [path for path in logs_dir.glob("stock_analysis_debug_*.log") if path.is_file()]
+    if debug_logs:
+        return max(debug_logs, key=lambda path: (path.stat().st_mtime, path.name))
+    analysis_logs = [path for path in logs_dir.glob("stock_analysis_*.log") if path.is_file()]
+    if analysis_logs:
+        return max(analysis_logs, key=lambda path: (path.stat().st_mtime, path.name))
+    return None
 
 
-def _contains_zero_success(log_files: list[Path]) -> tuple[bool, Path | None, str]:
-    for path in log_files:
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        match = ZERO_SUCCESS_RE.search(text)
-        if match:
-            return True, path, match.group(0)
-    return False, None, ""
+def _last_success_summary(log_path: Path) -> tuple[int, int] | None:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        print(f"WARNING: cannot read latest log {log_path}: {exc}", file=sys.stderr)
+        return None
+    matches = list(SUCCESS_SUMMARY_RE.finditer(text))
+    if not matches:
+        return None
+    last = matches[-1]
+    return int(last.group(1)), int(last.group(2))
 
 
 def validate_report(reports_dir: Path, logs_dir: Path, min_bytes: int = MIN_REPORT_BYTES) -> int:
@@ -53,6 +59,7 @@ def validate_report(reports_dir: Path, logs_dir: Path, min_bytes: int = MIN_REPO
         return 1
 
     size = latest.stat().st_size
+    print(f"Latest report: {latest} ({size} bytes)")
     if size <= min_bytes:
         print(
             f"ERROR: latest report is too small: {latest} ({size} bytes <= {min_bytes})",
@@ -60,12 +67,26 @@ def validate_report(reports_dir: Path, logs_dir: Path, min_bytes: int = MIN_REPO
         )
         return 1
 
-    has_zero_success, log_path, matched = _contains_zero_success(_iter_log_files(logs_dir))
-    if has_zero_success:
+    latest_log = _latest_log(logs_dir)
+    if latest_log is None:
+        print(f"WARNING: no stock_analysis log found under {logs_dir}; report size check passed")
+        print(f"OK: valid stock report found: {latest} ({size} bytes)")
+        return 0
+
+    print(f"Latest log: {latest_log}")
+    summary = _last_success_summary(latest_log)
+    if summary is None:
         print(
-            f"ERROR: analysis log indicates zero successful stocks: {matched} in {log_path}",
-            file=sys.stderr,
+            f"WARNING: no success/failure summary found in latest log {latest_log}; "
+            "report size check passed"
         )
+        print(f"OK: valid stock report found: {latest} ({size} bytes)")
+        return 0
+
+    success_count, fail_count = summary
+    print(f"Latest analysis summary: success={success_count}, failed={fail_count}")
+    if success_count == 0:
+        print(f"ERROR: latest analysis log indicates zero successful stocks: {latest_log}", file=sys.stderr)
         return 1
 
     print(f"OK: valid stock report found: {latest} ({size} bytes)")
