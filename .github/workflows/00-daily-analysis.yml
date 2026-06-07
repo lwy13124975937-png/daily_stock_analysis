@@ -480,9 +480,22 @@ jobs:
             python main.py $FORCE_RUN_ARG
           fi
 
+      - name: 上传 debug logs
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: debug-logs-${{ github.run_number }}
+          path: |
+            logs/
+          retention-days: 30
+
       - name: 检查有效股票日报
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'market-only' }}
         run: python scripts/check_report_valid.py
+
+      - name: 检查日报 code 覆盖
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'market-only' }}
+        run: python scripts/check_report_coverage.py
 
       - name: 生成静态报告网页
         run: python scripts/build_pages_report.py

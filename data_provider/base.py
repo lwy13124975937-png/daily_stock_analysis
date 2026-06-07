@@ -135,7 +135,7 @@ def normalize_stock_code(stock_code: str) -> str:
     return code
 
 
-ETF_PREFIXES = ("50", "51", "52", "56", "58", "15", "16", "18")
+ETF_PREFIXES = ("51", "52", "56", "58", "15", "16", "18")
 
 
 def _is_us_market(code: str) -> bool:

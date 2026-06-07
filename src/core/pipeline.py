@@ -25,7 +25,7 @@ import pandas as pd
 from src.config import FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT, get_config, Config
 from src.storage import get_db
 from data_provider import DataFetcherManager
-from data_provider.base import _is_etf_code, normalize_stock_code
+from data_provider.base import normalize_stock_code
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
@@ -265,81 +265,6 @@ class StockAnalysisPipeline:
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"{stock_name}({code}) {error_msg}")
             return False, error_msg
-
-    @staticmethod
-    def _is_exchange_traded_fund_code(code: str) -> bool:
-        try:
-            return _is_etf_code(normalize_stock_code(code))
-        except Exception:
-            return False
-
-    def _resolve_fallback_fund_name(self, code: str) -> str:
-        try:
-            name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
-            if name:
-                return str(name)
-        except Exception:
-            pass
-        return f"场内基金{normalize_stock_code(code)}"
-
-    def _build_exchange_fund_fallback_result(
-        self,
-        code: str,
-        *,
-        stock_name: Optional[str] = None,
-        reason: Optional[str] = None,
-        query_id: Optional[str] = None,
-        trend_result: Optional[TrendAnalysisResult] = None,
-    ) -> AnalysisResult:
-        """Return a successful placeholder for ETF/LOF codes when full analysis fails."""
-        normalized_code = normalize_stock_code(code)
-        report_language = normalize_report_language(getattr(self.config, "report_language", "zh"))
-        name = stock_name or self._resolve_fallback_fund_name(normalized_code)
-        summary = (
-            "该场内基金/ETF/LOF 本次未取得完整股票分析数据，已生成数据不足占位复盘。"
-            "后续可接入基金净值、跟踪指数、重仓行业和基金经理复盘。"
-        )
-        if trend_result is not None:
-            trend_label = self._trend_label_fallback(trend_result, report_language)
-        else:
-            trend_label = ""
-        result = AnalysisResult(
-            code=normalized_code,
-            name=name,
-            sentiment_score=50,
-            trend_prediction=trend_label or ("Data insufficient" if report_language == "en" else "数据不足"),
-            operation_advice="Watch" if report_language == "en" else "观望",
-            decision_type="hold",
-            confidence_level=localize_confidence_level("low", report_language),
-            report_language=report_language,
-            dashboard={
-                "intelligence": {
-                    "sentiment_summary": "基金专属数据暂未完整接入。",
-                    "earnings_outlook": "不适用，场内基金应关注净值、跟踪标的和持仓行业。",
-                },
-                "core_conclusion": {
-                    "one_sentence": summary,
-                    "time_sensitivity": "不急",
-                    "position_advice": {
-                        "no_position": "数据不足，暂不作为买入依据。",
-                        "has_position": "仅作持仓清单占位复盘，等待基金专属分析能力补齐。",
-                    },
-                },
-                "data_perspective": {
-                    "trend_status": {
-                        "ma_alignment": trend_label or "数据不足",
-                        "trend_strength": 0,
-                    }
-                },
-            },
-            analysis_summary=summary,
-            risk_warning="数据不足，占位内容不构成投资建议。",
-            data_sources="exchange_fund:fallback",
-            success=True,
-            error_message=reason,
-        )
-        result.query_id = query_id
-        return result
     
     def analyze_stock(
         self,
@@ -2317,19 +2242,6 @@ class StockAnalysisPipeline:
                         report_type=report_type,
                         fallback_code=code,
                     )
-            elif self._is_exchange_traded_fund_code(code):
-                reason = (
-                    result.error_message
-                    if result and result.error_message
-                    else "交易所基金完整分析未返回成功结果"
-                )
-                logger.warning("[%s] 场内基金/ETF/LOF 分析降级为占位结果: %s", code, reason)
-                result = self._build_exchange_fund_fallback_result(
-                    code,
-                    stock_name=getattr(result, "name", None) if result else None,
-                    reason=reason,
-                    query_id=effective_query_id,
-                )
             elif result:
                 logger.warning(
                     f"[{code}] 分析未成功: {result.error_message or '未知错误'}"
@@ -2340,13 +2252,6 @@ class StockAnalysisPipeline:
         except Exception as e:
             # 捕获所有异常，确保单股失败不影响整体
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
-            if self._is_exchange_traded_fund_code(code):
-                logger.warning("[%s] 场内基金/ETF/LOF 异常降级为占位结果: %s", code, e)
-                return self._build_exchange_fund_fallback_result(
-                    code,
-                    reason=str(e),
-                    query_id=effective_query_id,
-                )
             return None
         finally:
             reset_run_diagnostic_context(diag_token)
@@ -2427,6 +2332,7 @@ class StockAnalysisPipeline:
             )
         
         results: List[AnalysisResult] = []
+        failed_results: List[Dict[str, str]] = []
         
         # 使用线程池并发处理
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
@@ -2459,10 +2365,21 @@ class StockAnalysisPipeline:
                                 fallback_code=code,
                             )
                     elif result and not result.success:
+                        failed_results.append({
+                            "code": str(getattr(result, "code", None) or code),
+                            "name": str(getattr(result, "name", None) or code),
+                            "reason": str(result.error_message or "分析结果标记为失败"),
+                        })
                         logger.warning(
                             f"[{code}] 分析结果标记为失败，不计入汇总: "
                             f"{result.error_message or '未知原因'}"
                         )
+                    else:
+                        failed_results.append({
+                            "code": str(code),
+                            "name": str(code),
+                            "reason": "处理过程未返回分析结果",
+                        })
 
                     # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
                     if idx < len(stock_codes) - 1 and analysis_delay > 0:
@@ -2474,6 +2391,11 @@ class StockAnalysisPipeline:
                         time.sleep(analysis_delay)
 
                 except Exception as e:
+                    failed_results.append({
+                        "code": str(code),
+                        "name": str(code),
+                        "reason": str(e) or type(e).__name__,
+                    })
                     logger.error(f"[{code}] 任务执行失败: {e}")
         
         # 统计
@@ -2501,21 +2423,21 @@ class StockAnalysisPipeline:
         logger.info(f"成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f} 秒")
         
         # 保存报告到本地文件（无论是否推送通知都保存）
-        if results and not dry_run:
-            self._save_local_report(results, report_type)
+        if (results or failed_results) and not dry_run:
+            self._save_local_report(results, report_type, failed_results=failed_results)
 
         # 发送通知（单股推送模式下跳过汇总推送，避免重复）
         if results and send_notification and not dry_run:
             if single_stock_notify:
                 # 单股推送模式：只保存汇总报告，不再重复推送
                 logger.info("单股推送模式：跳过汇总推送，仅保存报告到本地")
-                self._send_notifications(results, report_type, skip_push=True)
+                self._send_notifications(results, report_type, skip_push=True, failed_results=failed_results)
             elif merge_notification:
                 # 合并模式（Issue #190）：仅保存，不推送，由 main 层合并个股+大盘后统一发送
                 logger.info("合并推送模式：跳过本次推送，将在个股+大盘复盘后统一发送")
-                self._send_notifications(results, report_type, skip_push=True)
+                self._send_notifications(results, report_type, skip_push=True, failed_results=failed_results)
             else:
-                self._send_notifications(results, report_type)
+                self._send_notifications(results, report_type, failed_results=failed_results)
         
         return results
 
@@ -2618,10 +2540,11 @@ class StockAnalysisPipeline:
         self,
         results: List[AnalysisResult],
         report_type: ReportType = ReportType.SIMPLE,
+        failed_results: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """保存分析报告到本地文件（与通知推送解耦）"""
         try:
-            report = self._generate_aggregate_report(results, report_type)
+            report = self._generate_aggregate_report(results, report_type, failed_results=failed_results)
             filepath = self.notifier.save_report_to_file(report)
             logger.info(f"决策仪表盘日报已保存: {filepath}")
         except Exception as e:
@@ -2632,6 +2555,7 @@ class StockAnalysisPipeline:
         results: List[AnalysisResult],
         report_type: ReportType = ReportType.SIMPLE,
         skip_push: bool = False,
+        failed_results: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """
         发送分析结果通知
@@ -2646,7 +2570,7 @@ class StockAnalysisPipeline:
         noise_finalized = False
         try:
             logger.info("生成决策仪表盘日报...")
-            report = self._generate_aggregate_report(results, report_type)
+            report = self._generate_aggregate_report(results, report_type, failed_results=failed_results)
             
             # 跳过推送（单股推送模式 / 合并模式：报告已由 _save_local_report 保存）
             if skip_push:
@@ -3158,11 +3082,38 @@ class StockAnalysisPipeline:
         self,
         results: List[AnalysisResult],
         report_type: ReportType,
+        failed_results: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """Generate aggregate report with backward-compatible notifier fallback."""
         generator = getattr(self.notifier, "generate_aggregate_report", None)
         if callable(generator):
-            return generator(results, report_type)
+            report = generator(results, report_type)
+            return self._append_unfinished_analysis_section(report, failed_results)
         if report_type == ReportType.BRIEF and hasattr(self.notifier, "generate_brief_report"):
-            return self.notifier.generate_brief_report(results)
-        return self.notifier.generate_dashboard_report(results)
+            report = self.notifier.generate_brief_report(results)
+            return self._append_unfinished_analysis_section(report, failed_results)
+        if results:
+            report = self.notifier.generate_dashboard_report(results)
+        else:
+            report = "# 股票分析日报\n\n> 本次没有成功完成的股票分析。\n"
+        return self._append_unfinished_analysis_section(report, failed_results)
+
+    @staticmethod
+    def _append_unfinished_analysis_section(
+        report: str,
+        failed_results: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        items = []
+        seen_codes = set()
+        for item in failed_results or []:
+            code = str(item.get("code", "") or "").strip()
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            name = str(item.get("name", "") or code).strip() or code
+            reason = str(item.get("reason", "") or "未知原因").strip() or "未知原因"
+            items.append(f"- {name}({code})：失败原因 {reason}")
+        if not items:
+            return report
+        section = "\n\n## 未完成分析标的\n\n" + "\n".join(items) + "\n"
+        return report.rstrip() + section
