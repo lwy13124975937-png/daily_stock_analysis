@@ -527,6 +527,42 @@ def _extract_ai_summary_items(markdown_text: str) -> dict[str, list[str]]:
     return by_code
 
 
+def _extract_unfinished_items(markdown_text: str) -> dict[str, list[str]]:
+    by_code: dict[str, list[str]] = {}
+    for section in _markdown_sections(markdown_text):
+        if "未完成分析标的" not in re.sub(r"\s+", "", section.heading):
+            continue
+        current_lines: list[str] = []
+
+        def flush() -> None:
+            if not current_lines:
+                return
+            item = "\n".join(current_lines).strip()
+            codes = _codes_in_text(item)
+            if len(codes) != 1:
+                return
+            code = codes[0]
+            _append_ai_snippet(by_code, code, item, max_chars=MAX_AI_SNIPPET_CHARS)
+
+        for line in section.body.splitlines():
+            if re.match(r"^\s*[-*+]\s+", line):
+                flush()
+                current_lines = [line]
+            elif current_lines:
+                current_lines.append(line)
+        flush()
+    return by_code
+
+
+def _render_failure_snippets(failures: list[str], code: str) -> str:
+    if not failures:
+        return ""
+    rendered = ['<p class="muted">本次分析未完成，以下为失败原因：</p>']
+    for failure in failures[:MAX_AI_SNIPPETS_PER_CODE]:
+        rendered.append(f'<pre class="ai-snippet">{escape(_summary_detail_text(failure, code))}</pre>')
+    return "".join(rendered)
+
+
 def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
     """Keep analysis text, but remove AI-provided display names adjacent to code."""
     escaped_code = re.escape(code)
@@ -813,6 +849,7 @@ def _holding_analysis_card(
     item: dict,
     snippets_by_code: dict[str, list[str]],
     summary_by_code: dict[str, list[str]],
+    unfinished_by_code: dict[str, list[str]],
 ) -> str:
     name = str(item.get("name", "") or "-")
     code = str(item.get("code", "") or "-")
@@ -826,6 +863,8 @@ def _holding_analysis_card(
         )
     elif snippets_by_code.get(code):
         analysis = _render_text_snippets(snippets_by_code.get(code, []), code)
+    elif unfinished_by_code.get(code):
+        analysis = _render_failure_snippets(unfinished_by_code.get(code, []), code)
     else:
         analysis = _render_summary_fallback(summary_by_code, code)
     return f"""
@@ -841,11 +880,12 @@ def _render_holding_cards(
     items: list[dict],
     snippets_by_code: dict[str, list[str]],
     summary_by_code: dict[str, list[str]],
+    unfinished_by_code: dict[str, list[str]],
 ) -> str:
     if not items:
         return '<p class="muted">暂无持仓。</p>'
     return "".join(
-        _holding_analysis_card(item, snippets_by_code, summary_by_code)
+        _holding_analysis_card(item, snippets_by_code, summary_by_code, unfinished_by_code)
         for item in items
     )
 
@@ -854,6 +894,7 @@ def _render_account_summary(
     account: str,
     items: list[dict],
     summary_by_code: dict[str, list[str]],
+    unfinished_by_code: dict[str, list[str]],
 ) -> str:
     rows = []
     for item in items:
@@ -868,6 +909,11 @@ def _render_account_summary(
             detail = "；".join(
                 _summary_detail_text(summary, code)
                 for summary in summaries[:MAX_AI_SNIPPETS_PER_CODE]
+            )
+        elif unfinished_by_code.get(code):
+            detail = "分析失败：" + "；".join(
+                _summary_detail_text(failure, code)
+                for failure in unfinished_by_code.get(code, [])[:MAX_AI_SNIPPETS_PER_CODE]
             )
         else:
             detail = "AI摘要缺失"
@@ -892,6 +938,7 @@ def _render_standard_account_section(
     groups: dict,
     summary_by_code: dict[str, list[str]],
     snippets_by_code: dict[str, list[str]],
+    unfinished_by_code: dict[str, list[str]],
     is_open: bool,
 ) -> str:
     items = _account_items(groups)
@@ -899,10 +946,10 @@ def _render_standard_account_section(
 <details {"open" if is_open else ""}>
   <summary>{escape(account)}</summary>
   <div class="details-body">
-    {_render_account_summary(account, items, summary_by_code)}
+    {_render_account_summary(account, items, summary_by_code, unfinished_by_code)}
     <section class="panel">
       <h3>{escape(account)}持仓明细与分析</h3>
-      {_render_holding_cards(items, snippets_by_code, summary_by_code)}
+      {_render_holding_cards(items, snippets_by_code, summary_by_code, unfinished_by_code)}
     </section>
   </div>
 </details>
@@ -925,9 +972,10 @@ def _build_holding_report_page(
 
     snippets_by_code = _extract_ai_snippets(markdown_text, all_holdings)
     summary_by_code = _extract_ai_summary_items(markdown_text)
+    unfinished_by_code = _extract_unfinished_items(markdown_text)
     snapshot_codes = _all_snapshot_codes(snapshot)
     unmatched: dict[str, list[str]] = {}
-    for source in (summary_by_code, snippets_by_code):
+    for source in (summary_by_code, snippets_by_code, unfinished_by_code):
         for code, snippets in source.items():
             if code in snapshot_codes:
                 continue
@@ -945,6 +993,7 @@ def _build_holding_report_page(
                 groups,
                 summary_by_code,
                 snippets_by_code,
+                unfinished_by_code,
                 idx == 0,
             )
         )
