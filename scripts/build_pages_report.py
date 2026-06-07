@@ -51,6 +51,29 @@ GLOBAL_SECTION_KEYWORDS = (
 )
 MAX_AI_SNIPPETS_PER_CODE = 3
 MAX_AI_SNIPPET_CHARS = 500
+TABLE_LINE_RE = re.compile(r"^\s*\|.*\|\s*$")
+TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+SKIP_DETAIL_HEADING_KEYWORDS = (
+    "当日行情",
+    "数据透视",
+    "检查清单",
+    "持仓情况",
+    "操作建议",
+    "价格指标",
+)
+FUND_DECISION_WORD_REPLACEMENTS = (
+    ("买入", "配置观察"),
+    ("卖出", "风险观察"),
+    ("观望", "继续跟踪"),
+    ("交易建议", "配置观察"),
+    ("交易评级", "配置观察"),
+    ("股票评级", "配置观察"),
+    ("评级", "观察结论"),
+    ("打分", "观察"),
+    ("评分", "观察"),
+    ("逐只股票", "逐个标的"),
+    ("个股技术面", "标的短线波动"),
+)
 
 
 @dataclass(frozen=True)
@@ -382,6 +405,19 @@ def _holding_code_from_title(text: str, name_code_pairs: list[tuple[str, str]]) 
     return None
 
 
+def _is_non_holding_report_boundary(text: str) -> bool:
+    compact = re.sub(r"\s+", "", _clean_heading_text(text))
+    return (
+        _is_global_ai_heading(text)
+        or "未完成分析标的" in compact
+        or "LOF/ETF组合复盘" in compact
+    )
+
+
+def _is_next_holding_boundary(text: str, name_code_pairs: list[tuple[str, str]]) -> bool:
+    return _holding_code_from_title(text, name_code_pairs) is not None
+
+
 def _ordered_title_text(line: str) -> str | None:
     match = re.match(r"^\s*\d+[.)、]\s+(.+?)\s*$", line)
     if not match:
@@ -432,7 +468,7 @@ def _extract_heading_sections(
             continue
         end = len(lines)
         for next_heading in headings[pos + 1:]:
-            if next_heading.level <= heading.level:
+            if _is_next_holding_boundary(next_heading.text, name_code_pairs) or _is_non_holding_report_boundary(next_heading.text):
                 end = next_heading.line_index
                 break
         _append_full_markdown_section(
@@ -629,9 +665,7 @@ def _extract_lof_portfolio_reviews(markdown_text: str) -> dict[str, str]:
 def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
     if not review_text:
         return ""
-    review_text = review_text.replace("逐只股票评分", "逐只股票评级")
-    review_text = review_text.replace("个股式评分", "个股式评级")
-    review_text = review_text.replace("评分", "评级")
+    review_text = _fund_review_display_text(review_text)
     return f"""
 <section class="panel">
   <h3>{escape(account)} LOF/ETF 组合复盘</h3>
@@ -640,12 +674,47 @@ def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
 """
 
 
+def _fund_review_display_text(text: str) -> str:
+    clean = text or ""
+    for old, new in FUND_DECISION_WORD_REPLACEMENTS:
+        clean = clean.replace(old, new)
+    return clean
+
+
+def _normalize_fragment_heading(text: str) -> str:
+    clean = _plain_markdown_text(text)
+    clean = re.sub(r"^#+\s*", "", clean).strip()
+    return clean
+
+
+def _is_code_only_heading(text: str) -> bool:
+    clean = _normalize_fragment_heading(text)
+    return bool(re.fullmatch(r"\d{6}", clean))
+
+
+def _should_skip_detail_section(heading_text: str) -> bool:
+    clean = _normalize_fragment_heading(heading_text)
+    if not clean or _is_code_only_heading(clean):
+        return True
+    return any(keyword in clean for keyword in SKIP_DETAIL_HEADING_KEYWORDS)
+
+
+def _is_markdown_table_line(line: str) -> bool:
+    stripped = line.strip()
+    if TABLE_SEPARATOR_RE.match(stripped):
+        return True
+    if TABLE_LINE_RE.match(stripped) and stripped.count("|") >= 2:
+        return True
+    return False
+
+
 def _render_markdown_fragment(markdown_text: str) -> str:
     lines = markdown_text.splitlines()
     html: list[str] = []
     paragraph: list[str] = []
     list_items: list[str] = []
     in_fence = False
+    skip_section = False
 
     def inline(text: str) -> str:
         safe = escape(text.strip())
@@ -685,8 +754,18 @@ def _render_markdown_fragment(markdown_text: str) -> str:
             flush_paragraph()
             flush_list()
             level, text = heading
+            clean_heading = _normalize_fragment_heading(text)
+            skip_section = _should_skip_detail_section(clean_heading)
+            if skip_section:
+                continue
             tag = "h4" if level <= 3 else "h5"
-            html.append(f"<{tag}>{inline(_clean_heading_text(text))}</{tag}>")
+            html.append(f"<{tag}>{inline(clean_heading)}</{tag}>")
+            continue
+        if skip_section:
+            continue
+        if _is_markdown_table_line(stripped):
+            flush_paragraph()
+            flush_list()
             continue
         bullet = re.match(r"^[-*+]\s+(.+)$", stripped)
         if bullet:
@@ -706,23 +785,28 @@ def _render_markdown_fragment(markdown_text: str) -> str:
 
 
 def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
-    """Keep analysis text, but remove AI-provided display names adjacent to code."""
-    escaped_code = re.escape(code)
-    text = snippet
-    text = re.sub(
-        rf"[\u4e00-\u9fffA-Za-z0-9*·_\-/\s]{{1,40}}[（(]\s*{escaped_code}\s*[）)]",
-        code,
-        text,
-    )
-    text = re.sub(
-        rf"{escaped_code}\s*[-—:：]\s*[^\n|，。；;]{{1,40}}",
-        code,
-        text,
-    )
-    text = re.sub(rf"\*\*\s*{escaped_code}\s*\*\*", code, text)
-    text = re.sub(rf"{escaped_code}\s*\*\*", code, text)
-    text = re.sub(r"^(#{1,6})(?=\S)", r"\1 ", text, flags=re.MULTILINE)
-    return text.strip()
+    """Keep analysis text while dropping duplicate leading holding titles."""
+    text = re.sub(r"^(#{1,6})(?=\S)", r"\1 ", snippet or "", flags=re.MULTILINE).strip()
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    while lines:
+        first = lines[0].strip()
+        heading = _heading_match(first)
+        heading_text = _normalize_fragment_heading(heading[1]) if heading else _plain_markdown_text(first)
+        ordered_title = _ordered_title_text(first) or ""
+        if (
+            code in _codes_in_text(heading_text)
+            or _is_code_only_heading(heading_text)
+            or (ordered_title and code in _codes_in_text(ordered_title))
+        ):
+            lines.pop(0)
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            continue
+        break
+    return "\n".join(lines).strip()
 
 
 def _render_text_snippets(snippets: list[str], code: str) -> str:
@@ -747,13 +831,38 @@ def _summary_detail_text(summary: str, code: str) -> str:
 
 
 def _failure_detail_text(failure: str, code: str) -> str:
+    raw = failure or ""
+    raw_lower = raw.lower()
+    if (
+        "503" in raw
+        or "serviceunavailable" in raw_lower
+        or "serviceunavailableerror" in raw_lower
+        or "unavailable" in raw_lower
+        or "high demand" in raw_lower
+        or "overloaded" in raw_lower
+        or "all llm models failed" in raw_lower
+        or "geminiexception" in raw_lower
+    ):
+        return "Gemini 模型服务暂不可用，本标的未完成分析。"
+    if (
+        "429" in raw
+        or "quota" in raw_lower
+        or "resource_exhausted" in raw_lower
+        or "resourceexhausted" in raw_lower
+        or "too many requests" in raw_lower
+        or "toomanyrequests" in raw_lower
+        or "free tier requests limit" in raw_lower
+    ):
+        return "Gemini API 额度超限，导致本标的未完成分析。"
+    if "timeout" in raw_lower or "timed out" in raw_lower:
+        return "AI 请求超时，本标的未完成分析。"
+
     detail = _summary_detail_text(failure, code)
     detail = re.sub(r"^失败原因\s*", "", detail).strip()
-    lower = detail.lower()
-    if "429" in detail or "quota" in lower or "resourceexhausted" in lower:
-        return "Gemini API 额度超限，导致本标的未完成分析。"
-    if len(detail) > 180:
-        return detail[:180].rstrip() + "..."
+    detail = re.sub(r"All LLM models failed.*", "", detail, flags=re.IGNORECASE).strip()
+    detail = re.sub(r"\{.*", "", detail).strip()
+    if len(detail) > 120:
+        return detail[:120].rstrip() + "..."
     return detail or "本标的未完成分析。"
 
 
@@ -995,7 +1104,7 @@ def _render_summary_fallback(summary_by_code: dict[str, list[str]], code: str) -
     snippets = []
     for summary in summaries[:MAX_AI_SNIPPETS_PER_CODE]:
         detail = _summary_detail_text(summary, code)
-        snippets.append(f'<pre class="ai-snippet">{escape(detail)}</pre>')
+        snippets.append(f'<p class="note">{escape(detail)}</p>')
     return (
         '<p class="muted">暂无完整单项分析，以下为 AI 摘要：</p>'
         + "".join(snippets)

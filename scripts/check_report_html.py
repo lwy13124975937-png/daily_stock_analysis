@@ -11,9 +11,31 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SITE_REPORTS_DIR = ROOT_DIR / "site" / "reports"
 RAW_REPORT_MARKER = "<summary>原始 AI 股票日报</summary>"
-BAD_SUMMARY_TOKENS = ("**", "###", "####", "AI摘要缺失")
-BAD_ACCOUNT_MARKDOWN_TOKENS = ("**", "###", "####", "```", "AI摘要缺失")
-BAD_ACCOUNT_ERROR_TOKENS = ("ResourceExhausted", "quota exceeded", '"error"', '"code"', '"message"')
+BAD_SUMMARY_TOKENS = ("**", "#", "###", "####", "AI摘要缺失")
+BAD_ACCOUNT_MARKDOWN_TOKENS = (
+    "**",
+    "### #",
+    "#### #",
+    "## #",
+    "```",
+    "# 重要信息速览",
+    "# 当日行情",
+    "# 数据透视",
+    "|---------|",
+    "| 持仓情况 |",
+    "AI摘要缺失",
+)
+BAD_ACCOUNT_ERROR_TOKENS = (
+    "All LLM models failed",
+    "GeminiException",
+    "ServiceUnavailableError",
+    "RESOURCE_EXHAUSTED",
+    "ResourceExhausted",
+    "quota exceeded",
+    '"error":',
+    '"code"',
+    '"message"',
+)
 SENSITIVE_TOKENS = (
     "unit_cost",
     "shares",
@@ -28,7 +50,7 @@ SENSITIVE_TOKENS = (
     "账户金额",
     "总资产",
 )
-FUND_DECISION_TOKENS = ("买入", "卖出", "观望", "评分")
+FUND_DECISION_TOKENS = ("买入", "卖出", "观望", "评分", "评级", "打分", "交易评级", "股票评级", "交易建议")
 
 
 def latest_report_html() -> Path | None:
