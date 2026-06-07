@@ -263,6 +263,18 @@ def _clean_heading_text(text: str) -> str:
     return re.sub(r"[*_`~]+", "", text or "").strip()
 
 
+def _plain_markdown_text(text: str) -> str:
+    clean = text or ""
+    clean = re.sub(r"^\s{0,3}#{1,6}\s*", "", clean)
+    clean = re.sub(r"^[-*+]\s+", "", clean.strip())
+    clean = re.sub(r"^\d+[.)、]\s+", "", clean)
+    clean = re.sub(r"`{3,}", "", clean)
+    clean = re.sub(r"`([^`]+)`", r"\1", clean)
+    clean = re.sub(r"[*_~]+", "", clean)
+    clean = re.sub(r"\s+", " ", clean)
+    return clean.strip()
+
+
 def _markdown_headings(markdown_text: str) -> list[MarkdownHeading]:
     headings: list[MarkdownHeading] = []
     for idx, line in enumerate(markdown_text.splitlines()):
@@ -473,6 +485,9 @@ def _extract_ai_snippets(markdown_text: str, holdings: list[dict] | None = None)
     for section in _markdown_sections(markdown_text):
         heading = section.heading
         body = section.body
+        compact_heading = re.sub(r"\s+", "", heading)
+        if "未完成分析标的" in compact_heading or "LOF/ETF组合复盘" in compact_heading:
+            continue
         heading_codes = _codes_in_text(heading)
         if len(heading_codes) == 1 and heading_codes[0] not in by_code:
             _append_section_snippets(
@@ -538,10 +553,10 @@ def _extract_unfinished_items(markdown_text: str) -> dict[str, list[str]]:
             if not current_lines:
                 return
             item = "\n".join(current_lines).strip()
-            codes = _codes_in_text(item)
-            if len(codes) != 1:
+            first_code = CODE_RE.search(item)
+            if first_code is None:
                 return
-            code = codes[0]
+            code = first_code.group(1)
             _append_ai_snippet(by_code, code, item, max_chars=MAX_AI_SNIPPET_CHARS)
 
         for line in section.body.splitlines():
@@ -559,7 +574,7 @@ def _render_failure_snippets(failures: list[str], code: str) -> str:
         return ""
     rendered = ['<p class="muted">本次分析未完成，以下为失败原因：</p>']
     for failure in failures[:MAX_AI_SNIPPETS_PER_CODE]:
-        rendered.append(f'<pre class="ai-snippet">{escape(_summary_detail_text(failure, code))}</pre>')
+        rendered.append(f'<p class="note">分析失败：{escape(_failure_detail_text(failure, code))}</p>')
     return "".join(rendered)
 
 
@@ -614,13 +629,80 @@ def _extract_lof_portfolio_reviews(markdown_text: str) -> dict[str, str]:
 def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
     if not review_text:
         return ""
-    safe = escape(review_text)
+    review_text = review_text.replace("逐只股票评分", "逐只股票评级")
+    review_text = review_text.replace("个股式评分", "个股式评级")
+    review_text = review_text.replace("评分", "评级")
     return f"""
 <section class="panel">
   <h3>{escape(account)} LOF/ETF 组合复盘</h3>
-  <pre class="ai-snippet">{safe}</pre>
+  <div class="report-fragment">{_render_markdown_fragment(review_text)}</div>
 </section>
 """
+
+
+def _render_markdown_fragment(markdown_text: str) -> str:
+    lines = markdown_text.splitlines()
+    html: list[str] = []
+    paragraph: list[str] = []
+    list_items: list[str] = []
+    in_fence = False
+
+    def inline(text: str) -> str:
+        safe = escape(text.strip())
+        safe = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe)
+        safe = re.sub(r"__(.+?)__", r"<strong>\1</strong>", safe)
+        safe = re.sub(r"`([^`]+)`", r"<code>\1</code>", safe)
+        return safe
+
+    def flush_paragraph() -> None:
+        if paragraph:
+            html.append(f"<p>{inline(' '.join(paragraph))}</p>")
+            paragraph.clear()
+
+    def flush_list() -> None:
+        if list_items:
+            html.append("<ul>" + "".join(f"<li>{inline(item)}</li>" for item in list_items) + "</ul>")
+            list_items.clear()
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            flush_paragraph()
+            flush_list()
+            continue
+        if in_fence:
+            if stripped:
+                paragraph.append(stripped)
+            continue
+        if not stripped:
+            flush_paragraph()
+            flush_list()
+            continue
+        heading = _heading_match(stripped)
+        if heading is not None:
+            flush_paragraph()
+            flush_list()
+            level, text = heading
+            tag = "h4" if level <= 3 else "h5"
+            html.append(f"<{tag}>{inline(_clean_heading_text(text))}</{tag}>")
+            continue
+        bullet = re.match(r"^[-*+]\s+(.+)$", stripped)
+        if bullet:
+            flush_paragraph()
+            list_items.append(bullet.group(1).strip())
+            continue
+        ordered = re.match(r"^\d+[.)、]\s+(.+)$", stripped)
+        if ordered:
+            flush_paragraph()
+            list_items.append(ordered.group(1).strip())
+            continue
+        paragraph.append(stripped)
+
+    flush_paragraph()
+    flush_list()
+    return "".join(html) or '<p class="muted">暂无内容。</p>'
 
 
 def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
@@ -637,6 +719,9 @@ def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
         code,
         text,
     )
+    text = re.sub(rf"\*\*\s*{escaped_code}\s*\*\*", code, text)
+    text = re.sub(rf"{escaped_code}\s*\*\*", code, text)
+    text = re.sub(r"^(#{1,6})(?=\S)", r"\1 ", text, flags=re.MULTILINE)
     return text.strip()
 
 
@@ -645,19 +730,31 @@ def _render_text_snippets(snippets: list[str], code: str) -> str:
         return '<p class="muted">AI 暂未输出该标的分析，仅展示持仓清单。</p>'
     rendered = []
     for snippet in snippets:
-        safe_text = escape(_sanitize_ai_snippet_for_holding(snippet, code))
-        rendered.append(f'<pre class="ai-snippet">{safe_text}</pre>')
+        cleaned = _sanitize_ai_snippet_for_holding(snippet, code)
+        rendered.append(f'<div class="report-fragment">{_render_markdown_fragment(cleaned)}</div>')
     return "".join(rendered)
 
 
 def _summary_detail_text(summary: str, code: str) -> str:
     escaped_code = re.escape(code)
-    text = summary.strip()
+    text = _plain_markdown_text(summary)
     text = re.sub(r"^[-*+]\s+", "", text)
     text = re.sub(r"^\d+[.)、]\s+", "", text)
-    text = re.sub(rf"^.*?[（(]\s*{escaped_code}\s*[）)]\s*[:：]\s*", "", text)
+    text = re.sub(rf"^.*?[（(]\s*{escaped_code}\s*[）)]\s*[:：]?\s*", "", text)
     text = re.sub(rf"^{escaped_code}\s*[:：]\s*", "", text)
+    text = text.replace("|", "｜")
     return text.strip() or "有 AI 摘要项，详见原始股票日报。"
+
+
+def _failure_detail_text(failure: str, code: str) -> str:
+    detail = _summary_detail_text(failure, code)
+    detail = re.sub(r"^失败原因\s*", "", detail).strip()
+    lower = detail.lower()
+    if "429" in detail or "quota" in lower or "resourceexhausted" in lower:
+        return "Gemini API 额度超限，导致本标的未完成分析。"
+    if len(detail) > 180:
+        return detail[:180].rstrip() + "..."
+    return detail or "本标的未完成分析。"
 
 
 def _wrap_html(title: str, body: str) -> str:
@@ -924,7 +1021,7 @@ def _holding_analysis_card(
     elif asset_type == "lof":
         analysis = (
             '<p class="note">本标的属于 LOF/ETF，已纳入账户级 LOF/ETF 组合复盘，'
-            "不进行逐只股票评分。</p>"
+            "不参与逐只个股交易结论。</p>"
         )
     elif snippets_by_code.get(code):
         analysis = _render_text_snippets(snippets_by_code.get(code, []), code)
@@ -971,7 +1068,7 @@ def _render_account_summary(
         if asset_type == "otc":
             detail = "场外基金暂未接入股票日报分析，仅展示持仓清单。"
         elif asset_type == "lof":
-            detail = "已纳入账户级 LOF/ETF 组合复盘，不进行逐只股票评分。"
+            detail = "已纳入账户级 LOF/ETF 组合复盘，不参与逐只个股交易结论。"
         elif summaries:
             detail = "；".join(
                 _summary_detail_text(summary, code)
@@ -979,7 +1076,7 @@ def _render_account_summary(
             )
         elif unfinished_by_code.get(code):
             detail = "分析失败：" + "；".join(
-                _summary_detail_text(failure, code)
+                _failure_detail_text(failure, code)
                 for failure in unfinished_by_code.get(code, [])[:MAX_AI_SNIPPETS_PER_CODE]
             )
         else:
