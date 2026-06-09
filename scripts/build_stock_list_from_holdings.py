@@ -13,11 +13,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SITE_DATA_DIR = ROOT_DIR / "site_data"
 SNAPSHOT_PATH = SITE_DATA_DIR / "holdings_snapshot.json"
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_HOLDINGS_URL = (
     "https://raw.githubusercontent.com/"
@@ -103,7 +105,7 @@ def build_holdings_snapshot(data: dict, source_url: str) -> tuple[dict, dict[str
             _append_unique_code(stock_list, seen_analysis_codes, code)
 
     snapshot = {
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "source_url": source_url,
         "accounts": accounts,
         "type_labels": TYPE_LABELS,

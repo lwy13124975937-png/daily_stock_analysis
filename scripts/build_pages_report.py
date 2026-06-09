@@ -15,6 +15,7 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -24,6 +25,7 @@ HOLDINGS_SNAPSHOT_PATH = SITE_DATA_DIR / "holdings_snapshot.json"
 SITE_DIR = ROOT_DIR / "site"
 SITE_REPORTS_DIR = SITE_DIR / "reports"
 SITE_ACCOUNTS_DIR = SITE_DIR / "accounts"
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 DISCLAIMER = "本页面内容由 AI 自动生成，仅作复盘参考，不构成投资建议。"
 SOURCE_TEXT = "stock-dashboard 最新 holdings_data.json"
@@ -191,7 +193,7 @@ def _relative_href(path: Path) -> str:
 
 
 def _now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _load_holdings_snapshot() -> dict:
