@@ -137,6 +137,7 @@ class StockAnalysisPipeline:
         self.analyzer = GeminiAnalyzer(config=self.config, skills=self.analysis_skills)
         self.notifier = NotificationService(source_message=source_message)
         self._single_stock_notify_lock = threading.Lock()
+        self._portfolio_review_sections_cache: Optional[str] = None
         
         # 初始化搜索服务（可选，初始化失败不应阻断主分析流程）
         try:
@@ -2285,6 +2286,7 @@ class StockAnalysisPipeline:
             分析结果列表
         """
         start_time = time.time()
+        self._portfolio_review_sections_cache = None
         
         # 使用配置中的股票列表
         if stock_codes is None:
@@ -3090,86 +3092,218 @@ class StockAnalysisPipeline:
         generator = getattr(self.notifier, "generate_aggregate_report", None)
         if callable(generator):
             report = generator(results, report_type)
-            report = self._append_lof_etf_portfolio_review_section(report)
-            return self._append_unfinished_analysis_section(report, failed_results)
+            report = self._append_unfinished_analysis_section(report, failed_results)
+            return self._append_portfolio_review_sections(report)
         if report_type == ReportType.BRIEF and hasattr(self.notifier, "generate_brief_report"):
             report = self.notifier.generate_brief_report(results)
-            report = self._append_lof_etf_portfolio_review_section(report)
-            return self._append_unfinished_analysis_section(report, failed_results)
+            report = self._append_unfinished_analysis_section(report, failed_results)
+            return self._append_portfolio_review_sections(report)
         if results:
             report = self.notifier.generate_dashboard_report(results)
         else:
             report = "# 股票分析日报\n\n> 本次没有成功完成的股票分析。\n"
-        report = self._append_lof_etf_portfolio_review_section(report)
-        return self._append_unfinished_analysis_section(report, failed_results)
+        report = self._append_unfinished_analysis_section(report, failed_results)
+        return self._append_portfolio_review_sections(report)
+
+    def _append_portfolio_review_sections(self, report: str) -> str:
+        cached_sections = getattr(self, "_portfolio_review_sections_cache", None)
+        if cached_sections is not None:
+            return report.rstrip() + cached_sections
+
+        snapshot = self._load_holdings_snapshot()
+        if not snapshot:
+            self._portfolio_review_sections_cache = ""
+            return report
+
+        sections = [
+            self._build_asset_portfolio_review_section(snapshot, "lof"),
+            self._build_asset_portfolio_review_section(snapshot, "otc"),
+        ]
+        self._portfolio_review_sections_cache = "".join(section for section in sections if section)
+        if not self._portfolio_review_sections_cache:
+            return report
+        return report.rstrip() + self._portfolio_review_sections_cache
 
     @staticmethod
-    def _append_lof_etf_portfolio_review_section(report: str) -> str:
+    def _load_holdings_snapshot() -> Dict[str, Any]:
         snapshot_path = Path(__file__).resolve().parents[2] / "site_data" / "holdings_snapshot.json"
         try:
-            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            return json.loads(snapshot_path.read_text(encoding="utf-8-sig"))
         except FileNotFoundError:
-            return report
+            return {}
         except Exception as exc:
-            logger.warning("读取 LOF/ETF 持仓快照失败，跳过组合复盘: %s", exc)
-            return report
+            logger.warning("读取持仓快照失败，跳过基金组合复盘: %s", exc)
+            return {}
+
+    def _build_asset_portfolio_review_section(
+        self,
+        snapshot: Dict[str, Any],
+        asset_type: str,
+    ) -> str:
+        section_title = {
+            "lof": "LOF/ETF 组合复盘",
+            "otc": "场外基金组合复盘",
+        }.get(asset_type)
+        if not section_title:
+            return ""
 
         accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
         if not isinstance(accounts, dict):
-            return report
+            return ""
 
-        sections = []
+        sections: List[str] = []
         for account, groups in accounts.items():
             if not isinstance(groups, dict):
                 continue
-            holdings = groups.get("lof", [])
+            holdings = groups.get(asset_type, [])
             if not isinstance(holdings, list) or not holdings:
                 continue
 
-            public_items = []
-            names = []
-            codes = set()
-            for item in holdings:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name", "") or "").strip()
-                code = str(item.get("code", "") or "").strip()
-                if not code:
-                    continue
-                names.append(name or code)
-                codes.add(code)
-                public_items.append(f"- {name or code}({code})")
-            if not public_items:
+            public_holdings = self._public_portfolio_holdings(holdings)
+            if not public_holdings:
                 continue
 
-            repeated_exposure = "未发现同一代码重复暴露。"
-            if len(codes) < len(public_items):
-                repeated_exposure = "存在同一代码在本账户内重复出现，需合并查看真实暴露。"
-
-            topic_hint = "、".join(names[:5]) if names else "暂无可识别主题"
-            sections.append(
-                "\n".join(
-                    [
-                        f"### {account}",
-                        "",
-                        f"本账户持有以下 LOF/ETF（共 {len(public_items)} 只）：",
-                        "",
-                        *public_items,
-                        "",
-                        "组合复盘：",
-                        f"- 主题/行业暴露：从名称观察，主要暴露在 {topic_hint} 等方向，需结合跟踪指数和重仓行业继续复核。",
-                        f"- 重复暴露：{repeated_exposure}",
-                        "- 配置节奏：LOF/ETF 更适合作为账户级低频配置观察，不按 A股个股技术面逐只打分。",
-                        "- 分析口径：本小节为 LOF/ETF 组合级复盘，不输出逐只股票评分或交易评级。",
-                    ]
-                )
-            )
+            sections.append(self._render_account_portfolio_review(account, asset_type, public_holdings))
 
         if not sections:
-            return report
+            return ""
 
-        section = "\n\n## LOF/ETF 组合复盘\n\n" + "\n\n".join(sections) + "\n"
-        return report.rstrip() + section
+        return f"\n\n## {section_title}\n\n" + "\n\n".join(sections) + "\n"
+
+    @staticmethod
+    def _public_portfolio_holdings(holdings: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        public_items: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for item in holdings:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            code = str(item.get("code", "") or "").strip()
+            item_type = str(item.get("type", "") or "").strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            public_items.append({"name": name or code, "code": code, "type": item_type})
+        return public_items
+
+    def _render_account_portfolio_review(
+        self,
+        account: str,
+        asset_type: str,
+        holdings: List[Dict[str, str]],
+    ) -> str:
+        holding_lines = [f"- {item['name']}（{item['code']}）" for item in holdings]
+        review_text = self._generate_account_portfolio_review(account, asset_type, holdings)
+        if review_text:
+            body = review_text
+        else:
+            failure_prefix = "LOF/ETF 组合复盘失败" if asset_type == "lof" else "场外基金组合复盘失败"
+            body = f"{failure_prefix}：LLM 未返回内容，本次组合复盘未完成。"
+
+        return "\n".join(
+            [
+                f"### {account}",
+                "",
+                "#### 持有标的" if asset_type == "lof" else "#### 持有基金",
+                "",
+                *holding_lines,
+                "",
+                self._sanitize_portfolio_review_text(body),
+            ]
+        )
+
+    def _generate_account_portfolio_review(
+        self,
+        account: str,
+        asset_type: str,
+        holdings: List[Dict[str, str]],
+    ) -> str:
+        prompt = self._build_portfolio_review_prompt(account, asset_type, holdings)
+        try:
+            generated = self.analyzer.generate_text(prompt, max_tokens=900, temperature=0.3)
+        except Exception as exc:
+            return self._portfolio_review_failure_text(asset_type, exc)
+        if not generated:
+            return ""
+        return generated.strip()
+
+    @staticmethod
+    def _build_portfolio_review_prompt(
+        account: str,
+        asset_type: str,
+        holdings: List[Dict[str, str]],
+    ) -> str:
+        holding_lines = "\n".join(f"- {item['name']}（{item['code']}）" for item in holdings)
+        if asset_type == "lof":
+            section_hint = "#### 组合观察\n- ...\n\n#### 配置节奏\n- ...\n\n#### 后续观察\n- ..."
+            asset_label = "LOF/ETF"
+            focus = "主题暴露、行业集中度、重复暴露、波动风险、配置节奏和后续观察"
+        else:
+            section_hint = "#### 组合观察\n- ...\n\n#### 风格暴露\n- ...\n\n#### 配置节奏\n- ...\n\n#### 后续观察\n- ..."
+            asset_label = "场外基金"
+            focus = "基金风格、行业/主题暴露、重复配置、集中度、长期配置适配度和后续观察"
+
+        return f"""请基于以下公开持仓清单，生成“账户级组合复盘”。
+
+账户：{account}
+资产类型：{asset_label}
+持仓清单：
+{holding_lines}
+
+要求：
+1. 这是账户级组合复盘，不是逐只股票或逐只基金分析。
+2. 不要输出买入、卖出、观望。
+3. 不要输出评分、评级、交易评级。
+4. 不要输出持仓金额、成本、份额、市值、盈亏等敏感字段。
+5. 不要假装知道实时净值、重仓股、基金经理最新调仓；输入没有的信息只能说明需要后续观察。
+6. 如果信息不足，请明确这是“基于当前持仓清单做配置层面观察”。
+7. 输出简短，适合手机阅读，控制在 300 到 500 字以内。
+8. 重点关注：{focus}。
+
+请只输出 Markdown 正文，使用以下结构，不要重复“持有标的/持有基金”清单：
+{section_hint}
+"""
+
+    @staticmethod
+    def _portfolio_review_failure_text(asset_type: str, exc: Exception) -> str:
+        raw = str(exc) or type(exc).__name__
+        lower = raw.lower()
+        if any(token in lower for token in ("503", "serviceunavailable", "high demand", "overloaded")):
+            reason = "Gemini 模型服务暂不可用，本次组合复盘未完成。"
+        elif any(token in lower for token in ("429", "resource_exhausted", "quota", "free tier requests limit")):
+            reason = "Gemini API 额度超限，本次组合复盘未完成。"
+        elif any(token in lower for token in ("timeout", "timed out")):
+            reason = "AI 请求超时，本次组合复盘未完成。"
+        else:
+            reason = (raw[:120] + "…") if len(raw) > 120 else raw
+        prefix = "LOF/ETF 组合复盘失败" if asset_type == "lof" else "场外基金组合复盘失败"
+        return f"{prefix}：{reason}"
+
+    @staticmethod
+    def _sanitize_portfolio_review_text(text: str) -> str:
+        clean = text or ""
+        replacements = (
+            ("买入", "配置观察"),
+            ("卖出", "风险观察"),
+            ("观望", "继续跟踪"),
+            ("交易建议", "配置观察"),
+            ("交易评级", "配置观察"),
+            ("股票评级", "配置观察"),
+            ("评级", "观察结论"),
+            ("打分", "观察"),
+            ("评分", "观察"),
+            ("持仓金额", "持仓规模"),
+            ("持仓成本", "持仓信息"),
+            ("单位成本", "持仓信息"),
+            ("成本", "持仓信息"),
+            ("份额", "持仓数量"),
+            ("金额", "规模"),
+            ("市值", "规模"),
+            ("盈亏", "波动结果"),
+        )
+        for old, new in replacements:
+            clean = clean.replace(old, new)
+        return clean.strip()
 
     @staticmethod
     def _append_unfinished_analysis_section(

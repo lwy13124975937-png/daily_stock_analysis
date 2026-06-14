@@ -121,6 +121,32 @@ def extract_lof_blocks(html: str) -> list[str]:
     return blocks
 
 
+def extract_otc_blocks(html: str) -> list[str]:
+    blocks = []
+    blocks.extend(
+        re.findall(
+            r"<section class=\"panel\">\s*<h3>[^<]*场外基金组合复盘</h3>(.*?)</section>",
+            html,
+            flags=re.DOTALL,
+        )
+    )
+    blocks.extend(
+        re.findall(
+            r"<article class=\"holding-item\"[^>]*data-type=\"otc\"[^>]*>(.*?)</article>",
+            html,
+            flags=re.DOTALL,
+        )
+    )
+    blocks.extend(
+        re.findall(
+            r"<li class=\"summary-item\"[^>]*data-type=\"otc\"[^>]*>(.*?)</li>",
+            html,
+            flags=re.DOTALL,
+        )
+    )
+    return blocks
+
+
 def _snippet(text: str, token: str) -> str:
     index = text.find(token)
     if index == -1:
@@ -214,6 +240,16 @@ def main() -> int:
                 errors.append(
                     f"{_page_label(page)} LOF/ETF block {idx} repeats {LOF_SINGLE_NOTE!r}"
                 )
+
+        for idx, block in enumerate(extract_otc_blocks(account_html), start=1):
+            _check_tokens(
+                errors,
+                page,
+                f"OTC block {idx}",
+                block,
+                FUND_DECISION_TOKENS,
+                "contains stock decision token",
+            )
 
     print("checked report html pages:")
     for page in pages:

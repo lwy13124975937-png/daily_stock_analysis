@@ -134,6 +134,7 @@ class HoldingReportContext:
     snippets_by_code: dict[str, list[str]]
     unfinished_by_code: dict[str, list[str]]
     lof_reviews_by_account: dict[str, str]
+    otc_reviews_by_account: dict[str, str]
     unmatched: dict[str, list[str]]
 
 
@@ -230,7 +231,7 @@ def _load_holdings_snapshot() -> dict:
         print(f"No holdings snapshot found: {HOLDINGS_SNAPSHOT_PATH}")
         return {}
     try:
-        return json.loads(HOLDINGS_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        return json.loads(HOLDINGS_SNAPSHOT_PATH.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         print(f"Failed to read holdings snapshot: {type(exc).__name__}: {exc}")
         return {}
@@ -659,7 +660,7 @@ def _render_failure_snippets(failures: list[str], code: str) -> str:
     return "".join(rendered)
 
 
-def _extract_lof_portfolio_reviews(markdown_text: str) -> dict[str, str]:
+def _extract_account_portfolio_reviews(markdown_text: str, compact_section_title: str) -> dict[str, str]:
     lines = markdown_text.splitlines()
     start = None
     for idx, line in enumerate(lines):
@@ -668,7 +669,7 @@ def _extract_lof_portfolio_reviews(markdown_text: str) -> dict[str, str]:
             continue
         level, text = heading
         compact = re.sub(r"\s+", "", _clean_heading_text(text))
-        if level == 2 and "LOF/ETF组合复盘" in compact:
+        if level == 2 and compact_section_title in compact:
             start = idx + 1
             break
     if start is None:
@@ -707,6 +708,14 @@ def _extract_lof_portfolio_reviews(markdown_text: str) -> dict[str, str]:
     }
 
 
+def _extract_lof_portfolio_reviews(markdown_text: str) -> dict[str, str]:
+    return _extract_account_portfolio_reviews(markdown_text, "LOF/ETF组合复盘")
+
+
+def _extract_otc_portfolio_reviews(markdown_text: str) -> dict[str, str]:
+    return _extract_account_portfolio_reviews(markdown_text, "场外基金组合复盘")
+
+
 def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
     if not review_text:
         return ""
@@ -714,6 +723,18 @@ def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
     return f"""
 <section class="panel">
   <h3>{escape(account)} LOF/ETF 组合复盘</h3>
+  <div class="report-fragment">{_render_markdown_fragment(review_text)}</div>
+</section>
+"""
+
+
+def _render_otc_portfolio_review(account: str, review_text: str | None) -> str:
+    if not review_text:
+        return ""
+    review_text = _fund_review_display_text(review_text)
+    return f"""
+<section class="panel">
+  <h3>{escape(account)} 场外基金组合复盘</h3>
   <div class="report-fragment">{_render_markdown_fragment(review_text)}</div>
 </section>
 """
@@ -1207,8 +1228,10 @@ def _render_summary_fallback(summary_by_code: dict[str, list[str]], code: str) -
 def _holding_status_text(
     code: str,
     asset_type: str,
+    account: str,
     summary_by_code: dict[str, list[str]],
     unfinished_by_code: dict[str, list[str]],
+    otc_reviews_by_account: dict[str, str],
 ) -> str:
     if asset_type == "stock" and summary_by_code.get(code):
         return _summary_detail_text(summary_by_code[code][0], code)
@@ -1217,6 +1240,8 @@ def _holding_status_text(
     if asset_type == "lof":
         return "本标的属于 LOF/ETF，已纳入账户级 LOF/ETF 组合复盘，不进行单只标的短线判断。"
     if asset_type == "otc":
+        if otc_reviews_by_account.get(account):
+            return "本标的属于场外基金，已纳入账户级基金组合复盘，不进行单只基金短线判断。"
         return "场外基金暂未接入股票日报分析，仅展示持仓清单。"
     return "暂无摘要，仅展示持仓清单。"
 
@@ -1226,6 +1251,7 @@ def _holding_analysis_card(
     snippets_by_code: dict[str, list[str]],
     summary_by_code: dict[str, list[str]],
     unfinished_by_code: dict[str, list[str]],
+    otc_reviews_by_account: dict[str, str],
 ) -> str:
     name = str(item.get("name", "") or "-")
     code = str(item.get("code", "") or "-")
@@ -1233,10 +1259,13 @@ def _holding_analysis_card(
     asset_type = str(item.get("type", "") or "")
     label = TYPE_LABELS.get(asset_type, asset_type or "-")
     if asset_type == "otc":
-        analysis = (
-            '<p class="note">场外基金暂未接入股票日报分析。本页仅展示来自 '
-            "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
-        )
+        if otc_reviews_by_account.get(account):
+            analysis = ""
+        else:
+            analysis = (
+                '<p class="note">场外基金暂未接入股票日报分析。本页仅展示来自 '
+                "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
+            )
     elif asset_type == "lof":
         analysis = ""
     elif snippets_by_code.get(code):
@@ -1245,7 +1274,14 @@ def _holding_analysis_card(
         analysis = _render_failure_snippets(unfinished_by_code.get(code, []), code)
     else:
         analysis = _render_summary_fallback(summary_by_code, code)
-    status = _holding_status_text(code, asset_type, summary_by_code, unfinished_by_code)
+    status = _holding_status_text(
+        code,
+        asset_type,
+        account,
+        summary_by_code,
+        unfinished_by_code,
+        otc_reviews_by_account,
+    )
     return f"""
 <article class="holding-item" data-account="{escape(account, quote=True)}" data-code="{escape(code, quote=True)}" data-type="{escape(asset_type, quote=True)}">
   <h4>{escape(name)}（{escape(code)}）</h4>
@@ -1261,11 +1297,18 @@ def _render_holding_cards(
     snippets_by_code: dict[str, list[str]],
     summary_by_code: dict[str, list[str]],
     unfinished_by_code: dict[str, list[str]],
+    otc_reviews_by_account: dict[str, str],
 ) -> str:
     if not items:
         return '<p class="muted">暂无持仓。</p>'
     return "".join(
-        _holding_analysis_card(item, snippets_by_code, summary_by_code, unfinished_by_code)
+        _holding_analysis_card(
+            item,
+            snippets_by_code,
+            summary_by_code,
+            unfinished_by_code,
+            otc_reviews_by_account,
+        )
         for item in items
     )
 
@@ -1275,6 +1318,7 @@ def _render_account_summary(
     items: list[dict],
     summary_by_code: dict[str, list[str]],
     unfinished_by_code: dict[str, list[str]],
+    otc_reviews_by_account: dict[str, str],
 ) -> str:
     rows = []
     for item in items:
@@ -1284,7 +1328,10 @@ def _render_account_summary(
         label = TYPE_LABELS.get(asset_type, asset_type or "-")
         summaries = summary_by_code.get(code, [])
         if asset_type == "otc":
-            detail = "场外基金暂未接入股票日报分析，仅展示持仓清单。"
+            if otc_reviews_by_account.get(account):
+                detail = "已纳入账户级基金组合复盘。"
+            else:
+                detail = "场外基金暂未接入股票日报分析，仅展示持仓清单。"
         elif asset_type == "lof":
             detail = "已纳入账户级组合复盘。"
         elif summaries:
@@ -1322,20 +1369,24 @@ def _render_standard_account_section(
     snippets_by_code: dict[str, list[str]],
     unfinished_by_code: dict[str, list[str]],
     lof_reviews_by_account: dict[str, str],
+    otc_reviews_by_account: dict[str, str],
     is_open: bool,
 ) -> str:
     items = _account_items(groups)
     has_lof = any(str(item.get("type", "")) == "lof" for item in items)
+    has_otc = any(str(item.get("type", "")) == "otc" for item in items)
     lof_review = _render_lof_portfolio_review(account, lof_reviews_by_account.get(account)) if has_lof else ""
+    otc_review = _render_otc_portfolio_review(account, otc_reviews_by_account.get(account)) if has_otc else ""
     return f"""
 <details {"open" if is_open else ""}>
   <summary>{escape(account)}</summary>
   <div class="details-body">
-    {_render_account_summary(account, items, summary_by_code, unfinished_by_code)}
+    {_render_account_summary(account, items, summary_by_code, unfinished_by_code, otc_reviews_by_account)}
     {lof_review}
+    {otc_review}
     <section class="panel">
       <h3>{escape(account)}持仓明细与分析</h3>
-      {_render_holding_cards(items, snippets_by_code, summary_by_code, unfinished_by_code)}
+      {_render_holding_cards(items, snippets_by_code, summary_by_code, unfinished_by_code, otc_reviews_by_account)}
     </section>
   </div>
 </details>
@@ -1358,6 +1409,7 @@ def _build_report_context(
     summary_by_code = _extract_ai_summary_items(markdown_text)
     unfinished_by_code = _extract_unfinished_items(markdown_text)
     lof_reviews_by_account = _extract_lof_portfolio_reviews(markdown_text)
+    otc_reviews_by_account = _extract_otc_portfolio_reviews(markdown_text)
     snapshot_codes = _all_snapshot_codes(snapshot)
     unmatched: dict[str, list[str]] = {}
     for source in (summary_by_code, snippets_by_code, unfinished_by_code):
@@ -1371,6 +1423,7 @@ def _build_report_context(
         snippets_by_code=snippets_by_code,
         unfinished_by_code=unfinished_by_code,
         lof_reviews_by_account=lof_reviews_by_account,
+        otc_reviews_by_account=otc_reviews_by_account,
         unmatched=unmatched,
     )
 
@@ -1381,6 +1434,7 @@ def _empty_report_context() -> HoldingReportContext:
         snippets_by_code={},
         unfinished_by_code={},
         lof_reviews_by_account={},
+        otc_reviews_by_account={},
         unmatched={},
     )
 
@@ -1407,6 +1461,7 @@ def _build_holding_report_page(
                 context.snippets_by_code,
                 context.unfinished_by_code,
                 context.lof_reviews_by_account,
+                context.otc_reviews_by_account,
                 idx == 0,
             )
         )
@@ -1496,6 +1551,7 @@ def _build_account_page(
     context.snippets_by_code,
     context.unfinished_by_code,
     context.lof_reviews_by_account,
+    context.otc_reviews_by_account,
     True,
 )}
 <footer class="disclaimer">{escape(DISCLAIMER)}</footer>
