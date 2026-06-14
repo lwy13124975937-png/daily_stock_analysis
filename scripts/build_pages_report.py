@@ -63,6 +63,16 @@ SKIP_DETAIL_HEADING_KEYWORDS = (
     "操作建议",
     "价格指标",
 )
+SKIP_DETAIL_LINE_KEYWORDS = (
+    "报告生成时间",
+    "分析模型",
+    "report generated time",
+    "generated time",
+    "analysis model",
+    "model:",
+    "model：",
+    "gemini/",
+)
 FUND_DECISION_WORD_REPLACEMENTS = (
     ("买入", "配置观察"),
     ("卖出", "风险观察"),
@@ -711,8 +721,24 @@ def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
 
 def _fund_review_display_text(text: str) -> str:
     clean = text or ""
+    clean = clean.replace(
+        "本小节为 LOF/ETF 组合级复盘，不输出逐个标的观察或配置观察。",
+        "本小节为 LOF/ETF 组合级复盘，仅做账户配置观察，不输出单只标的短线判断。",
+    )
     for old, new in FUND_DECISION_WORD_REPLACEMENTS:
         clean = clean.replace(old, new)
+    clean = clean.replace(
+        "本小节为 LOF/ETF 组合级复盘，不输出逐个标的观察或配置观察。",
+        "本小节为 LOF/ETF 组合级复盘，仅做账户配置观察，不输出单只标的短线判断。",
+    )
+    clean = clean.replace(
+        "本小节为 LOF/ETF 组合级复盘，不输出逐个标的观察或配置观察",
+        "本小节为 LOF/ETF 组合级复盘，仅做账户配置观察，不输出单只标的短线判断",
+    )
+    clean = clean.replace(
+        "不输出逐个标的观察或配置观察",
+        "仅做账户配置观察，不输出单只标的短线判断",
+    )
     clean = clean.replace("不参与逐只个股交易结论", "不进行单只标的短线判断")
     clean = clean.replace("不参与逐只个股交易", "不进行单只标的短线判断")
     clean = clean.replace("个股式短线判断", "单只标的短线判断")
@@ -744,6 +770,11 @@ def _is_markdown_table_line(line: str) -> bool:
     if TABLE_LINE_RE.match(stripped) and stripped.count("|") >= 2:
         return True
     return False
+
+
+def _is_report_meta_line(line: str) -> bool:
+    compact = _plain_markdown_text(line).lower()
+    return any(keyword.lower() in compact for keyword in SKIP_DETAIL_LINE_KEYWORDS)
 
 
 def _render_markdown_fragment(markdown_text: str) -> str:
@@ -800,6 +831,10 @@ def _render_markdown_fragment(markdown_text: str) -> str:
             html.append(f"<{tag}>{inline(clean_heading)}</{tag}>")
             continue
         if skip_section:
+            continue
+        if _is_report_meta_line(stripped):
+            flush_paragraph()
+            flush_list()
             continue
         if _is_markdown_table_line(stripped):
             flush_paragraph()
@@ -1180,7 +1215,7 @@ def _holding_status_text(
     if asset_type == "stock" and unfinished_by_code.get(code):
         return "分析失败：" + _failure_detail_text(unfinished_by_code[code][0], code)
     if asset_type == "lof":
-        return "已纳入账户级 LOF/ETF 组合复盘，不进行单只标的短线判断。"
+        return "本标的属于 LOF/ETF，已纳入账户级 LOF/ETF 组合复盘，不进行单只标的短线判断。"
     if asset_type == "otc":
         return "场外基金暂未接入股票日报分析，仅展示持仓清单。"
     return "暂无摘要，仅展示持仓清单。"
@@ -1203,10 +1238,7 @@ def _holding_analysis_card(
             "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
         )
     elif asset_type == "lof":
-        analysis = (
-            '<p class="note">本标的属于 LOF/ETF，已纳入账户级 LOF/ETF 组合复盘，'
-            "不进行单只标的短线判断。</p>"
-        )
+        analysis = ""
     elif snippets_by_code.get(code):
         analysis = _render_text_snippets(snippets_by_code.get(code, []), code)
     elif unfinished_by_code.get(code):

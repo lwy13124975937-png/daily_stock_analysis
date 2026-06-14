@@ -26,6 +26,10 @@ BAD_ACCOUNT_MARKDOWN_TOKENS = (
     "|---------|",
     "| 持仓情况 |",
     "AI摘要缺失",
+    "报告生成时间",
+    "分析模型",
+    "report generated time",
+    "gemini/gemini",
 )
 BAD_ACCOUNT_ERROR_TOKENS = (
     "All LLM models failed",
@@ -58,6 +62,10 @@ SENSITIVE_TOKENS = (
     "盈亏",
 )
 FUND_DECISION_TOKENS = ("买入", "卖出", "观望", "评分", "评级", "打分", "交易评级", "股票评级", "交易建议")
+BAD_LOF_TEXT_TOKENS = (
+    "不输出逐个标的观察或配置观察",
+)
+LOF_SINGLE_NOTE = "已纳入账户级 LOF/ETF 组合复盘"
 
 
 def html_pages() -> list[Path]:
@@ -194,6 +202,18 @@ def main() -> int:
                 FUND_DECISION_TOKENS,
                 "contains stock decision token",
             )
+            _check_tokens(
+                errors,
+                page,
+                f"LOF/ETF block {idx}",
+                block,
+                BAD_LOF_TEXT_TOKENS,
+                "contains invalid LOF/ETF sentence",
+            )
+            if block.count(LOF_SINGLE_NOTE) > 1:
+                errors.append(
+                    f"{_page_label(page)} LOF/ETF block {idx} repeats {LOF_SINGLE_NOTE!r}"
+                )
 
     print("checked report html pages:")
     for page in pages:
