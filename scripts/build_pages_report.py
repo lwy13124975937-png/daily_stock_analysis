@@ -1286,7 +1286,7 @@ def _render_account_summary(
         if asset_type == "otc":
             detail = "场外基金暂未接入股票日报分析，仅展示持仓清单。"
         elif asset_type == "lof":
-            detail = "已纳入账户级 LOF/ETF 组合复盘，不进行单只标的短线判断。"
+            detail = "已纳入账户级组合复盘。"
         elif summaries:
             detail = "；".join(
                 _summary_detail_text(summary, code)

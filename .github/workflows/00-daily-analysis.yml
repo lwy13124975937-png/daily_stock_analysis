@@ -502,6 +502,9 @@ jobs:
       - name: 生成静态报告网页
         run: python scripts/build_pages_report.py
 
+      - name: 检查静态报告网页
+        run: python scripts/check_report_html.py
+
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
         if: always()
