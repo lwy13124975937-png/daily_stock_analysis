@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 import json
+import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
@@ -78,6 +79,7 @@ from bot.models import BotMessage
 
 
 logger = logging.getLogger(__name__)
+PORTFOLIO_REVIEW_MAX_TOKENS = 1800
 
 # 防御性 guard：当实例绕过 __init__（如测试中 __new__）构造时，
 # double-check 初始化 _single_stock_notify_lock 仍然线程安全。
@@ -3220,12 +3222,19 @@ class StockAnalysisPipeline:
     ) -> str:
         prompt = self._build_portfolio_review_prompt(account, asset_type, holdings)
         try:
-            generated = self.analyzer.generate_text(prompt, max_tokens=900, temperature=0.3)
+            generated = self.analyzer.generate_text(
+                prompt,
+                max_tokens=PORTFOLIO_REVIEW_MAX_TOKENS,
+                temperature=0.3,
+            )
         except Exception as exc:
             return self._portfolio_review_failure_text(asset_type, exc)
         if not generated:
             return ""
-        return generated.strip()
+        generated = generated.strip()
+        if self._portfolio_review_looks_truncated(generated):
+            return self._portfolio_review_incomplete_text(asset_type)
+        return generated
 
     @staticmethod
     def _build_portfolio_review_prompt(
@@ -3257,12 +3266,47 @@ class StockAnalysisPipeline:
 4. 不要输出持仓金额、成本、份额、市值、盈亏等敏感字段。
 5. 不要假装知道实时净值、重仓股、基金经理最新调仓；输入没有的信息只能说明需要后续观察。
 6. 如果信息不足，请明确这是“基于当前持仓清单做配置层面观察”。
-7. 输出简短，适合手机阅读，控制在 300 到 500 字以内。
-8. 重点关注：{focus}。
+7. 输出简短，适合手机阅读，LOF/ETF 控制在 250 到 500 字，场外基金控制在 300 到 600 字。
+8. 每个小节至少 1 条，最后一条必须以完整句子结束，优先删减内容，不要输出半句话。
+9. 重点关注：{focus}。
 
 请只输出 Markdown 正文，使用以下结构，不要重复“持有标的/持有基金”清单：
 {section_hint}
 """
+
+    @staticmethod
+    def _portfolio_review_looks_truncated(text: str) -> bool:
+        clean = (text or "").strip()
+        if not clean:
+            return False
+        lines = [line.strip() for line in clean.splitlines() if line.strip()]
+        if not lines:
+            return False
+
+        last_line = lines[-1]
+        last_text = re.sub(r"^[-*+]\s+", "", last_line).strip()
+        last_text = re.sub(r"^\d+[.)、]\s+", "", last_text).strip()
+        last_text = re.sub(r"^#{1,6}\s+", "", last_text).strip()
+        if not last_text:
+            return False
+
+        suspicious_suffixes = (
+            "基于当前持仓清单做",
+            "呈现出明显的",
+            "当前处于典型的",
+            "典型的",
+        )
+        if any(last_text.endswith(suffix) for suffix in suspicious_suffixes):
+            return True
+        if last_text.count("“") > last_text.count("”"):
+            return True
+        natural_endings = tuple("。；;：:、，,）)】》”’！？?!…")
+        return len(last_text) > 40 and not last_text.endswith(natural_endings)
+
+    @staticmethod
+    def _portfolio_review_incomplete_text(asset_type: str) -> str:
+        prefix = "LOF/ETF 组合复盘失败" if asset_type == "lof" else "场外基金组合复盘失败"
+        return f"{prefix}：模型输出疑似截断，本次组合复盘未完成。"
 
     @staticmethod
     def _portfolio_review_failure_text(asset_type: str, exc: Exception) -> str:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from html import unescape
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -40,6 +41,7 @@ BAD_ACCOUNT_ERROR_TOKENS = (
     "quota exceeded",
     "litellm.ServiceUnavailableError",
     '"error":',
+    "traceback",
     '"code"',
     '"message"',
 )
@@ -66,6 +68,13 @@ BAD_LOF_TEXT_TOKENS = (
     "不输出逐个标的观察或配置观察",
 )
 LOF_SINGLE_NOTE = "已纳入账户级 LOF/ETF 组合复盘"
+TRUNCATED_SUFFIXES = (
+    "基于当前持仓清单做",
+    "呈现出明显的",
+    "当前处于典型的",
+    "典型的",
+)
+NATURAL_ENDINGS = tuple("。；;：:、，,）)】》”’！？?!…")
 
 
 def html_pages() -> list[Path]:
@@ -156,6 +165,40 @@ def _snippet(text: str, token: str) -> str:
     return re.sub(r"\s+", " ", text[start:end]).strip()
 
 
+def _strip_tags(fragment: str) -> str:
+    text = re.sub(r"<[^>]+>", "", fragment)
+    return unescape(re.sub(r"\s+", " ", text)).strip()
+
+
+def _review_text_units(block: str) -> list[str]:
+    units = []
+    for tag in ("p", "li"):
+        units.extend(
+            _strip_tags(match)
+            for match in re.findall(rf"<{tag}\b[^>]*>(.*?)</{tag}>", block, flags=re.DOTALL)
+        )
+    return [unit for unit in units if unit]
+
+
+def _check_suspicious_truncation(
+    errors: list[str],
+    path: Path,
+    scope: str,
+    block: str,
+) -> None:
+    for unit in _review_text_units(block):
+        if any(unit.endswith(suffix) for suffix in TRUNCATED_SUFFIXES):
+            errors.append(f"{_page_label(path)} {scope} appears truncated: {unit}")
+            continue
+        if unit.count("“") > unit.count("”"):
+            errors.append(f"{_page_label(path)} {scope} has unclosed Chinese quote: {unit}")
+            continue
+        if len(unit) < 40:
+            continue
+        if not unit.endswith(NATURAL_ENDINGS):
+            errors.append(f"{_page_label(path)} {scope} lacks natural sentence ending: {unit}")
+
+
 def _page_label(path: Path) -> str:
     try:
         return path.relative_to(ROOT_DIR).as_posix()
@@ -240,6 +283,7 @@ def main() -> int:
                 errors.append(
                     f"{_page_label(page)} LOF/ETF block {idx} repeats {LOF_SINGLE_NOTE!r}"
                 )
+            _check_suspicious_truncation(errors, page, f"LOF/ETF block {idx}", block)
 
         for idx, block in enumerate(extract_otc_blocks(account_html), start=1):
             _check_tokens(
@@ -250,6 +294,7 @@ def main() -> int:
                 FUND_DECISION_TOKENS,
                 "contains stock decision token",
             )
+            _check_suspicious_truncation(errors, page, f"OTC block {idx}", block)
 
     print("checked report html pages:")
     for page in pages:

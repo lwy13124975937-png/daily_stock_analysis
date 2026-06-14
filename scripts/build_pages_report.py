@@ -878,6 +878,84 @@ def _render_markdown_fragment(markdown_text: str) -> str:
     return "".join(html) or '<p class="muted">暂无内容。</p>'
 
 
+def _collect_named_fragment_section(markdown_text: str, keyword: str) -> str:
+    lines = markdown_text.splitlines()
+    collecting = False
+    collected: list[str] = []
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        heading = _heading_match(stripped)
+        if heading is not None:
+            heading_text = _normalize_fragment_heading(heading[1])
+            if collecting:
+                break
+            collecting = keyword in heading_text
+            continue
+        if collecting:
+            collected.append(raw_line)
+    return "\n".join(collected).strip()
+
+
+def _limit_fragment_body(markdown_text: str, max_lines: int) -> str:
+    kept: list[str] = []
+    for raw_line in markdown_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        if _heading_match(stripped) is not None:
+            continue
+        if _is_report_meta_line(stripped) or _is_markdown_table_line(stripped):
+            continue
+        kept.append(stripped)
+        if len([line for line in kept if line]) >= max_lines:
+            break
+    while kept and not kept[-1]:
+        kept.pop()
+    return "\n".join(kept).strip()
+
+
+def _render_stock_brief_section(title: str, markdown_text: str, max_lines: int) -> str:
+    body = _limit_fragment_body(markdown_text, max_lines=max_lines)
+    if not body:
+        return ""
+    return f"""
+<div class="stock-brief-section">
+  <h5>{escape(title)}</h5>
+  {_render_markdown_fragment(body)}
+</div>
+"""
+
+
+def _first_fragment_body(markdown_text: str, max_lines: int = 2) -> str:
+    lines: list[str] = []
+    for raw_line in markdown_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if _heading_match(stripped) is not None:
+            continue
+        if _is_report_meta_line(stripped) or _is_markdown_table_line(stripped):
+            continue
+        lines.append(stripped)
+        if len(lines) >= max_lines:
+            break
+    return "\n".join(lines).strip()
+
+
+def _render_stock_brief(cleaned: str) -> str:
+    sections = [
+        _render_stock_brief_section("核心结论", _collect_named_fragment_section(cleaned, "核心结论"), 2),
+        _render_stock_brief_section("作战计划", _collect_named_fragment_section(cleaned, "作战计划"), 3),
+        _render_stock_brief_section("关联板块", _collect_named_fragment_section(cleaned, "关联板块"), 2),
+    ]
+    if not any(sections):
+        fallback = _collect_named_fragment_section(cleaned, "重要信息速览") or _first_fragment_body(cleaned)
+        sections = [_render_stock_brief_section("核心结论", fallback, 2)]
+    return '<div class="stock-brief">' + "".join(section for section in sections if section) + "</div>"
+
+
 def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
     """Keep analysis text while dropping duplicate leading holding titles."""
     text = re.sub(r"^(#{1,6})(?=\S)", r"\1 ", snippet or "", flags=re.MULTILINE).strip()
@@ -906,11 +984,26 @@ def _sanitize_ai_snippet_for_holding(snippet: str, code: str) -> str:
 def _render_text_snippets(snippets: list[str], code: str) -> str:
     if not snippets:
         return '<p class="muted">AI 暂未输出该标的分析，仅展示持仓清单。</p>'
-    rendered = []
+    cleaned_snippets = []
     for snippet in snippets:
         cleaned = _sanitize_ai_snippet_for_holding(snippet, code)
-        rendered.append(f'<div class="report-fragment">{_render_markdown_fragment(cleaned)}</div>')
-    return "".join(rendered)
+        if cleaned:
+            cleaned_snippets.append(cleaned)
+    if not cleaned_snippets:
+        return '<p class="muted">AI 暂未输出该标的分析，仅展示持仓清单。</p>'
+
+    brief = _render_stock_brief(cleaned_snippets[0])
+    full = "".join(
+        f'<div class="report-fragment">{_render_markdown_fragment(cleaned)}</div>'
+        for cleaned in cleaned_snippets
+    )
+    return f"""
+{brief}
+<details class="analysis-details">
+  <summary>查看完整分析摘要</summary>
+  <div class="details-body">{full}</div>
+</details>
+"""
 
 
 def _summary_detail_text(summary: str, code: str) -> str:
@@ -1099,6 +1192,27 @@ def _wrap_html(title: str, body: str) -> str:
     .report-fragment p,
     .report-fragment ul {{
       margin: 8px 0;
+    }}
+    .stock-brief-section {{
+      margin: 10px 0;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+    }}
+    .stock-brief-section h5 {{
+      margin: 0 0 6px;
+      font-size: 15px;
+    }}
+    .analysis-details {{
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    .analysis-details summary {{
+      padding: 9px 10px;
+      font-size: 14px;
     }}
     .ai-snippet {{
       margin: 10px 0 0;
