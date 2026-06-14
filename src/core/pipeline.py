@@ -80,6 +80,7 @@ from bot.models import BotMessage
 
 logger = logging.getLogger(__name__)
 PORTFOLIO_REVIEW_MAX_TOKENS = 1800
+LLM_CALL_MIN_INTERVAL_SECONDS = 12.0
 
 # 防御性 guard：当实例绕过 __init__（如测试中 __new__）构造时，
 # double-check 初始化 _single_stock_notify_lock 仍然线程安全。
@@ -140,6 +141,9 @@ class StockAnalysisPipeline:
         self.notifier = NotificationService(source_message=source_message)
         self._single_stock_notify_lock = threading.Lock()
         self._portfolio_review_sections_cache: Optional[str] = None
+        self._llm_call_lock = threading.Lock()
+        self._last_llm_call_at = 0.0
+        self._llm_min_interval_seconds = LLM_CALL_MIN_INTERVAL_SECONDS
         
         # 初始化搜索服务（可选，初始化失败不应阻断主分析流程）
         try:
@@ -192,6 +196,28 @@ class StockAnalysisPipeline:
                 exc_info=True,
             )
             self.social_sentiment_service = None
+
+    def _wait_for_llm_slot(self, reason: str = "LLM") -> None:
+        """Throttle LLM call starts within one pipeline run."""
+        interval = float(getattr(self, "_llm_min_interval_seconds", LLM_CALL_MIN_INTERVAL_SECONDS) or 0.0)
+        if interval <= 0:
+            return
+
+        lock = getattr(self, "_llm_call_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._llm_call_lock = lock
+
+        with lock:
+            now = time.monotonic()
+            last_call = float(getattr(self, "_last_llm_call_at", 0.0) or 0.0)
+            wait_seconds = interval - (now - last_call) if last_call else 0.0
+            while wait_seconds > 0:
+                logger.info("LLM call throttle: %s waiting %.1f seconds", reason, wait_seconds)
+                time.sleep(wait_seconds)
+                now = time.monotonic()
+                wait_seconds = interval - (now - last_call)
+            self._last_llm_call_at = now
 
     def _emit_progress(self, progress: int, message: str) -> None:
         """Best-effort bridge from pipeline stages to task SSE progress."""
@@ -574,6 +600,7 @@ class StockAnalysisPipeline:
             self._emit_progress(64, f"{stock_name}：正在请求 LLM 生成报告")
             llm_started_at = time.monotonic()
             try:
+                self._wait_for_llm_slot(f"stock:{code}")
                 result = self.analyzer.analyze(
                     enhanced_context,
                     news_context=news_context,
@@ -1072,6 +1099,7 @@ class StockAnalysisPipeline:
                 message = f"请分析股票 {code} ({stock_name})，并生成决策仪表盘报告。"
             llm_started_at = time.monotonic()
             try:
+                self._wait_for_llm_slot(f"agent_stock:{code}")
                 agent_result = executor.run(message, context=initial_context)
             except Exception as exc:
                 record_llm_run(
@@ -2289,6 +2317,7 @@ class StockAnalysisPipeline:
         """
         start_time = time.time()
         self._portfolio_review_sections_cache = None
+        self._last_llm_call_at = 0.0
         
         # 使用配置中的股票列表
         if stock_codes is None:
@@ -3222,6 +3251,7 @@ class StockAnalysisPipeline:
     ) -> str:
         prompt = self._build_portfolio_review_prompt(account, asset_type, holdings)
         try:
+            self._wait_for_llm_slot(f"portfolio:{asset_type}:{account}")
             generated = self.analyzer.generate_text(
                 prompt,
                 max_tokens=PORTFOLIO_REVIEW_MAX_TOKENS,
@@ -3350,6 +3380,26 @@ class StockAnalysisPipeline:
         return clean.strip()
 
     @staticmethod
+    def _compact_analysis_failure_reason(reason: str) -> str:
+        raw = re.sub(r"\s+", " ", str(reason or "")).strip()
+        if not raw:
+            return "未知原因"
+
+        lower = raw.lower()
+        if any(token in lower for token in ("429", "resource_exhausted", "quota", "free tier requests limit", "toomanyrequests")):
+            return "Gemini API 额度超限，导致本标的未完成分析。"
+        if any(token in lower for token in ("503", "serviceunavailable", "high demand", "overloaded", "unavailable")):
+            return "Gemini 模型服务暂不可用，本标的未完成分析。"
+        if any(token in lower for token in ("timeout", "timed out")):
+            return "AI 请求超时，本标的未完成分析。"
+        if any(token in lower for token in ("truncated", "模型输出疑似截断")):
+            return "模型输出疑似截断，本标的未完成分析。"
+        if any(token in lower for token in ("all llm models failed", "geminiexception", "traceback", '"error":')):
+            return "AI 模型调用失败，本标的未完成分析。"
+
+        return raw[:120] + ("..." if len(raw) > 120 else "")
+
+    @staticmethod
     def _append_unfinished_analysis_section(
         report: str,
         failed_results: Optional[List[Dict[str, str]]] = None,
@@ -3363,6 +3413,7 @@ class StockAnalysisPipeline:
             seen_codes.add(code)
             name = str(item.get("name", "") or code).strip() or code
             reason = str(item.get("reason", "") or "未知原因").strip() or "未知原因"
+            reason = StockAnalysisPipeline._compact_analysis_failure_reason(reason)
             items.append(f"- {name}({code})：失败原因 {reason}")
         if not items:
             return report
