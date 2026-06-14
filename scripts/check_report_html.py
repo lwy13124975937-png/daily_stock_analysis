@@ -9,9 +9,11 @@ from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+SITE_DIR = ROOT_DIR / "site"
 SITE_REPORTS_DIR = ROOT_DIR / "site" / "reports"
+SITE_ACCOUNTS_DIR = ROOT_DIR / "site" / "accounts"
 RAW_REPORT_MARKER = "<summary>原始 AI 股票日报</summary>"
-BAD_SUMMARY_TOKENS = ("**", "#", "###", "####", "AI摘要缺失")
+BAD_SUMMARY_TOKENS = ("**", "#", "###", "####", "```", "|---------|", "AI摘要缺失")
 BAD_ACCOUNT_MARKDOWN_TOKENS = (
     "**",
     "### #",
@@ -32,6 +34,7 @@ BAD_ACCOUNT_ERROR_TOKENS = (
     "RESOURCE_EXHAUSTED",
     "ResourceExhausted",
     "quota exceeded",
+    "litellm.ServiceUnavailableError",
     '"error":',
     '"code"',
     '"message"',
@@ -49,17 +52,24 @@ SENSITIVE_TOKENS = (
     "金额",
     "账户金额",
     "总资产",
+    "持仓成本",
+    "单位成本",
+    "市值",
+    "盈亏",
 )
 FUND_DECISION_TOKENS = ("买入", "卖出", "观望", "评分", "评级", "打分", "交易评级", "股票评级", "交易建议")
 
 
-def latest_report_html() -> Path | None:
-    if not SITE_REPORTS_DIR.exists():
-        return None
-    reports = list(SITE_REPORTS_DIR.glob("report_*.html"))
-    if not reports:
-        return None
-    return max(reports, key=lambda path: path.stat().st_mtime)
+def html_pages() -> list[Path]:
+    pages: list[Path] = []
+    index = SITE_DIR / "index.html"
+    if index.exists():
+        pages.append(index)
+    if SITE_REPORTS_DIR.exists():
+        pages.extend(sorted(SITE_REPORTS_DIR.glob("*.html")))
+    if SITE_ACCOUNTS_DIR.exists():
+        pages.extend(sorted(SITE_ACCOUNTS_DIR.glob("*.html")))
+    return pages
 
 
 def strip_raw_report(html: str) -> str:
@@ -103,42 +113,91 @@ def extract_lof_blocks(html: str) -> list[str]:
     return blocks
 
 
+def _snippet(text: str, token: str) -> str:
+    index = text.find(token)
+    if index == -1:
+        return token
+    start = max(0, index - 40)
+    end = min(len(text), index + len(token) + 80)
+    return re.sub(r"\s+", " ", text[start:end]).strip()
+
+
+def _page_label(path: Path) -> str:
+    try:
+        return path.relative_to(ROOT_DIR).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _check_tokens(
+    errors: list[str],
+    path: Path,
+    scope: str,
+    html: str,
+    tokens: tuple[str, ...],
+    message: str,
+) -> None:
+    for token in tokens:
+        if token in html:
+            errors.append(
+                f"{_page_label(path)} {scope} {message} {token!r}: {_snippet(html, token)}"
+            )
+
+
 def main() -> int:
-    report_path = latest_report_html()
-    if report_path is None:
-        print(f"ERROR: no generated report HTML under {SITE_REPORTS_DIR}")
+    pages = html_pages()
+    if not pages:
+        print(f"ERROR: no generated HTML pages under {SITE_DIR}")
         return 1
 
-    html = report_path.read_text(encoding="utf-8", errors="ignore")
-    account_html = strip_raw_report(html)
     errors: list[str] = []
 
-    summary_blocks = extract_account_summary_blocks(account_html)
-    if not summary_blocks:
-        errors.append("no account summary blocks found")
-    for idx, block in enumerate(summary_blocks, start=1):
-        for token in BAD_SUMMARY_TOKENS:
-            if token in block:
-                errors.append(f"account summary block {idx} contains {token!r}")
+    for page in pages:
+        html = page.read_text(encoding="utf-8", errors="ignore")
+        account_html = strip_raw_report(html)
 
-    for token in BAD_ACCOUNT_MARKDOWN_TOKENS:
-        if token in account_html:
-            errors.append(f"account holding area contains raw Markdown token {token!r}")
+        _check_tokens(errors, page, "public page", html, SENSITIVE_TOKENS, "contains sensitive token")
+        _check_tokens(
+            errors,
+            page,
+            "account display area",
+            account_html,
+            BAD_ACCOUNT_MARKDOWN_TOKENS,
+            "contains raw Markdown token",
+        )
+        _check_tokens(
+            errors,
+            page,
+            "account display area",
+            account_html,
+            BAD_ACCOUNT_ERROR_TOKENS,
+            "contains raw error token",
+        )
 
-    for token in BAD_ACCOUNT_ERROR_TOKENS:
-        if token in account_html:
-            errors.append(f"account holding area contains raw error token {token!r}")
+        summary_blocks = extract_account_summary_blocks(account_html)
+        for idx, block in enumerate(summary_blocks, start=1):
+            _check_tokens(
+                errors,
+                page,
+                f"account summary block {idx}",
+                block,
+                BAD_SUMMARY_TOKENS,
+                "contains forbidden token",
+            )
 
-    for token in SENSITIVE_TOKENS:
-        if token in account_html:
-            errors.append(f"account holding area contains sensitive token {token!r}")
+        for idx, block in enumerate(extract_lof_blocks(account_html), start=1):
+            _check_tokens(
+                errors,
+                page,
+                f"LOF/ETF block {idx}",
+                block,
+                FUND_DECISION_TOKENS,
+                "contains stock decision token",
+            )
 
-    for idx, block in enumerate(extract_lof_blocks(account_html), start=1):
-        for token in FUND_DECISION_TOKENS:
-            if token in block:
-                errors.append(f"LOF/ETF block {idx} contains stock decision token {token!r}")
-
-    print(f"checked report html: {report_path.relative_to(ROOT_DIR)}")
+    print("checked report html pages:")
+    for page in pages:
+        print(f"  - {_page_label(page)}")
     if errors:
         print("ERROR: report HTML presentation check failed:")
         for error in errors:

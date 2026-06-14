@@ -76,6 +76,16 @@ FUND_DECISION_WORD_REPLACEMENTS = (
     ("逐只股票", "逐个标的"),
     ("个股技术面", "标的短线波动"),
 )
+RAW_ERROR_TOKENS = (
+    "All LLM models failed",
+    "GeminiException",
+    "ServiceUnavailable",
+    "ServiceUnavailableError",
+    "RESOURCE_EXHAUSTED",
+    "ResourceExhausted",
+    "litellm.",
+    '"error":',
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +116,15 @@ class MarkdownHeading:
     line_index: int
     level: int
     text: str
+
+
+@dataclass(frozen=True)
+class HoldingReportContext:
+    summary_by_code: dict[str, list[str]]
+    snippets_by_code: dict[str, list[str]]
+    unfinished_by_code: dict[str, list[str]]
+    lof_reviews_by_account: dict[str, str]
+    unmatched: dict[str, list[str]]
 
 
 def _load_markdown_renderer():
@@ -361,9 +380,12 @@ def _append_ai_snippet(
     snippet: str,
     *,
     max_chars: int | None = MAX_AI_SNIPPET_CHARS,
+    skip_raw_errors: bool = True,
 ) -> None:
     text = snippet.strip()
     if not text:
+        return
+    if skip_raw_errors and _looks_like_raw_error(text):
         return
     if max_chars is not None and len(text) > max_chars:
         text = text[:max_chars].rstrip() + "..."
@@ -373,6 +395,11 @@ def _append_ai_snippet(
     if text in existing or len(existing) >= MAX_AI_SNIPPETS_PER_CODE:
         return
     existing.append(text)
+
+
+def _looks_like_raw_error(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(token.lower() in lower for token in RAW_ERROR_TOKENS)
 
 
 def _append_section_snippets(
@@ -595,7 +622,13 @@ def _extract_unfinished_items(markdown_text: str) -> dict[str, list[str]]:
             if first_code is None:
                 return
             code = first_code.group(1)
-            _append_ai_snippet(by_code, code, item, max_chars=MAX_AI_SNIPPET_CHARS)
+            _append_ai_snippet(
+                by_code,
+                code,
+                item,
+                max_chars=MAX_AI_SNIPPET_CHARS,
+                skip_raw_errors=False,
+            )
 
         for line in section.body.splitlines():
             if re.match(r"^\s*[-*+]\s+", line):
@@ -680,6 +713,9 @@ def _fund_review_display_text(text: str) -> str:
     clean = text or ""
     for old, new in FUND_DECISION_WORD_REPLACEMENTS:
         clean = clean.replace(old, new)
+    clean = clean.replace("不参与逐只个股交易结论", "不进行单只标的短线判断")
+    clean = clean.replace("不参与逐只个股交易", "不进行单只标的短线判断")
+    clean = clean.replace("个股式短线判断", "单只标的短线判断")
     return clean
 
 
@@ -988,6 +1024,26 @@ def _wrap_html(title: str, body: str) -> str:
       margin: 0 0 6px;
       font-size: 16px;
     }}
+    .status-line {{
+      margin: 8px 0 10px;
+      padding: 8px 10px;
+      background: var(--soft);
+      border-left: 3px solid var(--link);
+      border-radius: 6px;
+      overflow-wrap: anywhere;
+    }}
+    .report-fragment {{
+      overflow-wrap: anywhere;
+    }}
+    .report-fragment h4,
+    .report-fragment h5 {{
+      margin: 12px 0 6px;
+      line-height: 1.4;
+    }}
+    .report-fragment p,
+    .report-fragment ul {{
+      margin: 8px 0;
+    }}
     .ai-snippet {{
       margin: 10px 0 0;
       padding: 10px;
@@ -1113,6 +1169,23 @@ def _render_summary_fallback(summary_by_code: dict[str, list[str]], code: str) -
     )
 
 
+def _holding_status_text(
+    code: str,
+    asset_type: str,
+    summary_by_code: dict[str, list[str]],
+    unfinished_by_code: dict[str, list[str]],
+) -> str:
+    if asset_type == "stock" and summary_by_code.get(code):
+        return _summary_detail_text(summary_by_code[code][0], code)
+    if asset_type == "stock" and unfinished_by_code.get(code):
+        return "分析失败：" + _failure_detail_text(unfinished_by_code[code][0], code)
+    if asset_type == "lof":
+        return "已纳入账户级 LOF/ETF 组合复盘，不进行单只标的短线判断。"
+    if asset_type == "otc":
+        return "场外基金暂未接入股票日报分析，仅展示持仓清单。"
+    return "暂无摘要，仅展示持仓清单。"
+
+
 def _holding_analysis_card(
     item: dict,
     snippets_by_code: dict[str, list[str]],
@@ -1132,7 +1205,7 @@ def _holding_analysis_card(
     elif asset_type == "lof":
         analysis = (
             '<p class="note">本标的属于 LOF/ETF，已纳入账户级 LOF/ETF 组合复盘，'
-            "不参与逐只个股交易结论。</p>"
+            "不进行单只标的短线判断。</p>"
         )
     elif snippets_by_code.get(code):
         analysis = _render_text_snippets(snippets_by_code.get(code, []), code)
@@ -1140,10 +1213,12 @@ def _holding_analysis_card(
         analysis = _render_failure_snippets(unfinished_by_code.get(code, []), code)
     else:
         analysis = _render_summary_fallback(summary_by_code, code)
+    status = _holding_status_text(code, asset_type, summary_by_code, unfinished_by_code)
     return f"""
 <article class="holding-item" data-account="{escape(account, quote=True)}" data-code="{escape(code, quote=True)}" data-type="{escape(asset_type, quote=True)}">
-  <h4>{escape(name)}</h4>
-  <p class="muted">代码：{escape(code)} ｜ 类型：{escape(label)}</p>
+  <h4>{escape(name)}（{escape(code)}）</h4>
+  <p class="muted">类型：{escape(label)}</p>
+  <p class="status-line">{escape(status)}</p>
   <div>{analysis}</div>
 </article>
 """
@@ -1179,7 +1254,7 @@ def _render_account_summary(
         if asset_type == "otc":
             detail = "场外基金暂未接入股票日报分析，仅展示持仓清单。"
         elif asset_type == "lof":
-            detail = "已纳入账户级 LOF/ETF 组合复盘，不参与逐只个股交易结论。"
+            detail = "已纳入账户级 LOF/ETF 组合复盘，不进行单只标的短线判断。"
         elif summaries:
             detail = "；".join(
                 _summary_detail_text(summary, code)
@@ -1191,7 +1266,7 @@ def _render_account_summary(
                 for failure in unfinished_by_code.get(code, [])[:MAX_AI_SNIPPETS_PER_CODE]
             )
         else:
-            detail = "AI摘要缺失"
+            detail = "暂无摘要，仅展示持仓清单。"
         rows.append(
             f'<li class="summary-item" data-account="{escape(account, quote=True)}" '
             f'data-code="{escape(code, quote=True)}" data-type="{escape(asset_type, quote=True)}">'
@@ -1235,12 +1310,10 @@ def _render_standard_account_section(
 """
 
 
-def _build_holding_report_page(
-    title: str,
+def _build_report_context(
     markdown_text: str,
-    raw_report_html: str,
     snapshot: dict,
-) -> str:
+) -> HoldingReportContext:
     accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
     account_names = _ordered_account_names(accounts)
     all_holdings: list[dict] = []
@@ -1261,7 +1334,34 @@ def _build_holding_report_page(
                 continue
             for snippet in snippets:
                 _append_ai_snippet(unmatched, code, snippet)
+    return HoldingReportContext(
+        summary_by_code=summary_by_code,
+        snippets_by_code=snippets_by_code,
+        unfinished_by_code=unfinished_by_code,
+        lof_reviews_by_account=lof_reviews_by_account,
+        unmatched=unmatched,
+    )
 
+
+def _empty_report_context() -> HoldingReportContext:
+    return HoldingReportContext(
+        summary_by_code={},
+        snippets_by_code={},
+        unfinished_by_code={},
+        lof_reviews_by_account={},
+        unmatched={},
+    )
+
+
+def _build_holding_report_page(
+    title: str,
+    markdown_text: str,
+    raw_report_html: str,
+    snapshot: dict,
+) -> str:
+    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+    account_names = _ordered_account_names(accounts)
+    context = _build_report_context(markdown_text, snapshot)
     sections = []
     for idx, account in enumerate(account_names):
         groups = accounts.get(account, {}) if isinstance(accounts, dict) else {}
@@ -1271,10 +1371,10 @@ def _build_holding_report_page(
             _render_standard_account_section(
                 account,
                 groups,
-                summary_by_code,
-                snippets_by_code,
-                unfinished_by_code,
-                lof_reviews_by_account,
+                context.summary_by_code,
+                context.snippets_by_code,
+                context.unfinished_by_code,
+                context.lof_reviews_by_account,
                 idx == 0,
             )
         )
@@ -1288,7 +1388,7 @@ def _build_holding_report_page(
 </header>
 {''.join(sections)}
 {_render_raw_report_details(raw_report_html)}
-{_render_unmatched_ai_details(unmatched)}
+{_render_unmatched_ai_details(context.unmatched)}
 <footer class="disclaimer">{escape(DISCLAIMER)}</footer>
 """
     return _wrap_html(title, body)
@@ -1339,53 +1439,33 @@ def _build_report_pages(snapshot: dict) -> list[ReportPage]:
     return pages
 
 
-def _account_items_table(items: list[dict]) -> str:
-    if not items:
-        return '<p class="muted">暂无该类型持仓。</p>'
-    rows = []
-    for item in items:
-        rows.append(
-            "<tr>"
-            f"<td>{escape(str(item.get('name', '') or '-'))}</td>"
-            f"<td>{escape(str(item.get('code', '') or '-'))}</td>"
-            f"<td>{escape(TYPE_LABELS.get(str(item.get('type', '')), str(item.get('type', ''))))}</td>"
-            "</tr>"
-        )
-    return (
-        '<div class="holding-table-wrap"><table>'
-        "<thead><tr><th>名称</th><th>代码</th><th>类型</th></tr></thead>"
-        f"<tbody>{''.join(rows)}</tbody></table></div>"
-    )
-
-
-def _build_account_page(account: str, groups: dict, latest_stock_report: ReportPage | None) -> str:
+def _build_account_page(
+    account: str,
+    groups: dict,
+    latest_stock_report: ReportPage | None,
+    context: HoldingReportContext,
+) -> str:
     report_link = '<p class="muted">本次构建未发现 report_*.md，最新持仓日报暂不可用。</p>'
     if latest_stock_report:
         href = f"../{_relative_href(latest_stock_report.output)}"
         report_link = f'<p><a href="{escape(href)}">查看最新持仓日报</a></p>'
 
-    items = _account_items(groups)
-    notes = []
-    if any(str(item.get("type", "")) == "lof" for item in items):
-        notes.append('<p class="note">场内基金/ETF/LOF 已纳入持仓日报分析，结论仅作复盘参考。</p>')
-    if any(str(item.get("type", "")) == "otc" for item in items):
-        notes.append(
-            '<p class="note">场外基金暂未接入股票日报分析。本页仅展示来自 '
-            "stock-dashboard 的最新持仓清单，后续可接入基金净值、重仓行业和基金经理复盘。</p>"
-        )
-
     body = f"""
 <nav class="page-nav"><a href="../index.html">返回首页</a></nav>
 <header class="hero">
   <h1>{escape(account)}持仓复盘</h1>
-  <p class="muted">仅展示公开持仓字段。完整 AI 分析请查看最新持仓日报。</p>
+  <p class="muted">本页与总持仓日报使用同一套账户渲染逻辑，仅展示公开持仓字段。</p>
   {report_link}
 </header>
-<section class="panel">
-  <h2>{escape(account)}持仓清单</h2>
-  {''.join(notes)}
-  {_account_items_table(items)}
-</section>
+{_render_standard_account_section(
+    account,
+    groups,
+    context.summary_by_code,
+    context.snippets_by_code,
+    context.unfinished_by_code,
+    context.lof_reviews_by_account,
+    True,
+)}
 <footer class="disclaimer">{escape(DISCLAIMER)}</footer>
 """
     return _wrap_html(f"{account}持仓复盘", body)
@@ -1395,6 +1475,15 @@ def _build_account_pages(snapshot: dict, pages: list[ReportPage]) -> list[Accoun
     SITE_ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
     accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
     latest_stock_report = _latest_report(pages, "stock")
+    context = _empty_report_context()
+    if latest_stock_report and latest_stock_report.source.exists():
+        try:
+            context = _build_report_context(
+                latest_stock_report.source.read_text(encoding="utf-8"),
+                snapshot,
+            )
+        except Exception as exc:
+            print(f"Failed to build account page report context: {type(exc).__name__}: {exc}")
     account_pages: list[AccountPage] = []
 
     ordered_accounts = sorted(
@@ -1410,7 +1499,7 @@ def _build_account_pages(snapshot: dict, pages: list[ReportPage]) -> list[Accoun
             continue
         output_path = SITE_ACCOUNTS_DIR / f"{_account_slug(str(account))}.html"
         output_path.write_text(
-            _build_account_page(str(account), groups, latest_stock_report),
+            _build_account_page(str(account), groups, latest_stock_report, context),
             encoding="utf-8",
         )
         account_pages.append(
