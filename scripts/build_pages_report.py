@@ -1731,6 +1731,7 @@ def _reports_index_block(pages: list[ReportPage]) -> str:
         )
     else:
         items.append('<li>大盘复盘：<span class="muted">暂无</span></li>')
+    items.append('<li>AI 建议准确性回测：<a href="advice_backtest.html">AI 建议准确性回测</a></li>')
     return f'<section class="panel"><h2>最新报告入口</h2><ul class="link-list">{"".join(items)}</ul></section>'
 
 

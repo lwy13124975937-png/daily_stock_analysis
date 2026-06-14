@@ -34,6 +34,7 @@ BAD_ACCOUNT_MARKDOWN_TOKENS = (
 )
 BAD_ACCOUNT_ERROR_TOKENS = (
     "All LLM models failed",
+    "Exception",
     "GeminiException",
     "ServiceUnavailableError",
     "RESOURCE_EXHAUSTED",
@@ -42,6 +43,7 @@ BAD_ACCOUNT_ERROR_TOKENS = (
     "litellm.ServiceUnavailableError",
     '"error":',
     "traceback",
+    "Traceback",
     '"code"',
     '"message"',
 )
@@ -82,6 +84,12 @@ def html_pages() -> list[Path]:
     index = SITE_DIR / "index.html"
     if index.exists():
         pages.append(index)
+    if SITE_DIR.exists():
+        pages.extend(
+            page
+            for page in sorted(SITE_DIR.glob("*.html"))
+            if page.name != "index.html"
+        )
     if SITE_REPORTS_DIR.exists():
         pages.extend(sorted(SITE_REPORTS_DIR.glob("*.html")))
     if SITE_ACCOUNTS_DIR.exists():

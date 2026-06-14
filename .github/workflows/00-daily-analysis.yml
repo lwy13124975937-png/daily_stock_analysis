@@ -502,6 +502,9 @@ jobs:
       - name: 生成静态报告网页
         run: python scripts/build_pages_report.py
 
+      - name: 更新 AI 建议准确性回测
+        run: python scripts/update_advice_backtest.py
+
       - name: 检查静态报告网页
         run: python scripts/check_report_html.py
 
