@@ -79,7 +79,7 @@ from bot.models import BotMessage
 
 
 logger = logging.getLogger(__name__)
-PORTFOLIO_REVIEW_MAX_TOKENS = 1800
+PORTFOLIO_REVIEW_MAX_TOKENS = 900
 LLM_CALL_MIN_INTERVAL_SECONDS = 12.0
 
 # 防御性 guard：当实例绕过 __init__（如测试中 __new__）构造时，
@@ -3274,15 +3274,17 @@ class StockAnalysisPipeline:
     ) -> str:
         holding_lines = "\n".join(f"- {item['name']}（{item['code']}）" for item in holdings)
         if asset_type == "lof":
-            section_hint = "#### 组合观察\n- ...\n\n#### 配置节奏\n- ...\n\n#### 后续观察\n- ..."
+            section_hint = "#### 组合观察\n- 1 句短句。\n\n#### 配置节奏\n- 1 句短句。\n\n#### 后续观察\n- 1 句短句。"
             asset_label = "LOF/ETF"
+            length_hint = "总字数控制在 120 到 220 字。"
             focus = "主题暴露、行业集中度、重复暴露、波动风险、配置节奏和后续观察"
         else:
-            section_hint = "#### 组合观察\n- ...\n\n#### 风格暴露\n- ...\n\n#### 配置节奏\n- ...\n\n#### 后续观察\n- ..."
+            section_hint = "#### 组合观察\n- 1 句短句。\n\n#### 风格暴露\n- 1 句短句。\n\n#### 配置节奏\n- 1 句短句。\n\n#### 后续观察\n- 1 句短句。"
             asset_label = "场外基金"
+            length_hint = "总字数控制在 150 到 260 字。"
             focus = "基金风格、行业/主题暴露、重复配置、集中度、长期配置适配度和后续观察"
 
-        return f"""请基于以下公开持仓清单，生成“账户级组合复盘”。
+        return f"""请基于以下公开持仓清单，生成极短的“账户级组合复盘”。
 
 账户：{account}
 资产类型：{asset_label}
@@ -3296,9 +3298,11 @@ class StockAnalysisPipeline:
 4. 不要输出持仓金额、成本、份额、市值、盈亏等敏感字段。
 5. 不要假装知道实时净值、重仓股、基金经理最新调仓；输入没有的信息只能说明需要后续观察。
 6. 如果信息不足，请明确这是“基于当前持仓清单做配置层面观察”。
-7. 输出简短，适合手机阅读，LOF/ETF 控制在 250 到 500 字，场外基金控制在 300 到 600 字。
-8. 每个小节至少 1 条，最后一条必须以完整句子结束，优先删减内容，不要输出半句话。
-9. 重点关注：{focus}。
+7. {length_hint}
+8. 每个小节最多 1 到 2 条，每条只写 1 个短句。
+9. 最后一条必须以完整句子结束；如果空间不足，删减内容，不要输出半句话。
+10. 不要长篇解释，不要输出复杂 Markdown，不要添加表格。
+11. 重点关注：{focus}。
 
 请只输出 Markdown 正文，使用以下结构，不要重复“持有标的/持有基金”清单：
 {section_hint}

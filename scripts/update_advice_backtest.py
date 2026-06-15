@@ -117,6 +117,15 @@ class MockPriceProvider(PriceProvider):
         return list(self.bars_by_code.get(code, [])), None
 
 
+class MockErrorPriceProvider(PriceProvider):
+    def __init__(self, bars_by_code: dict[str, list[DailyBar]] | None = None, error: str = "mock data missing"):
+        self.bars_by_code = bars_by_code or {}
+        self.error = error
+
+    def get_bars(self, code: str, analysis_date: date) -> tuple[list[DailyBar], str | None]:
+        return list(self.bars_by_code.get(code, [])), self.error
+
+
 def now_iso() -> str:
     return datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds")
 
@@ -440,6 +449,30 @@ def evaluate_hit(group: str, period: str, return_value: float) -> tuple[bool | N
     return None, "unknown"
 
 
+def available_weekday_count_after(analysis_date: date, today: date) -> int:
+    if today <= analysis_date:
+        return 0
+    count = 0
+    current = analysis_date + timedelta(days=1)
+    while current <= today:
+        if current.weekday() < 5:
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+def is_validation_window_pending(analysis_date: date, offset: int) -> bool:
+    """Return True when the T+N window has not plausibly arrived yet.
+
+    The exact T+N target is based on effective trading bars. When the market
+    data source has no bars yet, this weekday lower bound keeps same-day,
+    weekend, and near-future advice from being reported as missing data.
+    """
+
+    today = datetime.now(SHANGHAI_TZ).date()
+    return available_weekday_count_after(analysis_date, today) < offset
+
+
 def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str, Any]:
     result = dict(record)
     analysis_date = parse_date(result.get("date"))
@@ -455,7 +488,7 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
     bars = sorted((bar for bar in bars if bar.close > 0), key=lambda bar: bar.trade_date)
     if not bars:
         for period in PERIODS:
-            result[f"{period}_status"] = "数据不足"
+            result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, PERIODS[period]) else "数据不足"
             result[f"{period}_hit"] = None
             result[f"{period}_close"] = None
             result[f"{period}_return"] = None
@@ -464,7 +497,7 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
     start_candidates = [bar for bar in bars if bar.trade_date <= analysis_date]
     if not start_candidates:
         for period in PERIODS:
-            result[f"{period}_status"] = "数据不足" if error else "等待验证"
+            result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, PERIODS[period]) else "数据不足"
             result[f"{period}_hit"] = None
         return result
 
@@ -473,7 +506,7 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
     forward = [bar for bar in bars if bar.trade_date > analysis_date]
     for period, offset in PERIODS.items():
         if len(forward) < offset:
-            result[f"{period}_status"] = "数据不足" if error and not forward else "等待验证"
+            result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, offset) or not error else "数据不足"
             result[f"{period}_hit"] = None
             result[f"{period}_close"] = None
             result[f"{period}_return"] = None
@@ -981,7 +1014,7 @@ def assert_test_results(accuracy: dict[str, Any]) -> None:
     assert "444444" in codes, "sold stock historical advice should remain"
     assert len([r for r in records if r.get("code") == "666666"]) == 2, "different dates for same code must be kept"
     assert any(r.get("code") == "777777" and r.get("d5_status") == "等待验证" for r in records)
-    assert any(r.get("code") == "888888" and r.get("d1_status") == "数据不足" for r in records)
+    assert any(r.get("code") == "888888" and r.get("d1_status") == "等待验证" for r in records)
     assert accuracy["summary_all_history"]["total_advice"] >= 9
     assert "买入类" in accuracy["by_action_all_history"]
     assert accuracy["recent_records"]
@@ -989,6 +1022,32 @@ def assert_test_results(accuracy: dict[str, Any]) -> None:
     assert (SITE_DIR / "advice_backtest.html").exists()
     assert (REPORTS_DIR / "advice_accuracy_20990110.md").exists()
     assert (SITE_DIR / "index.html").read_text(encoding="utf-8").find("advice_backtest.html") != -1
+
+    today = datetime.now(SHANGHAI_TZ).date()
+    fresh = evaluate_record(
+        {"date": today.isoformat(), "code": "101010", "action": "买入", "sentiment": "看多"},
+        MockErrorPriceProvider(),
+    )
+    assert all(fresh.get(f"{period}_status") == "等待验证" for period in PERIODS), "same-day advice must wait for validation"
+
+    old_date = today - timedelta(days=10)
+    old_missing = evaluate_record(
+        {"date": old_date.isoformat(), "code": "202020", "action": "买入", "sentiment": "看多"},
+        MockErrorPriceProvider(),
+    )
+    assert old_missing.get("d1_status") == "数据不足", "past advice with missing market data must be insufficient"
+
+    old_verified = evaluate_record(
+        {"date": old_date.isoformat(), "code": "303030", "action": "买入", "sentiment": "看多"},
+        MockPriceProvider({"303030": make_test_bars(old_date, 10.0, [0.01])}),
+    )
+    assert old_verified.get("d1_status") == "已验证", "past advice with target close must be evaluated"
+
+    short_suspend = evaluate_record(
+        {"date": today.isoformat(), "code": "404040", "action": "观望", "sentiment": "震荡"},
+        MockPriceProvider({"404040": [DailyBar(today, 10.0)]}),
+    )
+    assert short_suspend.get("d1_status") == "等待验证", "not enough future effective trading bars must wait"
 
 
 def parse_args() -> argparse.Namespace:
