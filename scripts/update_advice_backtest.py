@@ -206,7 +206,7 @@ def latest_stock_report(reports_dir: Path = REPORTS_DIR) -> Path | None:
     reports = [p for p in reports_dir.glob("report_20*.md") if p.is_file()]
     if not reports:
         return None
-    return max(reports, key=lambda path: (path.stat().st_mtime, path.name))
+    return max(reports, key=lambda path: (report_date_key(path), path.name))
 
 
 def _split_section(markdown_text: str, heading_keyword: str) -> str:
@@ -224,6 +224,7 @@ def _split_section(markdown_text: str, heading_keyword: str) -> str:
 ADVICE_RE = re.compile(
     r"^\s*(?:[-*+]\s*)?(?:[○●🔴🟢🟡]\s*)?"
     r"(?P<name>.+?)[（(]\s*(?P<code>\d{6})\s*[）)]"
+    r"(?:\s*[（(]\s*(?P=code)\s*[）)])?"
     r"\s*(?:A股个股)?\s*[：:]\s*(?P<rest>.+?)\s*$"
 )
 
@@ -237,6 +238,8 @@ def parse_advice_line(line: str) -> tuple[str, str, str, int | None, str, str] |
     code = normalize_code(match.group("code"))
     name = clean_text(match.group("name")).lstrip("-+* ")
     rest = clean_text(match.group("rest")).replace("｜", "|")
+    if is_failed_advice_text(rest):
+        return None
     score_match = re.search(r"评分\s*[:：]?\s*(-?\d+)", rest)
     score = int(score_match.group(1)) if score_match else None
 
@@ -252,6 +255,22 @@ def parse_advice_line(line: str) -> tuple[str, str, str, int | None, str, str] |
 
     summary = f"{name}({code})：{rest}" if rest else f"{name}({code})"
     return code, name, action, score, sentiment, summary
+
+
+def is_failed_advice_text(text: str) -> bool:
+    compact = clean_text(text).lower()
+    return any(
+        token in compact
+        for token in (
+            "分析失败",
+            "未完成分析",
+            "本标的未完成",
+            "失败原因",
+            "gemini api",
+            "模型服务暂不可用",
+            "额度超限",
+        )
+    )
 
 
 def extract_advice_from_report(report_path: Path, holdings: dict[str, Holding]) -> list[dict[str, Any]]:
@@ -593,6 +612,25 @@ def build_accuracy(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def build_accuracy_with_metadata(
+    records: list[dict[str, Any]],
+    *,
+    latest_report_date: str | None,
+    latest_report_name: str | None,
+    new_advice_count: int,
+) -> dict[str, Any]:
+    accuracy = build_accuracy(records)
+    accuracy["latest_report_date"] = latest_report_date
+    accuracy["latest_report_name"] = latest_report_name
+    accuracy["new_advice_count"] = new_advice_count
+    accuracy["new_advice_message"] = (
+        f"本次新增 {new_advice_count} 条可回测建议。"
+        if new_advice_count
+        else "本次无新增可回测建议。"
+    )
+    return accuracy
+
+
 def format_rate(value: Any) -> str:
     if value is None:
         return "样本不足"
@@ -736,6 +774,8 @@ def render_html(accuracy: dict[str, Any]) -> str:
   <header class="hero">
     <h1>AI 建议准确性回测</h1>
     <p class="muted">更新时间：{escape(str(accuracy.get('updated_at') or now_iso()))}</p>
+    <p class="muted">最新读取日报：{escape(str(accuracy.get('latest_report_date') or '暂无'))}</p>
+    <p class="muted">{escape(str(accuracy.get('new_advice_message') or '本次无新增可回测建议。'))}</p>
     <p class="muted">不调用 Gemini 或任何 LLM，只用历史建议、当前持仓快照和后续真实行情做规则回测。</p>
   </header>
 
@@ -803,6 +843,9 @@ def render_markdown(accuracy: dict[str, Any], report_date: str) -> str:
         f"# {report_date} AI 建议准确性回测",
         "",
         "本报告不调用 Gemini 或任何 LLM，只回看历史建议与后续真实行情的一致性。",
+        "",
+        f"- 最新读取日报：{accuracy.get('latest_report_date') or '暂无'}",
+        f"- {accuracy.get('new_advice_message') or '本次无新增可回测建议。'}",
         "",
         "## 总览",
         "",
@@ -933,6 +976,7 @@ def setup_test_fixture() -> MockPriceProvider:
                     {"account": "测试账户B", "type": "stock", "name": "卖出下跌", "code": "222222"},
                     {"account": "测试账户B", "type": "stock", "name": "等待验证", "code": "777777"},
                     {"account": "测试账户B", "type": "stock", "name": "数据不足", "code": "888888"},
+                    {"account": "测试账户B", "type": "stock", "name": "分析失败", "code": "101010"},
                 ],
                 "lof": [],
                 "otc": [{"account": "测试账户B", "type": "otc", "name": "测试场外基金", "code": "121212"}],
@@ -961,6 +1005,7 @@ def setup_test_fixture() -> MockPriceProvider:
 - 新买入股票（999999） A股个股：持有｜评分 55｜震荡
 - 等待验证（777777） A股个股：观望｜评分 50｜中性
 - 数据不足（888888） A股个股：买入｜评分 70｜看多
+- 分析失败（101010） A股个股：分析失败：Gemini 模型服务暂不可用，本标的未完成分析。
 - 测试ETF（333333） LOF/ETF：已纳入账户级组合复盘
 
 ## LOF/ETF 组合复盘
@@ -999,8 +1044,13 @@ def run_backtest(provider: PriceProvider | None = None) -> dict[str, Any]:
     history = merge_history([*load_history(), *new_records])
     current_codes = set(holdings)
     evaluated = evaluate_records(history, provider or DataFetcherPriceProvider(), current_codes)
-    accuracy = build_accuracy(evaluated)
     report_date = report_date_text(report_path) if report_path else datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d")
+    accuracy = build_accuracy_with_metadata(
+        evaluated,
+        latest_report_date=report_date if report_path else None,
+        latest_report_name=report_path.name if report_path else None,
+        new_advice_count=len(new_records),
+    )
     write_outputs(evaluated, accuracy, report_date)
     return accuracy
 
@@ -1008,8 +1058,13 @@ def run_backtest(provider: PriceProvider | None = None) -> dict[str, Any]:
 def assert_test_results(accuracy: dict[str, Any]) -> None:
     records = accuracy.get("records", [])
     codes = {record.get("code") for record in records}
+    hold_observe = parse_advice_line("贵研铂业（600459） A股个股：持有观察｜评分 59｜强烈看多")
+    assert hold_observe and hold_observe[0] == "600459" and hold_observe[2] == "持有观察"
+    watch = parse_advice_line("株冶集团（600961） A股个股：观望｜评分 45｜震荡")
+    assert watch and watch[0] == "600961" and watch[2] == "观望"
     assert "333333" not in codes, "LOF/ETF must not enter advice backtest"
     assert "121212" not in codes, "OTC must not enter advice backtest"
+    assert "101010" not in codes, "failed stock analysis must not enter advice backtest"
     assert "999999" in codes, "new stock holding should enter advice history"
     assert "444444" in codes, "sold stock historical advice should remain"
     assert len([r for r in records if r.get("code") == "666666"]) == 2, "different dates for same code must be kept"
@@ -1022,6 +1077,7 @@ def assert_test_results(accuracy: dict[str, Any]) -> None:
     assert (SITE_DIR / "advice_backtest.html").exists()
     assert (REPORTS_DIR / "advice_accuracy_20990110.md").exists()
     assert (SITE_DIR / "index.html").read_text(encoding="utf-8").find("advice_backtest.html") != -1
+    assert "2099-01-10" in (SITE_DIR / "advice_backtest.html").read_text(encoding="utf-8")
 
     today = datetime.now(SHANGHAI_TZ).date()
     fresh = evaluate_record(

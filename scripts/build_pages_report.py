@@ -654,10 +654,7 @@ def _extract_unfinished_items(markdown_text: str) -> dict[str, list[str]]:
 def _render_failure_snippets(failures: list[str], code: str) -> str:
     if not failures:
         return ""
-    rendered = ['<p class="muted">本次分析未完成，以下为失败原因：</p>']
-    for failure in failures[:MAX_AI_SNIPPETS_PER_CODE]:
-        rendered.append(f'<p class="note">分析失败：{escape(_failure_detail_text(failure, code))}</p>')
-    return "".join(rendered)
+    return f'<p class="note">分析失败：{escape(_failure_detail_text(failures[0], code))}</p>'
 
 
 def _extract_account_portfolio_reviews(markdown_text: str, compact_section_title: str) -> dict[str, str]:
@@ -1759,8 +1756,7 @@ def _account_cards(account_pages: list[AccountPage]) -> str:
 
 
 def _build_index(snapshot: dict, pages: list[ReportPage], account_pages: list[AccountPage]) -> str:
-    generated_at = snapshot.get("generated_at") if isinstance(snapshot, dict) else ""
-    generated_at = str(generated_at or _now_text())
+    generated_at = _now_text()
     source_url = str(snapshot.get("source_url", "") if isinstance(snapshot, dict) else "")
     source_line = SOURCE_TEXT
     if source_url:

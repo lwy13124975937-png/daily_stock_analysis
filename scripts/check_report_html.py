@@ -14,6 +14,7 @@ SITE_DIR = ROOT_DIR / "site"
 SITE_REPORTS_DIR = ROOT_DIR / "site" / "reports"
 SITE_ACCOUNTS_DIR = ROOT_DIR / "site" / "accounts"
 RAW_REPORT_MARKER = "<summary>原始 AI 股票日报</summary>"
+REPORT_HTML_RE = re.compile(r"report_(20\d{6})\.html$")
 BAD_SUMMARY_TOKENS = ("**", "#", "###", "####", "```", "|---------|", "AI摘要缺失")
 BAD_ACCOUNT_MARKDOWN_TOKENS = (
     "**",
@@ -98,6 +99,23 @@ def html_pages() -> list[Path]:
     if SITE_ACCOUNTS_DIR.exists():
         pages.extend(sorted(SITE_ACCOUNTS_DIR.glob("*.html")))
     return pages
+
+
+def latest_stock_report_html() -> tuple[str, Path] | None:
+    if not SITE_REPORTS_DIR.exists():
+        return None
+    candidates: list[tuple[str, Path]] = []
+    for page in SITE_REPORTS_DIR.glob("report_20*.html"):
+        match = REPORT_HTML_RE.match(page.name)
+        if match:
+            candidates.append((match.group(1), page))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])
+
+
+def _date_hyphen(date_key: str) -> str:
+    return f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
 
 
 def strip_raw_report(html: str) -> str:
@@ -239,6 +257,29 @@ def main() -> int:
         return 1
 
     errors: list[str] = []
+    latest_report = latest_stock_report_html()
+    if latest_report is not None:
+        latest_date, latest_page = latest_report
+        latest_href = f"reports/{latest_page.name}"
+        index_path = SITE_DIR / "index.html"
+        if index_path.exists():
+            index_html = index_path.read_text(encoding="utf-8", errors="ignore")
+            if latest_href not in index_html:
+                errors.append(
+                    f"site/index.html latest report link is stale: expected {latest_href}"
+                )
+        else:
+            errors.append("site/index.html is missing while report pages exist")
+        advice_path = SITE_DIR / "advice_backtest.html"
+        if advice_path.exists():
+            advice_html = advice_path.read_text(encoding="utf-8", errors="ignore")
+            latest_text = _date_hyphen(latest_date)
+            if latest_text not in advice_html:
+                errors.append(
+                    f"site/advice_backtest.html is stale: expected latest report date {latest_text}"
+                )
+        else:
+            errors.append("site/advice_backtest.html is missing while report pages exist")
 
     for page in pages:
         html = page.read_text(encoding="utf-8", errors="ignore")
