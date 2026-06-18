@@ -44,6 +44,9 @@ BAD_ACCOUNT_ERROR_TOKENS = (
     '"error":',
     "traceback",
     "Traceback",
+    "模型输出疑似截断",
+    "LLM 未返回内容",
+    "本次组合复盘未完成",
     '"code"',
     '"message"',
 )

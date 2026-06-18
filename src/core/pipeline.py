@@ -3228,8 +3228,7 @@ class StockAnalysisPipeline:
         if review_text:
             body = review_text
         else:
-            failure_prefix = "LOF/ETF 组合复盘失败" if asset_type == "lof" else "场外基金组合复盘失败"
-            body = f"{failure_prefix}：LLM 未返回内容，本次组合复盘未完成。"
+            body = self._build_rule_based_portfolio_review(account, asset_type, holdings)
 
         return "\n".join(
             [
@@ -3258,13 +3257,108 @@ class StockAnalysisPipeline:
                 temperature=0.3,
             )
         except Exception as exc:
-            return self._portfolio_review_failure_text(asset_type, exc)
+            logger.warning("账户级基金组合复盘 AI 调用失败，使用规则兜底: %s", exc)
+            return self._build_rule_based_portfolio_review(account, asset_type, holdings)
         if not generated:
-            return ""
+            return self._build_rule_based_portfolio_review(account, asset_type, holdings)
         generated = generated.strip()
         if self._portfolio_review_looks_truncated(generated):
-            return self._portfolio_review_incomplete_text(asset_type)
+            return self._build_rule_based_portfolio_review(account, asset_type, holdings)
         return generated
+
+    @staticmethod
+    def _infer_fund_themes(name: str, code: str = "") -> List[str]:
+        text = f"{name} {code}".lower()
+        theme_rules: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+            ("科技成长", ("科技", "ai", "人工智能", "半导体", "芯片", "算力", "互联网", "软件", "硬科技")),
+            ("基建链", ("电网", "基建", "工程", "建筑", "电力设备")),
+            ("资源品", ("有色", "黄金", "白银", "稀土", "资源", "矿业", "铜", "铝", "煤炭", "能源")),
+            ("红利价值", ("红利", "股息", "价值")),
+            ("海外资产", ("纳斯达克", "标普", "美国", "全球", "海外", "qdii", "港股", "港美")),
+            ("医药", ("医药", "生物", "创新药")),
+            ("新能源", ("新能源", "光伏", "电池")),
+            ("宽基指数", ("沪深300", "中证500", "a500", "宽基", "创业板", "上证50", "指数")),
+            ("固收债券", ("债", "纯债", "固收")),
+        )
+        themes: List[str] = []
+        for theme, keywords in theme_rules:
+            if any(keyword.lower() in text for keyword in keywords):
+                themes.append(theme)
+        return themes
+
+    @classmethod
+    def _summarize_fund_themes(cls, holdings: List[Dict[str, str]], fallback_label: str) -> Tuple[str, str]:
+        theme_counts: Dict[str, int] = defaultdict(int)
+        for item in holdings:
+            for theme in cls._infer_fund_themes(item.get("name", ""), item.get("code", "")):
+                theme_counts[theme] += 1
+
+        if not theme_counts:
+            return fallback_label, "暂无法从名称准确归类，后续应结合基金实际投向继续观察。"
+
+        ordered = sorted(theme_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        theme_text = "、".join(theme for theme, _count in ordered[:4])
+        concentrated = [theme for theme, count in ordered if count > 1]
+        if concentrated:
+            exposure_text = f"可能存在主题集中在：{'、'.join(concentrated[:3])}。"
+        else:
+            exposure_text = "整体更偏多主题分散配置。"
+        return theme_text, exposure_text
+
+    @classmethod
+    def _build_rule_based_portfolio_review(
+        cls,
+        account: str,
+        asset_type: str,
+        holdings: List[Dict[str, str]],
+    ) -> str:
+        count = len(holdings)
+        if asset_type == "lof":
+            themes, exposure = cls._summarize_fund_themes(holdings, "主题较分散 / 暂无法从名称准确归类")
+            return "\n".join(
+                [
+                    "#### 组合观察",
+                    "",
+                    "- AI 组合复盘未完成，以下为规则版组合兜底复盘。",
+                    f"- 该账户持有 {count} 只 LOF/ETF，主要用于场内基金配置观察。",
+                    f"- 根据名称粗略识别主题：{themes}。",
+                    "",
+                    "#### 配置节奏",
+                    "",
+                    "- 当前仅做组合层面观察，不做单只基金短线判断。",
+                    "- 后续应重点看对应主题是否继续强势，以及组合是否过度集中。",
+                    "",
+                    "#### 后续观察",
+                    "",
+                    "- 观察组合中重复主题是否过高。",
+                    "- 观察是否存在单一方向暴露过重。",
+                ]
+            )
+
+        themes, exposure = cls._summarize_fund_themes(holdings, "风格较分散 / 暂无法从名称准确归类")
+        return "\n".join(
+            [
+                "#### 组合观察",
+                "",
+                "- AI 组合复盘未完成，以下为规则版组合兜底复盘。",
+                f"- 该账户持有 {count} 只场外基金，适合从组合层面观察风格暴露。",
+                f"- 根据名称粗略识别风格：{themes}。",
+                "",
+                "#### 风格暴露",
+                "",
+                f"- {exposure}",
+                "",
+                "#### 配置节奏",
+                "",
+                "- 当前仅做组合层面观察，不做单只基金短线判断。",
+                "- 后续应结合市场风格和组合集中度观察。",
+                "",
+                "#### 后续观察",
+                "",
+                "- 观察是否过度集中在单一主题。",
+                "- 观察不同基金之间是否高度重叠。",
+            ]
+        )
 
     @staticmethod
     def _build_portfolio_review_prompt(
