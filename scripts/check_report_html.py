@@ -51,7 +51,24 @@ BAD_ACCOUNT_ERROR_TOKENS = (
     '"code"',
     '"message"',
 )
-SENSITIVE_TOKENS = (
+SENSITIVE_PHRASES = (
+    "持仓成本",
+    "单位成本",
+    "成本价",
+    "持仓份额",
+    "基金份额",
+    "持仓金额",
+    "账户金额",
+    "总金额",
+    "总资产",
+    "持仓市值",
+    "市值",
+    "盈亏",
+    "浮盈",
+    "浮亏",
+    "收益金额",
+)
+SENSITIVE_FIELD_NAMES = (
     "unit_cost",
     "shares",
     "cost",
@@ -59,15 +76,17 @@ SENSITIVE_TOKENS = (
     "profit",
     "amount",
     "total",
-    "成本",
-    "份额",
-    "金额",
-    "账户金额",
-    "总资产",
-    "持仓成本",
-    "单位成本",
-    "市值",
-    "盈亏",
+)
+SENSITIVE_FIELD_RE = re.compile(
+    r"(?is)"
+    r"(<(?:th|td)\b[^>]*>\s*(?:"
+    + "|".join(re.escape(field) for field in SENSITIVE_FIELD_NAMES)
+    + r")\s*</(?:th|td)>)"
+    r"|([\"'](?:"
+    + "|".join(re.escape(field) for field in SENSITIVE_FIELD_NAMES)
+    + r")[\"']\s*:)"
+    r"|(\b(?:unit_cost|market_value)\b)"
+    r"|(\b(?:shares|cost|profit|amount|total)\b\s*[:=,])"
 )
 FUND_DECISION_TOKENS = ("买入", "卖出", "观望", "评分", "评级", "打分", "交易评级", "股票评级", "交易建议")
 BAD_LOF_TEXT_TOKENS = (
@@ -272,6 +291,22 @@ def _check_tokens(
             )
 
 
+def _check_sensitive_content(errors: list[str], path: Path, scope: str, html: str) -> None:
+    for phrase in SENSITIVE_PHRASES:
+        if phrase in html:
+            errors.append(
+                f"{_page_label(path)} {scope} contains sensitive phrase {phrase!r}: "
+                f"{_snippet(html, phrase)}"
+            )
+
+    for match in SENSITIVE_FIELD_RE.finditer(html):
+        token = match.group(0)
+        errors.append(
+            f"{_page_label(path)} {scope} contains sensitive field {token!r}: "
+            f"{_snippet(html, token)}"
+        )
+
+
 def main() -> int:
     pages = html_pages()
     if not pages:
@@ -307,7 +342,7 @@ def main() -> int:
         html = page.read_text(encoding="utf-8", errors="ignore")
         account_html = strip_raw_report(html)
 
-        _check_tokens(errors, page, "public page", html, SENSITIVE_TOKENS, "contains sensitive token")
+        _check_sensitive_content(errors, page, "public page", html)
         _check_tokens(
             errors,
             page,
