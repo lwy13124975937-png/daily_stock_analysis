@@ -75,10 +75,26 @@ BAD_LOF_TEXT_TOKENS = (
 )
 LOF_SINGLE_NOTE = "已纳入账户级 LOF/ETF 组合复盘"
 TRUNCATED_SUFFIXES = (
+    "组合在",
     "基于当前持仓清单做",
     "呈现出明显的",
+    "该组合呈现",
+    "当前组合在",
     "当前处于典型的",
     "典型的",
+)
+INCOMPLETE_TAIL_TOKENS = (
+    "在",
+    "的",
+    "和",
+    "与",
+    "及",
+    "但",
+    "因此",
+    "同时",
+    "主要",
+    "整体",
+    "风格暴露",
 )
 NATURAL_ENDINGS = tuple("。；;：:、，,）)】》”’！？?!…")
 
@@ -137,7 +153,7 @@ def extract_lof_blocks(html: str) -> list[str]:
     blocks = []
     blocks.extend(
         re.findall(
-            r"<section class=\"panel\">\s*<h3>[^<]*LOF/ETF 组合复盘</h3>(.*?)</section>",
+            r'<section\b[^>]*class="[^"]*panel[^"]*"[^>]*>\s*<h3>[^<]*LOF/ETF 组合复盘</h3>(.*?)</section>',
             html,
             flags=re.DOTALL,
         )
@@ -163,7 +179,7 @@ def extract_otc_blocks(html: str) -> list[str]:
     blocks = []
     blocks.extend(
         re.findall(
-            r"<section class=\"panel\">\s*<h3>[^<]*场外基金组合复盘</h3>(.*?)</section>",
+            r'<section\b[^>]*class="[^"]*panel[^"]*"[^>]*>\s*<h3>[^<]*场外基金组合复盘</h3>(.*?)</section>',
             html,
             flags=re.DOTALL,
         )
@@ -218,6 +234,12 @@ def _check_suspicious_truncation(
     for unit in _review_text_units(block):
         if any(unit.endswith(suffix) for suffix in TRUNCATED_SUFFIXES):
             errors.append(f"{_page_label(path)} {scope} appears truncated: {unit}")
+            continue
+        if any(unit.endswith(token) for token in INCOMPLETE_TAIL_TOKENS):
+            errors.append(f"{_page_label(path)} {scope} has incomplete sentence tail: {unit}")
+            continue
+        if "AI 组合复盘未完成" in unit and "规则版组合兜底复盘" not in unit:
+            errors.append(f"{_page_label(path)} {scope} has incomplete AI fallback notice: {unit}")
             continue
         if unit.count("“") > unit.count("”"):
             errors.append(f"{_page_label(path)} {scope} has unclosed Chinese quote: {unit}")

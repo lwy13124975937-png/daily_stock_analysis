@@ -401,8 +401,19 @@ def dataframe_to_bars(df: Any) -> list[DailyBar]:
         return []
     bars: list[DailyBar] = []
     columns = {str(col).lower(): col for col in getattr(df, "columns", [])}
-    date_col = columns.get("date") or columns.get("trade_date")
-    close_col = columns.get("close") or columns.get("收盘")
+    date_col = (
+        columns.get("date")
+        or columns.get("trade_date")
+        or columns.get("日期")
+        or columns.get("交易日期")
+    )
+    close_col = (
+        columns.get("close")
+        or columns.get("收盘")
+        or columns.get("收盘价")
+        or columns.get("收盘价(元)")
+        or columns.get("最新价")
+    )
     if date_col is None or close_col is None:
         return []
     for _, row in df.iterrows():
@@ -499,7 +510,7 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
     result["action_group"] = group
     if analysis_date is None:
         for period in PERIODS:
-            result[f"{period}_status"] = "数据不足"
+            result[f"{period}_status"] = result.get(f"{period}_status") or "数据不足"
             result[f"{period}_hit"] = None
         return result
 
@@ -507,28 +518,37 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
     bars = sorted((bar for bar in bars if bar.close > 0), key=lambda bar: bar.trade_date)
     if not bars:
         for period in PERIODS:
+            if result.get(f"{period}_status") == "已验证":
+                continue
             result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, PERIODS[period]) else "数据不足"
             result[f"{period}_hit"] = None
-            result[f"{period}_close"] = None
-            result[f"{period}_return"] = None
+            result.setdefault(f"{period}_close", None)
+            result.setdefault(f"{period}_return", None)
         return result
 
     start_candidates = [bar for bar in bars if bar.trade_date <= analysis_date]
-    if not start_candidates:
+    advice_close = parse_float(result.get("advice_close"))
+    if advice_close is None or advice_close <= 0:
+        advice_close = start_candidates[-1].close if start_candidates else None
+
+    if advice_close is None or advice_close <= 0:
         for period in PERIODS:
+            if result.get(f"{period}_status") == "已验证":
+                continue
             result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, PERIODS[period]) else "数据不足"
             result[f"{period}_hit"] = None
         return result
 
-    advice_close = start_candidates[-1].close
     result["advice_close"] = round(advice_close, 4)
     forward = [bar for bar in bars if bar.trade_date > analysis_date]
     for period, offset in PERIODS.items():
+        if result.get(f"{period}_status") == "已验证" and parse_float(result.get(f"{period}_close")) is not None:
+            continue
         if len(forward) < offset:
-            result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, offset) or not error else "数据不足"
+            result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, offset) else "数据不足"
             result[f"{period}_hit"] = None
-            result[f"{period}_close"] = None
-            result[f"{period}_return"] = None
+            result.setdefault(f"{period}_close", None)
+            result.setdefault(f"{period}_return", None)
             continue
 
         target = forward[offset - 1]
@@ -1098,12 +1118,52 @@ def assert_test_results(accuracy: dict[str, Any]) -> None:
         MockPriceProvider({"303030": make_test_bars(old_date, 10.0, [0.01])}),
     )
     assert old_verified.get("d1_status") == "已验证", "past advice with target close must be evaluated"
+    assert old_verified.get("advice_close") == 10.0, "missing advice_close must be backfilled from historical bars"
+    assert old_verified.get("d1_close") == 10.1
+
+    missing_start = evaluate_record(
+        {"date": old_date.isoformat(), "code": "505050", "action": "买入", "sentiment": "看多"},
+        MockPriceProvider({"505050": [DailyBar(old_date + timedelta(days=1), 10.2)]}),
+    )
+    assert missing_start.get("d1_status") == "数据不足", "missing advice-day close after window arrived must be insufficient"
+
+    missing_target = evaluate_record(
+        {"date": old_date.isoformat(), "code": "606060", "action": "买入", "sentiment": "看多"},
+        MockPriceProvider({"606060": [DailyBar(old_date, 10.0)]}),
+    )
+    assert missing_target.get("d1_status") == "数据不足", "missing target close after window arrived must be insufficient"
+
+    existing_verified = evaluate_record(
+        {
+            "date": old_date.isoformat(),
+            "code": "707070",
+            "action": "买入",
+            "sentiment": "看多",
+            "advice_close": 10.0,
+            "d1_status": "已验证",
+            "d1_close": 10.3,
+            "d1_return": 0.03,
+            "d1_hit": True,
+        },
+        MockErrorPriceProvider(),
+    )
+    assert existing_verified.get("d1_status") == "已验证" and existing_verified.get("d1_close") == 10.3
 
     short_suspend = evaluate_record(
         {"date": today.isoformat(), "code": "404040", "action": "观望", "sentiment": "震荡"},
         MockPriceProvider({"404040": [DailyBar(today, 10.0)]}),
     )
     assert short_suspend.get("d1_status") == "等待验证", "not enough future effective trading bars must wait"
+
+    class TinyFrame:
+        empty = False
+        columns = ["日期", "收盘价"]
+
+        def iterrows(self):
+            yield 0, {"日期": old_date.isoformat(), "收盘价": "10.5"}
+
+    bars = dataframe_to_bars(TinyFrame())
+    assert bars and bars[0].trade_date == old_date and bars[0].close == 10.5
 
 
 def parse_args() -> argparse.Namespace:

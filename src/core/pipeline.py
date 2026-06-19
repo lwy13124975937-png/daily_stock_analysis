@@ -3419,12 +3419,30 @@ class StockAnalysisPipeline:
             return False
 
         suspicious_suffixes = (
+            "组合在",
             "基于当前持仓清单做",
             "呈现出明显的",
+            "该组合呈现",
+            "当前组合在",
             "当前处于典型的",
             "典型的",
         )
         if any(last_text.endswith(suffix) for suffix in suspicious_suffixes):
+            return True
+        incomplete_tail_tokens = (
+            "在",
+            "的",
+            "和",
+            "与",
+            "及",
+            "但",
+            "因此",
+            "同时",
+            "主要",
+            "整体",
+            "风格暴露",
+        )
+        if any(last_text.endswith(token) for token in incomplete_tail_tokens):
             return True
         if last_text.count("“") > last_text.count("”"):
             return True
