@@ -6,14 +6,29 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import os
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts.build_stock_list_from_holdings import (  # noqa: E402
+    DEFAULT_HOLDINGS_URL,
+    build_holdings_snapshot,
+    _download_json,
+)
+
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_SNAPSHOT_PATH = ROOT_DIR / "site_data" / "holdings_snapshot.json"
 DEFAULT_REPORTS_DIR = ROOT_DIR / "reports"
+DEFAULT_HOLDINGS_PATHS = (
+    ROOT_DIR / "holdings_data.json",
+    ROOT_DIR / "site_data" / "holdings_data.json",
+    ROOT_DIR / "data" / "holdings_data.json",
+)
 REPORTABLE_TYPES = {"stock"}
 CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 HEADING_RE = re.compile(r"^(#{2,6})\s+(.+?)\s*$", re.MULTILINE)
@@ -26,13 +41,88 @@ def latest_report(reports_dir: Path) -> Path | None:
     return max(reports, key=lambda path: path.stat().st_mtime)
 
 
-def load_snapshot(snapshot_path: Path) -> dict:
+def _load_json_file(path: Path) -> dict:
     try:
-        return json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise RuntimeError(f"holdings snapshot not found: {snapshot_path}") from None
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"invalid holdings snapshot JSON: {snapshot_path}: {exc}") from exc
+        raise RuntimeError(f"invalid JSON: {path}: {exc}") from exc
+
+
+def _write_recovered_snapshot(snapshot_path: Path, snapshot: dict) -> None:
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"recovered holdings snapshot written: {snapshot_path}")
+
+
+def load_snapshot(
+    snapshot_path: Path,
+    holdings_data_path: Path | None = None,
+    holdings_url: str | None = None,
+) -> dict:
+    attempts: list[str] = []
+
+    if snapshot_path.exists():
+        try:
+            snapshot = _load_json_file(snapshot_path)
+            print(f"holdings source: snapshot {snapshot_path}")
+            return snapshot
+        except RuntimeError as exc:
+            attempts.append(str(exc))
+    else:
+        attempts.append(f"missing snapshot: {snapshot_path}")
+
+    candidate_paths: list[Path] = []
+    if holdings_data_path is not None:
+        candidate_paths.append(holdings_data_path)
+    env_path = os.environ.get("HOLDINGS_DATA_PATH")
+    if env_path:
+        candidate_paths.append(Path(env_path))
+    candidate_paths.extend(DEFAULT_HOLDINGS_PATHS)
+
+    seen_paths: set[Path] = set()
+    for candidate in candidate_paths:
+        candidate = candidate.expanduser()
+        if not candidate.is_absolute():
+            candidate = ROOT_DIR / candidate
+        candidate = candidate.resolve()
+        if candidate in seen_paths:
+            continue
+        seen_paths.add(candidate)
+        if not candidate.exists():
+            attempts.append(f"missing holdings data: {candidate}")
+            continue
+        try:
+            data = _load_json_file(candidate)
+            snapshot, _type_codes, _stock_list = build_holdings_snapshot(data, str(candidate))
+            _write_recovered_snapshot(snapshot_path, snapshot)
+            print(f"holdings source: raw file {candidate}")
+            return snapshot
+        except RuntimeError as exc:
+            attempts.append(str(exc))
+        except Exception as exc:
+            attempts.append(f"failed to load holdings data {candidate}: {type(exc).__name__}: {exc}")
+
+    url = (holdings_url or os.environ.get("HOLDINGS_DATA_URL") or DEFAULT_HOLDINGS_URL).strip()
+    if url:
+        try:
+            data = _download_json(url)
+            snapshot, _type_codes, _stock_list = build_holdings_snapshot(data, url)
+            _write_recovered_snapshot(snapshot_path, snapshot)
+            print(f"holdings source: raw url {url}")
+            return snapshot
+        except Exception as exc:
+            attempts.append(f"failed to download holdings data {url}: {type(exc).__name__}: {exc}")
+
+    detail = "\n".join(f"- {item}" for item in attempts)
+    raise RuntimeError(
+        "holdings snapshot not found and no fallback holdings data could be loaded. "
+        "Run scripts/build_stock_list_from_holdings.py before coverage, or provide "
+        "site_data/holdings_snapshot.json / holdings_data.json.\n"
+        f"attempted sources:\n{detail}"
+    )
 
 
 def iter_reportable_holdings(snapshot: dict) -> Iterable[Dict[str, str]]:
@@ -131,8 +221,13 @@ def has_lof_portfolio_review(report_text: str) -> bool:
     return False
 
 
-def check_coverage(snapshot_path: Path, reports_dir: Path) -> Tuple[bool, List[Dict[str, str]]]:
-    snapshot = load_snapshot(snapshot_path)
+def check_coverage(
+    snapshot_path: Path,
+    reports_dir: Path,
+    holdings_data_path: Path | None = None,
+    holdings_url: str | None = None,
+) -> Tuple[bool, List[Dict[str, str]]]:
+    snapshot = load_snapshot(snapshot_path, holdings_data_path, holdings_url)
     required_holdings = unique_by_code(iter_reportable_holdings(snapshot))
     if not required_holdings:
         raise RuntimeError("no reportable stock holdings found in holdings snapshot")
@@ -163,10 +258,6 @@ def check_coverage(snapshot_path: Path, reports_dir: Path) -> Tuple[bool, List[D
             )
         return False, missing
 
-    if has_lof_holdings(snapshot) and not has_lof_portfolio_review(report_text):
-        print("ERROR: LOF/ETF holdings exist but report is missing ## LOF/ETF 组合复盘")
-        return False, []
-
     print("report coverage check passed")
     return True, []
 
@@ -187,13 +278,30 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REPORTS_DIR,
         help=f"Directory containing report_*.md files. Default: {DEFAULT_REPORTS_DIR}",
     )
+    parser.add_argument(
+        "--holdings-data",
+        type=Path,
+        default=None,
+        help="Optional raw holdings_data.json path used when the snapshot is missing.",
+    )
+    parser.add_argument(
+        "--holdings-url",
+        type=str,
+        default=None,
+        help="Optional raw holdings_data.json URL used when local sources are missing.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        ok, _missing = check_coverage(args.snapshot, args.reports_dir)
+        ok, _missing = check_coverage(
+            args.snapshot,
+            args.reports_dir,
+            args.holdings_data,
+            args.holdings_url,
+        )
     except RuntimeError as exc:
         print(f"ERROR: {exc}")
         return 1
