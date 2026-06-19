@@ -23,6 +23,7 @@ from scripts.build_stock_list_from_holdings import (  # noqa: E402
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_SNAPSHOT_PATH = ROOT_DIR / "site_data" / "holdings_snapshot.json"
+DEFAULT_CURRENT_STOCK_LIST_PATH = ROOT_DIR / "site_data" / "current_stock_list.json"
 DEFAULT_REPORTS_DIR = ROOT_DIR / "reports"
 DEFAULT_HOLDINGS_PATHS = (
     ROOT_DIR / "holdings_data.json",
@@ -55,6 +56,109 @@ def _write_recovered_snapshot(snapshot_path: Path, snapshot: dict) -> None:
         encoding="utf-8",
     )
     print(f"recovered holdings snapshot written: {snapshot_path}")
+
+
+def _normalize_code(value: object) -> str:
+    code = str(value or "").strip()
+    if code.isdigit() and 0 < len(code) <= 6:
+        return code.zfill(6)
+    return code
+
+
+def iter_current_stock_list(payload: dict) -> Iterable[Dict[str, str]]:
+    stocks = payload.get("stocks", []) if isinstance(payload, dict) else []
+    if not isinstance(stocks, list):
+        return
+    for item in stocks:
+        if not isinstance(item, dict):
+            continue
+        normalized_type = str(item.get("type") or "stock").strip().lower()
+        if normalized_type not in REPORTABLE_TYPES:
+            continue
+        code = _normalize_code(item.get("code"))
+        if not code:
+            continue
+        yield {
+            "account": str(item.get("account", "") or "").strip(),
+            "type": normalized_type,
+            "name": str(item.get("name", "") or code).strip() or code,
+            "code": code,
+        }
+
+
+def holdings_from_stock_list_env(stock_list: str) -> list[Dict[str, str]]:
+    holdings: list[Dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_code in stock_list.split(","):
+        code = _normalize_code(raw_code)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        holdings.append({"account": "", "type": "stock", "name": code, "code": code})
+    return holdings
+
+
+def load_reportable_holdings(
+    current_stock_list_path: Path,
+    snapshot_path: Path,
+    holdings_data_path: Path | None = None,
+    holdings_url: str | None = None,
+) -> list[Dict[str, str]]:
+    attempts: list[str] = []
+
+    if current_stock_list_path.exists():
+        try:
+            payload = _load_json_file(current_stock_list_path)
+            holdings = unique_by_code(iter_current_stock_list(payload))
+            if holdings:
+                print(f"holdings source: current stock list {current_stock_list_path}")
+                return holdings
+            attempts.append(f"empty current stock list: {current_stock_list_path}")
+        except RuntimeError as exc:
+            attempts.append(str(exc))
+    else:
+        attempts.append(f"missing current stock list: {current_stock_list_path}")
+
+    try:
+        snapshot = load_snapshot(snapshot_path, holdings_data_path, holdings_url=None)
+        holdings = unique_by_code(iter_reportable_holdings(snapshot))
+        if holdings:
+            return holdings
+        attempts.append(f"no reportable stock holdings in snapshot/raw local sources: {snapshot_path}")
+    except RuntimeError as exc:
+        attempts.append(str(exc))
+
+    stock_list_env = os.environ.get("STOCK_LIST", "").strip()
+    if stock_list_env:
+        holdings = holdings_from_stock_list_env(stock_list_env)
+        if holdings:
+            print("holdings source: STOCK_LIST environment")
+            return holdings
+        attempts.append("STOCK_LIST environment is set but contains no valid codes")
+    else:
+        attempts.append("missing STOCK_LIST environment")
+
+    url = (holdings_url or os.environ.get("HOLDINGS_DATA_URL") or DEFAULT_HOLDINGS_URL).strip()
+    if url:
+        try:
+            data = _download_json(url)
+            snapshot, _type_codes, _stock_list = build_holdings_snapshot(data, url)
+            _write_recovered_snapshot(snapshot_path, snapshot)
+            holdings = unique_by_code(iter_reportable_holdings(snapshot))
+            if holdings:
+                print(f"holdings source: raw url {url}")
+                return holdings
+            attempts.append(f"raw url contains no reportable stock holdings: {url}")
+        except Exception as exc:
+            attempts.append(f"failed to download holdings data {url}: {type(exc).__name__}: {exc}")
+
+    detail = "\n".join(f"- {item}" for item in attempts)
+    raise RuntimeError(
+        "no reportable stock list could be loaded for coverage. "
+        "Run scripts/build_stock_list_from_holdings.py before coverage, or provide "
+        "site_data/current_stock_list.json / site_data/holdings_snapshot.json / STOCK_LIST.\n"
+        f"attempted sources:\n{detail}"
+    )
 
 
 def load_snapshot(
@@ -105,7 +209,7 @@ def load_snapshot(
         except Exception as exc:
             attempts.append(f"failed to load holdings data {candidate}: {type(exc).__name__}: {exc}")
 
-    url = (holdings_url or os.environ.get("HOLDINGS_DATA_URL") or DEFAULT_HOLDINGS_URL).strip()
+    url = (holdings_url or "").strip()
     if url:
         try:
             data = _download_json(url)
@@ -222,15 +326,20 @@ def has_lof_portfolio_review(report_text: str) -> bool:
 
 
 def check_coverage(
+    current_stock_list_path: Path,
     snapshot_path: Path,
     reports_dir: Path,
     holdings_data_path: Path | None = None,
     holdings_url: str | None = None,
 ) -> Tuple[bool, List[Dict[str, str]]]:
-    snapshot = load_snapshot(snapshot_path, holdings_data_path, holdings_url)
-    required_holdings = unique_by_code(iter_reportable_holdings(snapshot))
+    required_holdings = load_reportable_holdings(
+        current_stock_list_path,
+        snapshot_path,
+        holdings_data_path,
+        holdings_url,
+    )
     if not required_holdings:
-        raise RuntimeError("no reportable stock holdings found in holdings snapshot")
+        raise RuntimeError("no reportable stock holdings found")
 
     report_path = latest_report(reports_dir)
     if report_path is None:
@@ -267,6 +376,12 @@ def parse_args() -> argparse.Namespace:
         description="Verify latest report_*.md covers every stock code and includes LOF/ETF portfolio review when needed."
     )
     parser.add_argument(
+        "--current-stock-list",
+        type=Path,
+        default=DEFAULT_CURRENT_STOCK_LIST_PATH,
+        help=f"Path to current stock list JSON. Default: {DEFAULT_CURRENT_STOCK_LIST_PATH}",
+    )
+    parser.add_argument(
         "--snapshot",
         type=Path,
         default=DEFAULT_SNAPSHOT_PATH,
@@ -297,6 +412,7 @@ def main() -> int:
     args = parse_args()
     try:
         ok, _missing = check_coverage(
+            args.current_stock_list,
             args.snapshot,
             args.reports_dir,
             args.holdings_data,

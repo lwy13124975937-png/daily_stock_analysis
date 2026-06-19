@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SITE_DATA_DIR = ROOT_DIR / "site_data"
 SNAPSHOT_PATH = SITE_DATA_DIR / "holdings_snapshot.json"
+CURRENT_STOCK_LIST_PATH = SITE_DATA_DIR / "current_stock_list.json"
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_HOLDINGS_URL = (
@@ -122,6 +123,63 @@ def write_snapshot(snapshot: dict) -> None:
     print(f"Holdings snapshot written: {SNAPSHOT_PATH.relative_to(ROOT_DIR)}")
 
 
+def _stock_items_from_snapshot(snapshot: dict) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+    if not isinstance(accounts, dict):
+        return items
+
+    for account_name, groups in accounts.items():
+        if not isinstance(groups, dict):
+            continue
+        stocks = groups.get("stock", [])
+        if not isinstance(stocks, list):
+            continue
+        for holding in stocks:
+            if not isinstance(holding, dict):
+                continue
+            code = _normalize_code(holding.get("code"))
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            items.append(
+                {
+                    "code": code,
+                    "name": _clean_text(holding.get("name")) or code,
+                    "type": "stock",
+                    "account": _clean_text(holding.get("account") or account_name),
+                }
+            )
+    return items
+
+
+def _stock_items_from_codes(stock_list: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_code in stock_list.split(","):
+        code = _normalize_code(raw_code)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        items.append({"code": code, "name": code, "type": "stock"})
+    return items
+
+
+def write_current_stock_list(stock_items: list[dict[str, str]], source: str) -> None:
+    SITE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at": datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "stocks": stock_items,
+    }
+    CURRENT_STOCK_LIST_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Current stock list written: {CURRENT_STOCK_LIST_PATH.relative_to(ROOT_DIR)}")
+
+
 def _write_github_env(name: str, value: str) -> None:
     github_env = os.environ.get("GITHUB_ENV")
     if not github_env:
@@ -130,8 +188,9 @@ def _write_github_env(name: str, value: str) -> None:
         env_file.write(f"{name}={value}\n")
 
 
-def _set_stock_list(value: str, source: str) -> str:
+def _set_stock_list(value: str, source: str, stock_items: list[dict[str, str]] | None = None) -> str:
     stock_list = value.strip()
+    write_current_stock_list(stock_items or _stock_items_from_codes(stock_list), source)
     _write_github_env("STOCK_LIST", stock_list)
     print(f"STOCK_LIST={stock_list}")
     print(f"STOCK_LIST source: {source}")
@@ -145,7 +204,11 @@ def _print_type_codes(label: str, codes: list[str]) -> None:
 
 
 def build_stock_list() -> str:
-    fallback = os.environ.get("STOCK_LIST_FALLBACK", DEFAULT_FALLBACK_STOCK_LIST).strip()
+    fallback = (
+        os.environ.get("STOCK_LIST")
+        or os.environ.get("STOCK_LIST_FALLBACK")
+        or DEFAULT_FALLBACK_STOCK_LIST
+    ).strip()
     fallback = fallback or DEFAULT_FALLBACK_STOCK_LIST
     url = os.environ.get("HOLDINGS_DATA_URL", DEFAULT_HOLDINGS_URL).strip()
     url = url or DEFAULT_HOLDINGS_URL
@@ -154,6 +217,7 @@ def build_stock_list() -> str:
         data = _download_json(url)
         snapshot, type_codes, stock_list = build_holdings_snapshot(data, url)
         write_snapshot(snapshot)
+        stock_items = _stock_items_from_snapshot(snapshot)
     except Exception as exc:
         print(f"Failed to download or parse holdings data: {type(exc).__name__}: {exc}", file=sys.stderr)
         return _set_stock_list(fallback, "fallback")
@@ -166,7 +230,7 @@ def build_stock_list() -> str:
         print("No enabled stock holdings found; using fallback STOCK_LIST.", file=sys.stderr)
         return _set_stock_list(fallback, "fallback")
 
-    return _set_stock_list(",".join(stock_list), "holdings")
+    return _set_stock_list(",".join(stock_list), "holdings", stock_items)
 
 
 def main() -> int:
