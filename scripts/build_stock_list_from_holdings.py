@@ -81,6 +81,8 @@ def _auth_token() -> str:
         "STOCK_DASHBOARD_TOKEN",
         "GH_PAT",
         "GH_TOKEN",
+        "PAT_TOKEN",
+        "REPO_ACCESS_TOKEN",
         "GITHUB_TOKEN",
     ):
         token = os.environ.get(name, "").strip()
@@ -119,6 +121,29 @@ def _download_json(url: str) -> dict:
         return _decode_github_contents_payload(payload)
 
 
+def _load_json_from_env() -> tuple[dict, str] | None:
+    payload_b64 = os.environ.get("HOLDINGS_DATA_JSON_B64", "").strip()
+    if payload_b64:
+        try:
+            payload = base64.b64decode(payload_b64).decode("utf-8")
+            return json.loads(payload), "env:HOLDINGS_DATA_JSON_B64"
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to parse HOLDINGS_DATA_JSON_B64: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    payload = os.environ.get("HOLDINGS_DATA_JSON", "").strip()
+    if payload:
+        try:
+            return json.loads(payload), "env:HOLDINGS_DATA_JSON"
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to parse HOLDINGS_DATA_JSON: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    return None
+
+
 def _load_holdings_data() -> tuple[dict, str]:
     local_path = os.environ.get("HOLDINGS_DATA_PATH", "").strip()
     if local_path:
@@ -126,6 +151,10 @@ def _load_holdings_data() -> tuple[dict, str]:
         if not path.is_absolute():
             path = ROOT_DIR / path
         return json.loads(path.read_text(encoding="utf-8-sig")), str(path)
+
+    env_data = _load_json_from_env()
+    if env_data is not None:
+        return env_data
 
     attempts: list[str] = []
     urls = []
