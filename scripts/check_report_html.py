@@ -93,6 +93,7 @@ BAD_LOF_TEXT_TOKENS = (
     "不输出逐个标的观察或配置观察",
 )
 LOF_SINGLE_NOTE = "已纳入账户级 LOF/ETF 组合复盘"
+MISSING_SNAPSHOT_TEXT = "暂无持仓快照"
 TRUNCATED_SUFFIXES = (
     "组合在",
     "基于当前持仓清单做",
@@ -116,6 +117,12 @@ INCOMPLETE_TAIL_TOKENS = (
     "风格暴露",
 )
 NATURAL_ENDINGS = tuple("。；;：:、，,）)】》”’！？?!…")
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 def html_pages() -> list[Path]:
@@ -234,6 +241,34 @@ def _strip_tags(fragment: str) -> str:
     return unescape(re.sub(r"\s+", " ", text)).strip()
 
 
+def _current_holding_advice_count(html: str) -> int | None:
+    match = re.search(
+        r"<h3>\s*当前持仓建议\s*</h3>.*?已记录建议数量：\s*<strong>(\d+)</strong>",
+        html,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _report_has_stock_holdings(html: str) -> bool:
+    account_html = strip_raw_report(html)
+    return 'data-type="stock"' in account_html or "A股个股" in account_html
+
+
+def _check_half_sentence_leaks(errors: list[str], path: Path, scope: str, html: str) -> None:
+    text = _strip_tags(html)
+    for phrase in TRUNCATED_SUFFIXES:
+        pattern = re.compile(re.escape(phrase) + r"(?=\s|$|[。；;：:，,、])")
+        match = pattern.search(text)
+        if match:
+            start = max(0, match.start() - 40)
+            end = min(len(text), match.end() + 80)
+            snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+            errors.append(f"{_page_label(path)} {scope} contains truncated phrase {phrase!r}: {snippet}")
+
+
 def _review_text_units(block: str) -> list[str]:
     units = []
     for tag in ("p", "li"):
@@ -325,6 +360,8 @@ def main() -> int:
                 errors.append(
                     f"site/index.html latest report link is stale: expected {latest_href}"
                 )
+            if MISSING_SNAPSHOT_TEXT in index_html:
+                errors.append("site/index.html shows missing holdings snapshot")
         else:
             errors.append("site/index.html is missing while report pages exist")
         advice_path = SITE_DIR / "advice_backtest.html"
@@ -334,6 +371,12 @@ def main() -> int:
             if latest_text not in advice_html:
                 errors.append(
                     f"site/advice_backtest.html is stale: expected latest report date {latest_text}"
+                )
+            latest_html = latest_page.read_text(encoding="utf-8", errors="ignore")
+            current_count = _current_holding_advice_count(advice_html)
+            if _report_has_stock_holdings(latest_html) and current_count == 0:
+                errors.append(
+                    "site/advice_backtest.html has zero current holding advice while latest report contains stock holdings"
                 )
         else:
             errors.append("site/advice_backtest.html is missing while report pages exist")
@@ -359,6 +402,9 @@ def main() -> int:
             BAD_ACCOUNT_ERROR_TOKENS,
             "contains raw error token",
         )
+        if MISSING_SNAPSHOT_TEXT in account_html:
+            errors.append(f"{_page_label(page)} account display area shows missing holdings snapshot")
+        _check_half_sentence_leaks(errors, page, "account display area", account_html)
 
         summary_blocks = extract_account_summary_blocks(account_html)
         for idx, block in enumerate(summary_blocks, start=1):

@@ -33,6 +33,7 @@ SITE_DATA_ACCURACY_PATH = SITE_DATA_DIR / "advice_accuracy.json"
 LOCAL_HISTORY_PATH = DATA_DIR / "advice_history.jsonl"
 LOCAL_ACCURACY_PATH = DATA_DIR / "advice_accuracy.json"
 SNAPSHOT_PATH = ROOT_DIR / "site_data" / "holdings_snapshot.json"
+CURRENT_STOCK_LIST_PATH = ROOT_DIR / "site_data" / "current_stock_list.json"
 PAGES_HISTORY_URL = (
     "https://lwy13124975937-png.github.io/"
     "daily_stock_analysis/data/advice_history.jsonl"
@@ -89,24 +90,42 @@ class DataFetcherPriceProvider(PriceProvider):
 
     def _manager_instance(self):
         if self._manager is None:
+            if str(ROOT_DIR) not in sys.path:
+                sys.path.insert(0, str(ROOT_DIR))
             from data_provider import DataFetcherManager
 
             self._manager = DataFetcherManager()
         return self._manager
 
+    @staticmethod
+    def _code_variants(code: str) -> list[str]:
+        raw = normalize_code(code)
+        variants = [raw]
+        if raw.isdigit() and len(raw) == 6:
+            market = "SH" if raw.startswith(("5", "6", "9")) else "SZ"
+            variants.extend([f"{market}{raw}", f"{market.lower()}{raw}", f"{raw}.{market}"])
+        return list(dict.fromkeys(variants))
+
     def get_bars(self, code: str, analysis_date: date) -> tuple[list[DailyBar], str | None]:
         start = (analysis_date - timedelta(days=10)).strftime("%Y-%m-%d")
         end = datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d")
-        try:
-            df, _source = self._manager_instance().get_daily_data(
-                code,
-                start_date=start,
-                end_date=end,
-                days=self.days,
-            )
-        except Exception as exc:
-            return [], f"{type(exc).__name__}: {exc}"
-        return dataframe_to_bars(df), None
+        errors: list[str] = []
+        for candidate in self._code_variants(code):
+            try:
+                df, _source = self._manager_instance().get_daily_data(
+                    candidate,
+                    start_date=start,
+                    end_date=end,
+                    days=self.days,
+                )
+            except Exception as exc:
+                errors.append(f"{candidate}: {type(exc).__name__}: {exc}")
+                continue
+            bars = dataframe_to_bars(df)
+            if bars:
+                return bars, None
+            errors.append(f"{candidate}: empty daily data")
+        return [], "; ".join(errors) if errors else "no market data"
 
 
 class MockPriceProvider(PriceProvider):
@@ -175,6 +194,44 @@ def load_snapshot(path: Path = SNAPSHOT_PATH) -> dict:
         return {}
 
 
+def load_current_stock_list(path: Path = CURRENT_STOCK_LIST_PATH) -> dict[str, Holding]:
+    if not path.exists():
+        print(f"WARNING: current stock list not found: {path}", file=sys.stderr)
+        return {}
+    try:
+        payload = read_json(path)
+    except Exception as exc:
+        print(f"WARNING: cannot read current stock list {path}: {exc}", file=sys.stderr)
+        return {}
+    stocks = payload.get("stocks", []) if isinstance(payload, dict) else []
+    if not isinstance(stocks, list):
+        return {}
+
+    holdings: dict[str, Holding] = {}
+    for item in stocks:
+        if not isinstance(item, dict):
+            continue
+        if clean_text(item.get("type")).lower() != REPORTABLE_TYPE:
+            continue
+        code = normalize_code(item.get("code"))
+        if not code:
+            continue
+        holdings[code] = Holding(
+            code=code,
+            name=clean_text(item.get("name")) or code,
+            account=clean_text(item.get("account")) or "",
+            type=REPORTABLE_TYPE,
+        )
+
+    if holdings:
+        print(
+            "WARNING: using current_stock_list.json for current holding identity; "
+            "full holdings_snapshot.json is still required for account pages.",
+            file=sys.stderr,
+        )
+    return holdings
+
+
 def current_stock_holdings(snapshot: dict) -> dict[str, Holding]:
     accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
     if not isinstance(accounts, dict):
@@ -202,6 +259,14 @@ def current_stock_holdings(snapshot: dict) -> dict[str, Holding]:
     return holdings
 
 
+def load_current_stock_holdings() -> dict[str, Holding]:
+    snapshot = load_snapshot()
+    holdings = current_stock_holdings(snapshot)
+    if holdings:
+        return holdings
+    return load_current_stock_list()
+
+
 def latest_stock_report(reports_dir: Path = REPORTS_DIR) -> Path | None:
     reports = [p for p in reports_dir.glob("report_20*.md") if p.is_file()]
     if not reports:
@@ -225,7 +290,8 @@ ADVICE_RE = re.compile(
     r"^\s*(?:[-*+]\s*)?(?:[○●🔴🟢🟡]\s*)?"
     r"(?P<name>.+?)[（(]\s*(?P<code>\d{6})\s*[）)]"
     r"(?:\s*[（(]\s*(?P=code)\s*[）)])?"
-    r"\s*(?:A股个股)?\s*[：:]\s*(?P<rest>.+?)\s*$"
+    r"\s*(?:A股个股|股票|stock)?\s*[：:]\s*(?P<rest>.+?)\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -514,9 +580,13 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
             result[f"{period}_hit"] = None
         return result
 
-    bars, error = provider.get_bars(str(result.get("code")), analysis_date)
+    code = str(result.get("code") or "")
+    bars, error = provider.get_bars(code, analysis_date)
+    if error:
+        result["price_warning"] = f"行情源未返回 {code} {analysis_date.isoformat()} 附近收盘价：{error}"
     bars = sorted((bar for bar in bars if bar.close > 0), key=lambda bar: bar.trade_date)
     if not bars:
+        result.setdefault("price_warning", f"advice_close missing: {code} {analysis_date.isoformat()}")
         for period in PERIODS:
             if result.get(f"{period}_status") == "已验证":
                 continue
@@ -532,6 +602,7 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
         advice_close = start_candidates[-1].close if start_candidates else None
 
     if advice_close is None or advice_close <= 0:
+        result["price_warning"] = f"advice_close missing: {code} {analysis_date.isoformat()}"
         for period in PERIODS:
             if result.get(f"{period}_status") == "已验证":
                 continue
@@ -545,6 +616,8 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
         if result.get(f"{period}_status") == "已验证" and parse_float(result.get(f"{period}_close")) is not None:
             continue
         if len(forward) < offset:
+            if not is_validation_window_pending(analysis_date, offset):
+                result["price_warning"] = f"target_close missing: {code} {analysis_date.isoformat()} {period}"
             result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, offset) else "数据不足"
             result[f"{period}_hit"] = None
             result.setdefault(f"{period}_close", None)
@@ -699,6 +772,9 @@ def render_record_card(record: dict[str, Any]) -> str:
     current = "当前仍持有" if record.get("is_current_holding_now") else "已不在当前持仓"
     score = record.get("score")
     score_text = "unknown" if score is None else str(score)
+    price_warning = ""
+    if record.get("price_warning"):
+        price_warning = f'<p class="muted">价格诊断：{escape(str(record.get("price_warning")))}</p>'
     return f"""
 <article class="record-card">
   <h4>{escape(str(record.get('name') or ''))}（{escape(str(record.get('code') or ''))}）</h4>
@@ -709,6 +785,7 @@ def render_record_card(record: dict[str, Any]) -> str:
     <span>T+5：{escape(status_text(record, 'd5'))} {escape(format_return(record.get('d5_return')))}</span>
     <span>T+20：{escape(status_text(record, 'd20'))} {escape(format_return(record.get('d20_return')))}</span>
   </div>
+  {price_warning}
 </article>
 """
 
@@ -1057,8 +1134,7 @@ def setup_test_fixture() -> MockPriceProvider:
 
 
 def run_backtest(provider: PriceProvider | None = None) -> dict[str, Any]:
-    snapshot = load_snapshot()
-    holdings = current_stock_holdings(snapshot)
+    holdings = load_current_stock_holdings()
     report_path = latest_stock_report()
     new_records = extract_advice_from_report(report_path, holdings) if report_path else []
     history = merge_history([*load_history(), *new_records])

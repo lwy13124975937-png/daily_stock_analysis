@@ -451,6 +451,7 @@ def _is_non_holding_report_boundary(text: str) -> bool:
         _is_global_ai_heading(text)
         or "未完成分析标的" in compact
         or "LOF/ETF组合复盘" in compact
+        or "场外基金组合复盘" in compact
     )
 
 
@@ -562,7 +563,11 @@ def _extract_ai_snippets(markdown_text: str, holdings: list[dict] | None = None)
         heading = section.heading
         body = section.body
         compact_heading = re.sub(r"\s+", "", heading)
-        if "未完成分析标的" in compact_heading or "LOF/ETF组合复盘" in compact_heading:
+        if (
+            "未完成分析标的" in compact_heading
+            or "LOF/ETF组合复盘" in compact_heading
+            or "场外基金组合复盘" in compact_heading
+        ):
             continue
         heading_codes = _codes_in_text(heading)
         if len(heading_codes) == 1 and heading_codes[0] not in by_code:
@@ -713,10 +718,206 @@ def _extract_otc_portfolio_reviews(markdown_text: str) -> dict[str, str]:
     return _extract_account_portfolio_reviews(markdown_text, "场外基金组合复盘")
 
 
-def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
-    if not review_text:
-        return ""
+FUND_REVIEW_TRUNCATED_SUFFIXES = (
+    "组合在",
+    "当前组合在",
+    "该组合呈现",
+    "呈现出明显的",
+    "基于当前持仓清单做",
+    "基于当前持仓清单",
+    "风格暴露",
+)
+FUND_REVIEW_INCOMPLETE_TAILS = (
+    "在",
+    "的",
+    "和",
+    "与",
+    "及",
+    "但",
+    "因此",
+    "同时",
+    "主要",
+    "整体",
+)
+FUND_REVIEW_NATURAL_ENDINGS = tuple("。；;：:、，,）)】》”’！？?!…")
+
+
+def _fund_review_looks_truncated(text: str) -> bool:
+    plain = _plain_markdown_text(text)
+    units = [unit.strip() for unit in re.split(r"[\n\r]+", plain) if unit.strip()]
+    if not units:
+        return True
+    for unit in units:
+        if any(unit.endswith(suffix) for suffix in FUND_REVIEW_TRUNCATED_SUFFIXES):
+            return True
+        if len(unit) <= 12 and any(unit.endswith(tail) for tail in FUND_REVIEW_INCOMPLETE_TAILS):
+            return True
+        if len(unit) >= 24 and not unit.endswith(FUND_REVIEW_NATURAL_ENDINGS):
+            return True
+        if unit.count("“") > unit.count("”"):
+            return True
+    return False
+
+
+def _fund_theme_summary(holdings: list[dict]) -> str:
+    theme_keywords = (
+        ("科技成长", ("科技", "AI", "人工智能", "半导体", "芯片", "算力", "互联网")),
+        ("基建链", ("电网", "基建", "工程", "建筑")),
+        ("资源品", ("有色", "黄金", "稀土", "资源", "矿业", "铜", "铝", "白银")),
+        ("红利价值", ("红利", "股息", "价值")),
+        ("海外资产", ("纳斯达克", "标普", "美国", "全球", "海外", "QDII", "港美")),
+        ("医药", ("医药", "生物", "创新药")),
+        ("新能源", ("新能源", "光伏", "电池", "电力设备")),
+        ("宽基指数", ("沪深300", "中证500", "A500", "宽基")),
+        ("固收债券", ("债", "纯债", "固收")),
+    )
+    matched: list[str] = []
+    names = " ".join(str(item.get("name", "")) for item in holdings)
+    for label, keywords in theme_keywords:
+        if any(keyword.lower() in names.lower() for keyword in keywords):
+            matched.append(label)
+    return "、".join(dict.fromkeys(matched)) if matched else "主题较分散，暂无法从名称准确归类"
+
+
+def _rule_based_fund_review(account: str, asset_type: str, holdings: list[dict]) -> str:
+    count = len(holdings)
+    rows = [f"- {item.get('name') or item.get('code')}（{item.get('code')}）" for item in holdings]
+    themes = _fund_theme_summary(holdings)
+    if asset_type == "lof":
+        return "\n".join(
+            [
+                "#### 持有标的",
+                *rows,
+                "",
+                "#### 组合观察",
+                "- AI 组合复盘未完成，以下为规则版组合兜底复盘。",
+                f"- 该账户持有 {count} 只 LOF/ETF，主要用于场内基金配置观察。",
+                f"- 根据名称粗略识别主题：{themes}。",
+                "",
+                "#### 配置节奏",
+                "- 当前仅做组合层面观察，不做单只基金短线判断。",
+                "- 后续应重点看对应主题是否延续，以及组合是否过度集中。",
+                "",
+                "#### 后续观察",
+                "- 观察组合中重复主题是否过高。",
+                "- 观察是否存在单一方向暴露过重。",
+            ]
+        )
+    return "\n".join(
+        [
+            "#### 持有基金",
+            *rows,
+            "",
+            "#### 组合观察",
+            "- AI 组合复盘未完成，以下为规则版组合兜底复盘。",
+            f"- 该账户持有 {count} 只场外基金，适合从组合层面观察风格暴露。",
+            f"- 根据名称粗略识别风格：{themes}。",
+            "",
+            "#### 风格暴露",
+            "- 如果同类主题较多，可能存在主题集中。",
+            "- 如果主题较分散，整体更偏多主题分散配置。",
+            "",
+            "#### 配置节奏",
+            "- 当前仅做组合层面观察，不做单只基金短线判断。",
+            "- 后续应结合市场风格和组合集中度观察。",
+            "",
+            "#### 后续观察",
+            "- 观察是否过度集中在单一主题。",
+            "- 观察不同基金之间是否高度重叠。",
+        ]
+    )
+
+
+def _review_or_rule_fallback(account: str, asset_type: str, review_text: str | None, holdings: list[dict]) -> str:
+    if not review_text or _fund_review_looks_truncated(review_text):
+        return _rule_based_fund_review(account, asset_type, holdings)
+    return _fund_review_display_text(review_text)
+
+
+def _portfolio_holdings_by_account(snapshot: dict, asset_type: str) -> dict[str, list[dict]]:
+    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
+    if not isinstance(accounts, dict):
+        return {}
+    grouped: dict[str, list[dict]] = {}
+    for account in _ordered_account_names(accounts):
+        groups = accounts.get(account, {})
+        if not isinstance(groups, dict):
+            continue
+        holdings = [item for item in groups.get(asset_type, []) or [] if isinstance(item, dict)]
+        if holdings:
+            grouped[str(account)] = holdings
+    return grouped
+
+
+def _replace_portfolio_section_for_public_html(
+    markdown_text: str,
+    snapshot: dict,
+    asset_type: str,
+    section_title: str,
+) -> str:
+    holdings_by_account = _portfolio_holdings_by_account(snapshot, asset_type)
+    if not holdings_by_account:
+        return markdown_text
+
+    reviews = (
+        _extract_lof_portfolio_reviews(markdown_text)
+        if asset_type == "lof"
+        else _extract_otc_portfolio_reviews(markdown_text)
+    )
+    lines = markdown_text.splitlines()
+    start = None
+    end = None
+    for idx, line in enumerate(lines):
+        heading = _heading_match(line)
+        if heading is None:
+            continue
+        level, text = heading
+        compact = re.sub(r"\s+", "", _clean_heading_text(text))
+        if level == 2 and re.sub(r"\s+", "", section_title) in compact:
+            start = idx
+            end = len(lines)
+            for next_idx in range(idx + 1, len(lines)):
+                next_heading = _heading_match(lines[next_idx])
+                if next_heading is not None and next_heading[0] <= 2:
+                    end = next_idx
+                    break
+            break
+
+    section_lines = [f"## {section_title}", ""]
+    for account, holdings in holdings_by_account.items():
+        section_lines.extend(
+            [
+                f"### {account}",
+                "",
+                _review_or_rule_fallback(account, asset_type, reviews.get(account), holdings),
+                "",
+            ]
+        )
+    replacement = "\n".join(section_lines).rstrip()
+
+    if start is None or end is None:
+        return markdown_text.rstrip() + "\n\n" + replacement + "\n"
+    return "\n".join([*lines[:start], replacement, *lines[end:]])
+
+
+def _sanitize_public_report_markdown(markdown_text: str, snapshot: dict) -> str:
+    sanitized = _replace_portfolio_section_for_public_html(
+        markdown_text,
+        snapshot,
+        "lof",
+        "LOF/ETF 组合复盘",
+    )
+    return _replace_portfolio_section_for_public_html(
+        sanitized,
+        snapshot,
+        "otc",
+        "场外基金组合复盘",
+    )
+
+
+def _render_lof_portfolio_review(account: str, review_text: str | None, holdings: list[dict]) -> str:
     review_text = _fund_review_display_text(review_text)
+    review_text = _review_or_rule_fallback(account, "lof", review_text, holdings)
     return f"""
 <section class="panel">
   <h3>{escape(account)} LOF/ETF 组合复盘</h3>
@@ -725,10 +926,8 @@ def _render_lof_portfolio_review(account: str, review_text: str | None) -> str:
 """
 
 
-def _render_otc_portfolio_review(account: str, review_text: str | None) -> str:
-    if not review_text:
-        return ""
-    review_text = _fund_review_display_text(review_text)
+def _render_otc_portfolio_review(account: str, review_text: str | None, holdings: list[dict]) -> str:
+    review_text = _review_or_rule_fallback(account, "otc", review_text, holdings)
     return f"""
 <section class="panel">
   <h3>{escape(account)} 场外基金组合复盘</h3>
@@ -1484,10 +1683,10 @@ def _render_standard_account_section(
     is_open: bool,
 ) -> str:
     items = _account_items(groups)
-    has_lof = any(str(item.get("type", "")) == "lof" for item in items)
-    has_otc = any(str(item.get("type", "")) == "otc" for item in items)
-    lof_review = _render_lof_portfolio_review(account, lof_reviews_by_account.get(account)) if has_lof else ""
-    otc_review = _render_otc_portfolio_review(account, otc_reviews_by_account.get(account)) if has_otc else ""
+    lof_items = [item for item in items if str(item.get("type", "")) == "lof"]
+    otc_items = [item for item in items if str(item.get("type", "")) == "otc"]
+    lof_review = _render_lof_portfolio_review(account, lof_reviews_by_account.get(account), lof_items) if lof_items else ""
+    otc_review = _render_otc_portfolio_review(account, otc_reviews_by_account.get(account), otc_items) if otc_items else ""
     return f"""
 <details {"open" if is_open else ""}>
   <summary>{escape(account)}</summary>
@@ -1613,9 +1812,14 @@ def _build_report_pages(snapshot: dict) -> list[ReportPage]:
         title = _friendly_report_title(report_path, markdown_text)
         kind = _report_kind(report_path)
         output_path = SITE_REPORTS_DIR / _html_name(report_path)
-        raw_html = renderer(markdown_text) if renderer else _wrap_html(title, escape(markdown_text))
+        display_markdown_text = (
+            _sanitize_public_report_markdown(markdown_text, snapshot)
+            if kind == "stock"
+            else markdown_text
+        )
+        raw_html = renderer(display_markdown_text) if renderer else _wrap_html(title, escape(display_markdown_text))
         if kind == "stock":
-            html = _build_holding_report_page(title, markdown_text, raw_html, snapshot)
+            html = _build_holding_report_page(title, display_markdown_text, raw_html, snapshot)
         else:
             html = _enhance_report_html(raw_html, title)
         output_path.write_text(html, encoding="utf-8")
@@ -1782,6 +1986,11 @@ def build_pages() -> list[Path]:
     snapshot = _load_holdings_snapshot()
     report_pages = _build_report_pages(snapshot)
     account_pages = _build_account_pages(snapshot, report_pages)
+    if report_pages and not account_pages:
+        raise RuntimeError(
+            "holding report pages exist but no account pages were generated; "
+            "site_data/holdings_snapshot.json is missing or empty"
+        )
 
     index_path = SITE_DIR / "index.html"
     index_path.write_text(_build_index(snapshot, report_pages, account_pages), encoding="utf-8")

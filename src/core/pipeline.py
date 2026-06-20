@@ -3411,24 +3411,16 @@ class StockAnalysisPipeline:
         if not lines:
             return False
 
-        last_line = lines[-1]
-        last_text = re.sub(r"^[-*+]\s+", "", last_line).strip()
-        last_text = re.sub(r"^\d+[.)、]\s+", "", last_text).strip()
-        last_text = re.sub(r"^#{1,6}\s+", "", last_text).strip()
-        if not last_text:
-            return False
-
         suspicious_suffixes = (
             "组合在",
             "基于当前持仓清单做",
+            "基于当前持仓清单",
             "呈现出明显的",
             "该组合呈现",
             "当前组合在",
             "当前处于典型的",
             "典型的",
         )
-        if any(last_text.endswith(suffix) for suffix in suspicious_suffixes):
-            return True
         incomplete_tail_tokens = (
             "在",
             "的",
@@ -3442,12 +3434,23 @@ class StockAnalysisPipeline:
             "整体",
             "风格暴露",
         )
-        if any(last_text.endswith(token) for token in incomplete_tail_tokens):
-            return True
-        if last_text.count("“") > last_text.count("”"):
-            return True
         natural_endings = tuple("。；;：:、，,）)】》”’！？?!…")
-        return len(last_text) > 40 and not last_text.endswith(natural_endings)
+
+        for line in lines:
+            current = re.sub(r"^[-*+]\s+", "", line).strip()
+            current = re.sub(r"^\d+[.)、]\s+", "", current).strip()
+            current = re.sub(r"^#{1,6}\s+", "", current).strip()
+            if not current:
+                continue
+            if any(current.endswith(suffix) for suffix in suspicious_suffixes):
+                return True
+            if any(current.endswith(token) for token in incomplete_tail_tokens):
+                return True
+            if current.count("“") > current.count("”"):
+                return True
+            if len(current) > 40 and not current.endswith(natural_endings):
+                return True
+        return False
 
     @staticmethod
     def _portfolio_review_incomplete_text(asset_type: str) -> str:

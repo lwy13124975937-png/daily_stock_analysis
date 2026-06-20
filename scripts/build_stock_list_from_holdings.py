@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import base64
 from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -26,9 +27,26 @@ DEFAULT_HOLDINGS_URL = (
     "https://raw.githubusercontent.com/"
     "lwy13124975937-png/stock-dashboard/main/holdings_data.json"
 )
-DEFAULT_FALLBACK_STOCK_LIST = "600519"
+DEFAULT_HOLDINGS_API_URL = (
+    "https://api.github.com/repos/"
+    "lwy13124975937-png/stock-dashboard/contents/holdings_data.json?ref=main"
+)
 ANALYZED_TYPES = {"stock"}
 SNAPSHOT_TYPES = ("stock", "lof", "otc")
+TYPE_ALIASES = {
+    "stock": "stock",
+    "a股": "stock",
+    "a股个股": "stock",
+    "lof": "lof",
+    "etf": "lof",
+    "lof/etf": "lof",
+    "场内基金": "lof",
+    "场内基金/etf/lof": "lof",
+    "场内基金/ETF/LOF": "lof",
+    "otc": "otc",
+    "fund": "otc",
+    "场外基金": "otc",
+}
 TYPE_LABELS = {
     "stock": "A股个股",
     "lof": "场内基金/ETF/LOF",
@@ -51,11 +69,85 @@ def _clean_text(value: object) -> str:
     return str(value or "").strip()
 
 
+def _normalize_type(value: object) -> str:
+    raw = _clean_text(value)
+    lowered = raw.lower()
+    return TYPE_ALIASES.get(lowered) or TYPE_ALIASES.get(raw) or lowered
+
+
+def _auth_token() -> str:
+    for name in (
+        "HOLDINGS_DATA_TOKEN",
+        "STOCK_DASHBOARD_TOKEN",
+        "GH_PAT",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ):
+        token = os.environ.get(name, "").strip()
+        if token:
+            return token
+    return ""
+
+
+def _request_headers() -> dict[str, str]:
+    headers = {
+        "User-Agent": "daily-stock-analysis-actions",
+        "Accept": "application/vnd.github+json, application/json;q=0.9,*/*;q=0.8",
+    }
+    token = _auth_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _decode_github_contents_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict) or "content" not in payload:
+        return payload
+    content = str(payload.get("content") or "")
+    encoding = str(payload.get("encoding") or "").lower()
+    if encoding == "base64":
+        decoded = base64.b64decode(content).decode("utf-8")
+        return json.loads(decoded)
+    return json.loads(content)
+
+
 def _download_json(url: str) -> dict:
-    request = Request(url, headers={"User-Agent": "daily-stock-analysis-actions"})
+    request = Request(url, headers=_request_headers())
     with urlopen(request, timeout=20) as response:
         charset = response.headers.get_content_charset() or "utf-8"
-        return json.loads(response.read().decode(charset))
+        payload = json.loads(response.read().decode(charset))
+        return _decode_github_contents_payload(payload)
+
+
+def _load_holdings_data() -> tuple[dict, str]:
+    local_path = os.environ.get("HOLDINGS_DATA_PATH", "").strip()
+    if local_path:
+        path = Path(local_path)
+        if not path.is_absolute():
+            path = ROOT_DIR / path
+        return json.loads(path.read_text(encoding="utf-8-sig")), str(path)
+
+    attempts: list[str] = []
+    urls = []
+    configured_url = os.environ.get("HOLDINGS_DATA_URL", "").strip()
+    if configured_url:
+        urls.append(configured_url)
+    else:
+        urls.append(DEFAULT_HOLDINGS_URL)
+    configured_api_url = os.environ.get("HOLDINGS_DATA_API_URL", "").strip()
+    if configured_api_url:
+        urls.append(configured_api_url)
+    urls.append(DEFAULT_HOLDINGS_API_URL)
+
+    for url in dict.fromkeys(urls):
+        try:
+            return _download_json(url), url
+        except Exception as exc:
+            attempts.append(f"- failed holdings data {url}: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        "unable to load holdings data; attempted sources:\n" + "\n".join(attempts)
+    )
 
 
 def _empty_account() -> dict[str, list[dict[str, str]]]:
@@ -83,7 +175,7 @@ def build_holdings_snapshot(data: dict, source_url: str) -> tuple[dict, dict[str
         if not isinstance(record, dict) or not _is_enabled(record):
             continue
 
-        asset_type = _clean_text(record.get("type")).lower()
+        asset_type = _normalize_type(record.get("type"))
         if asset_type not in SNAPSHOT_TYPES:
             continue
 
@@ -204,38 +296,38 @@ def _print_type_codes(label: str, codes: list[str]) -> None:
 
 
 def build_stock_list() -> str:
-    fallback = (
-        os.environ.get("STOCK_LIST")
-        or os.environ.get("STOCK_LIST_FALLBACK")
-        or DEFAULT_FALLBACK_STOCK_LIST
-    ).strip()
-    fallback = fallback or DEFAULT_FALLBACK_STOCK_LIST
-    url = os.environ.get("HOLDINGS_DATA_URL", DEFAULT_HOLDINGS_URL).strip()
-    url = url or DEFAULT_HOLDINGS_URL
-
     try:
-        data = _download_json(url)
-        snapshot, type_codes, stock_list = build_holdings_snapshot(data, url)
+        data, source = _load_holdings_data()
+        snapshot, type_codes, stock_list = build_holdings_snapshot(data, source)
         write_snapshot(snapshot)
         stock_items = _stock_items_from_snapshot(snapshot)
     except Exception as exc:
-        print(f"Failed to download or parse holdings data: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return _set_stock_list(fallback, "fallback")
+        explicit_stock_list = os.environ.get("STOCK_LIST", "").strip()
+        if explicit_stock_list:
+            print(
+                "WARNING: failed to load full holdings data; using explicit STOCK_LIST only. "
+                "No holdings_snapshot.json will be generated.",
+                file=sys.stderr,
+            )
+            print(f"Reason: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return _set_stock_list(explicit_stock_list, "env-stock-list")
+        print(f"ERROR: failed to load full holdings data: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return ""
 
     _print_type_codes("A股逐只分析", type_codes["stock"])
     _print_type_codes("LOF/ETF 组合复盘", type_codes["lof"])
     _print_type_codes("场外基金清单", type_codes["otc"])
 
     if not stock_list:
-        print("No enabled stock holdings found; using fallback STOCK_LIST.", file=sys.stderr)
-        return _set_stock_list(fallback, "fallback")
+        print("ERROR: no enabled stock holdings found in holdings data.", file=sys.stderr)
+        return ""
 
     return _set_stock_list(",".join(stock_list), "holdings", stock_items)
 
 
 def main() -> int:
-    build_stock_list()
-    return 0
+    stock_list = build_stock_list()
+    return 0 if stock_list else 1
 
 
 if __name__ == "__main__":
