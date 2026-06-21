@@ -103,7 +103,15 @@ class DataFetcherPriceProvider(PriceProvider):
         variants = [raw]
         if raw.isdigit() and len(raw) == 6:
             market = "SH" if raw.startswith(("5", "6", "9")) else "SZ"
-            variants.extend([f"{market}{raw}", f"{market.lower()}{raw}", f"{raw}.{market}"])
+            lower_market = market.lower()
+            variants.extend(
+                [
+                    f"{market}{raw}",
+                    f"{lower_market}{raw}",
+                    f"{raw}.{market}",
+                    f"{lower_market}.{raw}",
+                ]
+            )
         return list(dict.fromkeys(variants))
 
     def get_bars(self, code: str, analysis_date: date) -> tuple[list[DailyBar], str | None]:
@@ -125,7 +133,9 @@ class DataFetcherPriceProvider(PriceProvider):
             if bars:
                 return bars, None
             errors.append(f"{candidate}: empty daily data")
-        return [], "; ".join(errors) if errors else "no market data"
+        attempted = ", ".join(self._code_variants(code))
+        detail = "; ".join(errors) if errors else "no market data"
+        return [], f"attempted code formats: {attempted}; {detail}"
 
 
 class MockPriceProvider(PriceProvider):
@@ -466,19 +476,38 @@ def dataframe_to_bars(df: Any) -> list[DailyBar]:
     if df is None or getattr(df, "empty", True):
         return []
     bars: list[DailyBar] = []
-    columns = {str(col).lower(): col for col in getattr(df, "columns", [])}
+    columns = {str(col).strip().lower(): col for col in getattr(df, "columns", [])}
+
+    def pick_column(candidates: Iterable[str]) -> Any:
+        for candidate in candidates:
+            column = columns.get(candidate.strip().lower())
+            if column is not None:
+                return column
+        return None
+
     date_col = (
-        columns.get("date")
-        or columns.get("trade_date")
-        or columns.get("日期")
-        or columns.get("交易日期")
+        pick_column(
+            (
+                "date",
+                "trade_date",
+                "datetime",
+                "日期",
+                "交易日期",
+                "时间",
+            )
+        )
     )
     close_col = (
-        columns.get("close")
-        or columns.get("收盘")
-        or columns.get("收盘价")
-        or columns.get("收盘价(元)")
-        or columns.get("最新价")
+        pick_column(
+            (
+                "close",
+                "Close",
+                "收盘",
+                "收盘价",
+                "收盘价(元)",
+                "最新价",
+            )
+        )
     )
     if date_col is None or close_col is None:
         return []
@@ -569,6 +598,45 @@ def is_validation_window_pending(analysis_date: date, offset: int) -> bool:
     return available_weekday_count_after(analysis_date, today) < offset
 
 
+def bars_date_range_text(bars: list[DailyBar]) -> str:
+    if not bars:
+        return "none"
+    return f"{bars[0].trade_date.isoformat()}~{bars[-1].trade_date.isoformat()}"
+
+
+def price_diagnostic(
+    *,
+    code: str,
+    analysis_date: date,
+    period: str | None,
+    missing: str,
+    bars: list[DailyBar],
+    error: str | None = None,
+    advice_close_date: date | None = None,
+) -> str:
+    formats = ", ".join(DataFetcherPriceProvider._code_variants(code))
+    parts = [
+        "价格诊断",
+        f"code={code}",
+        f"advice_date={analysis_date.isoformat()}",
+    ]
+    if period:
+        parts.append(f"horizon={period}")
+    if advice_close_date:
+        parts.append(f"advice_close_date={advice_close_date.isoformat()}")
+    parts.extend(
+        [
+            f"missing={missing}",
+            f"attempted_formats={formats}",
+            f"daily_rows={len(bars)}",
+            f"available_dates={bars_date_range_text(bars)}",
+        ]
+    )
+    if error:
+        parts.append(f"provider_error={error}")
+    return "；".join(parts)
+
+
 def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str, Any]:
     result = dict(record)
     analysis_date = parse_date(result.get("date"))
@@ -580,13 +648,29 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
             result[f"{period}_hit"] = None
         return result
 
-    code = str(result.get("code") or "")
+    code = normalize_code(result.get("code"))
     bars, error = provider.get_bars(code, analysis_date)
+    bars = sorted({bar.trade_date: bar for bar in bars if bar.close > 0}.values(), key=lambda bar: bar.trade_date)
     if error:
-        result["price_warning"] = f"行情源未返回 {code} {analysis_date.isoformat()} 附近收盘价：{error}"
-    bars = sorted((bar for bar in bars if bar.close > 0), key=lambda bar: bar.trade_date)
+        result["price_warning"] = price_diagnostic(
+            code=code,
+            analysis_date=analysis_date,
+            period=None,
+            missing="provider_error",
+            bars=bars,
+            error=error,
+        )
     if not bars:
-        result.setdefault("price_warning", f"advice_close missing: {code} {analysis_date.isoformat()}")
+        result.setdefault(
+            "price_warning",
+            price_diagnostic(
+                code=code,
+                analysis_date=analysis_date,
+                period=None,
+                missing="advice_close",
+                bars=bars,
+            ),
+        )
         for period in PERIODS:
             if result.get(f"{period}_status") == "已验证":
                 continue
@@ -596,13 +680,28 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
             result.setdefault(f"{period}_return", None)
         return result
 
-    start_candidates = [bar for bar in bars if bar.trade_date <= analysis_date]
-    advice_close = parse_float(result.get("advice_close"))
-    if advice_close is None or advice_close <= 0:
-        advice_close = start_candidates[-1].close if start_candidates else None
+    advice_index: int | None = None
+    advice_bar: DailyBar | None = None
+    for index, bar in enumerate(bars):
+        if bar.trade_date <= analysis_date:
+            advice_index = index
+            advice_bar = bar
+        else:
+            break
 
-    if advice_close is None or advice_close <= 0:
-        result["price_warning"] = f"advice_close missing: {code} {analysis_date.isoformat()}"
+    advice_close = parse_float(result.get("advice_close"))
+    if (advice_close is None or advice_close <= 0) and advice_bar is not None:
+        advice_close = advice_bar.close
+
+    if advice_bar is None or advice_index is None or advice_close is None or advice_close <= 0:
+        result["price_warning"] = price_diagnostic(
+            code=code,
+            analysis_date=analysis_date,
+            period=None,
+            missing="advice_close",
+            bars=bars,
+            error=error,
+        )
         for period in PERIODS:
             if result.get(f"{period}_status") == "已验证":
                 continue
@@ -611,14 +710,24 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
         return result
 
     result["advice_close"] = round(advice_close, 4)
-    forward = [bar for bar in bars if bar.trade_date > analysis_date]
+    result["advice_close_date"] = advice_bar.trade_date.isoformat()
+    forward = bars[advice_index + 1 :]
     for period, offset in PERIODS.items():
         if result.get(f"{period}_status") == "已验证" and parse_float(result.get(f"{period}_close")) is not None:
             continue
         if len(forward) < offset:
-            if not is_validation_window_pending(analysis_date, offset):
-                result["price_warning"] = f"target_close missing: {code} {analysis_date.isoformat()} {period}"
-            result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, offset) else "数据不足"
+            pending = is_validation_window_pending(advice_bar.trade_date, offset)
+            if not pending:
+                result["price_warning"] = price_diagnostic(
+                    code=code,
+                    analysis_date=analysis_date,
+                    period=period,
+                    missing="target_close",
+                    bars=bars,
+                    error=error,
+                    advice_close_date=advice_bar.trade_date,
+                )
+            result[f"{period}_status"] = "等待验证" if pending else "数据不足"
             result[f"{period}_hit"] = None
             result.setdefault(f"{period}_close", None)
             result.setdefault(f"{period}_return", None)
@@ -1196,6 +1305,28 @@ def assert_test_results(accuracy: dict[str, Any]) -> None:
     assert old_verified.get("d1_status") == "已验证", "past advice with target close must be evaluated"
     assert old_verified.get("advice_close") == 10.0, "missing advice_close must be backfilled from historical bars"
     assert old_verified.get("d1_close") == 10.1
+    assert old_verified.get("advice_close_date") == old_date.isoformat()
+
+    june18 = date(2026, 6, 18)
+    june18_verified = evaluate_record(
+        {"date": june18.isoformat(), "code": "600961", "action": "观望", "sentiment": "震荡"},
+        MockPriceProvider({"600961": [DailyBar(june18, 10.0), DailyBar(date(2026, 6, 19), 10.2)]}),
+    )
+    assert june18_verified.get("d1_status") == "已验证"
+    assert june18_verified.get("advice_close_date") == "2026-06-18"
+    assert june18_verified.get("d1_date") == "2026-06-19"
+    assert june18_verified.get("d1_close") == 10.2
+
+    weekend_date = date(2026, 6, 21)
+    weekend_waiting = evaluate_record(
+        {"date": weekend_date.isoformat(), "code": "600961", "action": "观望", "sentiment": "震荡"},
+        MockPriceProvider({"600961": [DailyBar(date(2026, 6, 19), 10.0)]}),
+    )
+    assert weekend_waiting.get("advice_close_date") == "2026-06-19"
+    assert weekend_waiting.get("d1_status") == "等待验证"
+
+    assert "sh.600961" in DataFetcherPriceProvider._code_variants("600961")
+    assert "sz.000651" in DataFetcherPriceProvider._code_variants("000651")
 
     missing_start = evaluate_record(
         {"date": old_date.isoformat(), "code": "505050", "action": "买入", "sentiment": "看多"},
@@ -1240,6 +1371,16 @@ def assert_test_results(accuracy: dict[str, Any]) -> None:
 
     bars = dataframe_to_bars(TinyFrame())
     assert bars and bars[0].trade_date == old_date and bars[0].close == 10.5
+
+    class EnglishFrame:
+        empty = False
+        columns = ["datetime", "Close"]
+
+        def iterrows(self):
+            yield 0, {"datetime": old_date.isoformat(), "Close": "11.5"}
+
+    english_bars = dataframe_to_bars(EnglishFrame())
+    assert english_bars and english_bars[0].trade_date == old_date and english_bars[0].close == 11.5
 
 
 def parse_args() -> argparse.Namespace:

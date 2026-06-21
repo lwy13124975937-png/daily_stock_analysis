@@ -380,6 +380,10 @@ def main() -> int:
                 errors.append(
                     "site/advice_backtest.html has zero current holding advice while latest report contains stock holdings"
                 )
+            if re.search(r"T\+\d+\s*[：:]\s*数据不足", advice_html) and "价格诊断" not in advice_html:
+                errors.append(
+                    "site/advice_backtest.html contains insufficient price status without price diagnostics"
+                )
         else:
             errors.append("site/advice_backtest.html is missing while report pages exist")
 
