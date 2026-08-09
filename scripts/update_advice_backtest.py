@@ -87,6 +87,8 @@ class DataFetcherPriceProvider(PriceProvider):
     def __init__(self, days: int = 90):
         self.days = days
         self._manager = None
+        self._cache: dict[str, tuple[date, list[DailyBar], str | None]] = {}
+        self.request_count = 0
 
     def _manager_instance(self):
         if self._manager is None:
@@ -98,11 +100,25 @@ class DataFetcherPriceProvider(PriceProvider):
         return self._manager
 
     @staticmethod
+    def _canonical_code(code: str) -> str:
+        raw = str(code or "").strip().upper()
+        prefix_match = re.fullmatch(r"(?:SH|SZ|BJ)\.?([0-9]{6})", raw)
+        if prefix_match:
+            return prefix_match.group(1)
+        suffix_match = re.fullmatch(r"([0-9]{6})\.(?:SH|SZ|BJ)", raw)
+        if suffix_match:
+            return suffix_match.group(1)
+        return normalize_code(raw)
+
+    @staticmethod
     def _code_variants(code: str) -> list[str]:
-        raw = normalize_code(code)
+        raw = DataFetcherPriceProvider._canonical_code(code)
         variants = [raw]
         if raw.isdigit() and len(raw) == 6:
-            market = "SH" if raw.startswith(("5", "6", "9")) else "SZ"
+            if raw.startswith(("4", "8", "920")):
+                market = "BJ"
+            else:
+                market = "SH" if raw.startswith(("5", "6", "9")) else "SZ"
             lower_market = market.lower()
             variants.extend(
                 [
@@ -115,27 +131,36 @@ class DataFetcherPriceProvider(PriceProvider):
         return list(dict.fromkeys(variants))
 
     def get_bars(self, code: str, analysis_date: date) -> tuple[list[DailyBar], str | None]:
-        start = (analysis_date - timedelta(days=10)).strftime("%Y-%m-%d")
-        end = datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d")
-        errors: list[str] = []
-        for candidate in self._code_variants(code):
-            try:
-                df, _source = self._manager_instance().get_daily_data(
-                    candidate,
-                    start_date=start,
-                    end_date=end,
-                    days=self.days,
-                )
-            except Exception as exc:
-                errors.append(f"{candidate}: {type(exc).__name__}: {exc}")
-                continue
+        normalized = self._canonical_code(code)
+        anchor_lookback_days = max(self.days, 30)
+        requested_start = analysis_date - timedelta(days=anchor_lookback_days)
+        cached = self._cache.get(normalized)
+        if cached is not None and cached[0] <= requested_start:
+            return list(cached[1]), cached[2]
+
+        today = datetime.now(SHANGHAI_TZ).date()
+        days = max(self.days, (today - requested_start).days + 30)
+        error: str | None = None
+        bars: list[DailyBar] = []
+        try:
+            # DataFetcherManager normalizes SH/SZ prefixes and suffixes itself.
+            # Calling it once avoids repeating the entire provider failover chain
+            # for equivalent spellings of the same A-share code.
+            self.request_count += 1
+            df, _source = self._manager_instance().get_daily_data(
+                normalized,
+                start_date=requested_start.strftime("%Y-%m-%d"),
+                end_date=today.strftime("%Y-%m-%d"),
+                days=days,
+            )
             bars = dataframe_to_bars(df)
-            if bars:
-                return bars, None
-            errors.append(f"{candidate}: empty daily data")
-        attempted = ", ".join(self._code_variants(code))
-        detail = "; ".join(errors) if errors else "no market data"
-        return [], f"attempted code formats: {attempted}; {detail}"
+            if not bars:
+                error = f"{normalized}: empty daily data"
+        except Exception as exc:
+            error = f"{normalized}: {type(exc).__name__}: {exc}"
+
+        self._cache[normalized] = (requested_start, list(bars), error)
+        return list(bars), error
 
 
 class MockPriceProvider(PriceProvider):
@@ -616,7 +641,6 @@ def price_diagnostic(
 ) -> str:
     formats = ", ".join(DataFetcherPriceProvider._code_variants(code))
     parts = [
-        "价格诊断",
         f"code={code}",
         f"advice_date={analysis_date.isoformat()}",
     ]
@@ -627,18 +651,22 @@ def price_diagnostic(
     parts.extend(
         [
             f"missing={missing}",
-            f"attempted_formats={formats}",
+            f"compatible_formats={formats}",
             f"daily_rows={len(bars)}",
             f"available_dates={bars_date_range_text(bars)}",
         ]
     )
     if error:
-        parts.append(f"provider_error={error}")
+        compact_error = re.sub(r"\s+", " ", str(error)).strip()
+        if len(compact_error) > 240:
+            compact_error = compact_error[:237].rstrip() + "..."
+        parts.append(f"provider_error={compact_error}")
     return "；".join(parts)
 
 
 def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str, Any]:
     result = dict(record)
+    result.pop("price_warning", None)
     analysis_date = parse_date(result.get("date"))
     group = classify_advice(result)
     result["action_group"] = group
@@ -648,28 +676,24 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
             result[f"{period}_hit"] = None
         return result
 
+    if all(
+        result.get(f"{period}_status") == "已验证"
+        and parse_float(result.get(f"{period}_close")) is not None
+        for period in PERIODS
+    ):
+        return result
+
     code = normalize_code(result.get("code"))
     bars, error = provider.get_bars(code, analysis_date)
     bars = sorted({bar.trade_date: bar for bar in bars if bar.close > 0}.values(), key=lambda bar: bar.trade_date)
-    if error:
+    if not bars:
         result["price_warning"] = price_diagnostic(
             code=code,
             analysis_date=analysis_date,
             period=None,
-            missing="provider_error",
+            missing="advice_close",
             bars=bars,
             error=error,
-        )
-    if not bars:
-        result.setdefault(
-            "price_warning",
-            price_diagnostic(
-                code=code,
-                analysis_date=analysis_date,
-                period=None,
-                missing="advice_close",
-                bars=bars,
-            ),
         )
         for period in PERIODS:
             if result.get(f"{period}_status") == "已验证":
@@ -752,7 +776,11 @@ def evaluate_records(
     current_codes: set[str],
 ) -> list[dict[str, Any]]:
     evaluated = []
-    for record in history:
+    ordered_history = sorted(
+        history,
+        key=lambda item: (str(item.get("date") or ""), normalize_code(item.get("code"))),
+    )
+    for record in ordered_history:
         item = evaluate_record(record, provider)
         item["is_current_holding_now"] = item.get("code") in current_codes
         evaluated.append(item)
@@ -1248,7 +1276,13 @@ def run_backtest(provider: PriceProvider | None = None) -> dict[str, Any]:
     new_records = extract_advice_from_report(report_path, holdings) if report_path else []
     history = merge_history([*load_history(), *new_records])
     current_codes = set(holdings)
-    evaluated = evaluate_records(history, provider or DataFetcherPriceProvider(), current_codes)
+    price_provider = provider or DataFetcherPriceProvider()
+    evaluated = evaluate_records(history, price_provider, current_codes)
+    if isinstance(price_provider, DataFetcherPriceProvider):
+        print(
+            "Price history requests: "
+            f"{price_provider.request_count} for {len({item.get('code') for item in history if item.get('code')})} unique codes"
+        )
     report_date = report_date_text(report_path) if report_path else datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d")
     accuracy = build_accuracy_with_metadata(
         evaluated,
@@ -1317,12 +1351,14 @@ def assert_test_results(accuracy: dict[str, Any]) -> None:
     assert june18_verified.get("d1_date") == "2026-06-19"
     assert june18_verified.get("d1_close") == 10.2
 
-    weekend_date = date(2026, 6, 21)
+    days_until_sunday = (6 - today.weekday()) % 7 or 7
+    weekend_date = today + timedelta(days=days_until_sunday)
+    prior_friday = weekend_date - timedelta(days=2)
     weekend_waiting = evaluate_record(
         {"date": weekend_date.isoformat(), "code": "600961", "action": "观望", "sentiment": "震荡"},
-        MockPriceProvider({"600961": [DailyBar(date(2026, 6, 19), 10.0)]}),
+        MockPriceProvider({"600961": [DailyBar(prior_friday, 10.0)]}),
     )
-    assert weekend_waiting.get("advice_close_date") == "2026-06-19"
+    assert weekend_waiting.get("advice_close_date") == prior_friday.isoformat()
     assert weekend_waiting.get("d1_status") == "等待验证"
 
     assert "sh.600961" in DataFetcherPriceProvider._code_variants("600961")

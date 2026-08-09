@@ -39,7 +39,7 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     # 添加超时限制，防止任务卡死
-    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
+    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '45') }}
     
     steps:
       - name: 随机延迟（避免固定时间访问）
@@ -62,6 +62,9 @@ jobs:
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
+
+      - name: 检查持仓日报链路回归
+        run: python -m unittest -q tests.test_holding_report_workflow
 
       - name: 生成持仓自选股列表
         env:

@@ -333,6 +333,14 @@ def build_stock_list() -> str:
     except Exception as exc:
         explicit_stock_list = os.environ.get("STOCK_LIST", "").strip()
         if explicit_stock_list:
+            if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+                print(
+                    "ERROR: full holdings data is required in GitHub Actions; "
+                    "refusing to continue with STOCK_LIST only because no holdings snapshot can be generated.",
+                    file=sys.stderr,
+                )
+                print(f"Reason: {type(exc).__name__}: {exc}", file=sys.stderr)
+                return ""
             print(
                 "WARNING: failed to load full holdings data; using explicit STOCK_LIST only. "
                 "No holdings_snapshot.json will be generated.",
