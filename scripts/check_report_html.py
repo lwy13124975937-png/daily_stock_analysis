@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -171,7 +172,7 @@ def strip_raw_report(html: str) -> str:
 
 def extract_account_summary_blocks(html: str) -> list[str]:
     return re.findall(
-        r"<section class=\"panel\">\s*<h3>[^<]*分析结果摘要</h3>(.*?)</section>",
+        r'<section\b[^>]*class="[^"]*panel[^"]*"[^>]*>\s*<h3>[^<]*分析结果摘要</h3>(.*?)</section>',
         html,
         flags=re.DOTALL,
     )
@@ -257,6 +258,99 @@ def _current_holding_advice_count(html: str) -> int | None:
 def _report_has_stock_holdings(html: str) -> bool:
     account_html = strip_raw_report(html)
     return 'data-type="stock"' in account_html or "A股个股" in account_html
+
+
+def _account_item_counts(html: str, tag: str, css_class: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    pattern = re.compile(
+        rf'<{tag}\b[^>]*class="[^"]*\b{re.escape(css_class)}\b[^"]*"[^>]*data-account="([^"]+)"',
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(html):
+        account = unescape(match.group(1))
+        counts[account] = counts.get(account, 0) + 1
+    return counts
+
+
+def _account_types(html: str) -> dict[str, set[str]]:
+    types: dict[str, set[str]] = {}
+    pattern = re.compile(
+        r'<(?:li|article)\b[^>]*data-account="([^"]+)"[^>]*data-type="([^"]+)"',
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(html):
+        account = unescape(match.group(1))
+        types.setdefault(account, set()).add(unescape(match.group(2)))
+    return types
+
+
+def _check_account_contract(errors: list[str], path: Path, html: str) -> dict[str, int]:
+    account_html = strip_raw_report(html)
+    summary_counts = _account_item_counts(account_html, "li", "summary-item")
+    holding_counts = _account_item_counts(account_html, "article", "holding-item")
+    account_types = _account_types(account_html)
+    accounts = sorted(set(summary_counts) | set(holding_counts))
+
+    for account in accounts:
+        summary_count = summary_counts.get(account, 0)
+        holding_count = holding_counts.get(account, 0)
+        if summary_count == 0 or holding_count == 0 or summary_count != holding_count:
+            errors.append(
+                f"{_page_label(path)} account {account!r} item count mismatch: "
+                f"summary={summary_count}, details={holding_count}"
+            )
+
+        visible_text = _strip_tags(account_html)
+        summary_index = visible_text.find(f"{account}分析结果摘要")
+        details_index = visible_text.find(f"{account}持仓明细与分析")
+        if summary_index == -1 or details_index == -1 or summary_index >= details_index:
+            errors.append(
+                f"{_page_label(path)} account {account!r} must render summary before holding details"
+            )
+        review_titles = []
+        if "lof" in account_types.get(account, set()):
+            review_titles.append(f"{account} LOF/ETF 组合复盘")
+        if "otc" in account_types.get(account, set()):
+            review_titles.append(f"{account} 场外基金组合复盘")
+        for review_title in review_titles:
+            review_index = visible_text.find(review_title)
+            if review_index == -1 or review_index <= details_index:
+                errors.append(
+                    f"{_page_label(path)} account {account!r} portfolio review must follow holding details"
+                )
+    return holding_counts
+
+
+def _check_responsive_contract(errors: list[str], path: Path, html: str) -> None:
+    if 'name="viewport"' not in html:
+        errors.append(f"{_page_label(path)} is missing the mobile viewport declaration")
+    if "overflow-x:hidden" not in html.replace(" ", ""):
+        errors.append(f"{_page_label(path)} is missing the horizontal overflow guard")
+    if not re.search(r"box-sizing\s*:\s*border-box", html, flags=re.IGNORECASE):
+        errors.append(f"{_page_label(path)} is missing the border-box sizing guard")
+    if path.name == "advice_backtest.html":
+        compact = re.sub(r"\s+", "", html)
+        mobile_grid = ".overview-grid,.card-grid,.record-grid,.metric-grid,.period-grid{grid-template-columns:1fr;}"
+        if mobile_grid not in compact:
+            errors.append("site/advice_backtest.html is missing the single-column mobile grid rule")
+
+
+def _check_advice_history_contract(errors: list[str], advice_path: Path, advice_html: str) -> None:
+    accuracy_path = SITE_DIR / "data" / "advice_accuracy.json"
+    if not accuracy_path.exists():
+        return
+    try:
+        payload = json.loads(accuracy_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        errors.append(f"{_page_label(accuracy_path)} cannot be read: {type(exc).__name__}: {exc}")
+        return
+    expected = len(payload.get("records", [])) if isinstance(payload, dict) else 0
+    match = re.search(r"历史全部建议回测</span><span class=\"summary-count\">(\d+) 条", advice_html)
+    if expected and (not match or int(match.group(1)) != expected):
+        actual = int(match.group(1)) if match else None
+        errors.append(
+            f"{_page_label(advice_path)} history count mismatch: expected={expected}, rendered={actual}"
+        )
 
 
 def _check_half_sentence_leaks(errors: list[str], path: Path, scope: str, html: str) -> None:
@@ -354,8 +448,10 @@ def main() -> int:
     latest_report = latest_stock_report_html()
     if latest_report is not None:
         latest_date, latest_page = latest_report
+        latest_html = latest_page.read_text(encoding="utf-8", errors="ignore")
         latest_href = f"reports/{latest_page.name}"
         index_path = SITE_DIR / "index.html"
+        index_html = ""
         if index_path.exists():
             index_html = index_path.read_text(encoding="utf-8", errors="ignore")
             if latest_href not in index_html:
@@ -374,7 +470,6 @@ def main() -> int:
                 errors.append(
                     f"site/advice_backtest.html is stale: expected latest report date {latest_text}"
                 )
-            latest_html = latest_page.read_text(encoding="utf-8", errors="ignore")
             current_count = _current_holding_advice_count(advice_html)
             if _report_has_stock_holdings(latest_html) and current_count == 0:
                 errors.append(
@@ -384,13 +479,29 @@ def main() -> int:
                 errors.append(
                     "site/advice_backtest.html contains insufficient price status without price diagnostics"
                 )
+            _check_advice_history_contract(errors, advice_path, advice_html)
         else:
             errors.append("site/advice_backtest.html is missing while report pages exist")
+
+        report_account_counts = _account_item_counts(strip_raw_report(latest_html), "article", "holding-item")
+        for account_page in sorted(SITE_ACCOUNTS_DIR.glob("*.html")) if SITE_ACCOUNTS_DIR.exists() else []:
+            page_html = account_page.read_text(encoding="utf-8", errors="ignore")
+            page_counts = _account_item_counts(page_html, "article", "holding-item")
+            for account, count in page_counts.items():
+                if report_account_counts.get(account) != count:
+                    errors.append(
+                        f"{_page_label(account_page)} holding count differs from latest report for "
+                        f"{account!r}: account_page={count}, report={report_account_counts.get(account)}"
+                    )
+            expected_href = f"accounts/{account_page.name}"
+            if index_html and expected_href not in index_html:
+                errors.append(f"site/index.html is missing account link {expected_href}")
 
     for page in pages:
         html = page.read_text(encoding="utf-8", errors="ignore")
         account_html = strip_raw_report(html)
 
+        _check_responsive_contract(errors, page, html)
         _check_sensitive_content(errors, page, "public page", html)
         _check_tokens(
             errors,
@@ -411,6 +522,7 @@ def main() -> int:
         if MISSING_SNAPSHOT_TEXT in account_html:
             errors.append(f"{_page_label(page)} account display area shows missing holdings snapshot")
         _check_half_sentence_leaks(errors, page, "account display area", account_html)
+        _check_account_contract(errors, page, account_html)
 
         summary_blocks = extract_account_summary_blocks(account_html)
         for idx, block in enumerate(summary_blocks, start=1):

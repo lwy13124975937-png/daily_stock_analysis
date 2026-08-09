@@ -258,6 +258,17 @@ def _account_items(groups: dict, allowed_types: set[str] | None = None) -> list[
     return items
 
 
+def _display_holding_name(value: object, code: str) -> str:
+    name = str(value or "").strip() or "-"
+    if not code:
+        return name
+    return re.sub(
+        rf"\s*[（(]\s*{re.escape(code)}\s*[）)]\s*$",
+        "",
+        name,
+    ).strip() or name
+
+
 def _ordered_account_names(accounts: dict) -> list[str]:
     if not isinstance(accounts, dict):
         return []
@@ -378,8 +389,8 @@ def _holding_name_code_pairs(holdings: list[dict] | None) -> list[tuple[str, str
     for item in holdings or []:
         if not isinstance(item, dict):
             continue
-        name = str(item.get("name", "") or "").strip()
         code = str(item.get("code", "") or "").strip()
+        name = _display_holding_name(item.get("name", ""), code)
         if name and code:
             pairs.append((name, code))
     return pairs
@@ -781,7 +792,10 @@ def _fund_theme_summary(holdings: list[dict]) -> str:
 
 def _rule_based_fund_review(account: str, asset_type: str, holdings: list[dict]) -> str:
     count = len(holdings)
-    rows = [f"- {item.get('name') or item.get('code')}（{item.get('code')}）" for item in holdings]
+    rows = []
+    for item in holdings:
+        code = str(item.get("code") or "")
+        rows.append(f"- {_display_holding_name(item.get('name'), code)}（{code}）")
     themes = _fund_theme_summary(holdings)
     if asset_type == "lof":
         return "\n".join(
@@ -919,8 +933,9 @@ def _render_lof_portfolio_review(account: str, review_text: str | None, holdings
     review_text = _fund_review_display_text(review_text)
     review_text = _review_or_rule_fallback(account, "lof", review_text, holdings)
     return f"""
-<section class="panel">
+<section class="panel portfolio-panel" data-review-type="lof">
   <h3>{escape(account)} LOF/ETF 组合复盘</h3>
+  <p class="panel-intro">基于本账户全部场内基金进行组合层面观察。</p>
   <div class="report-fragment">{_render_markdown_fragment(review_text)}</div>
 </section>
 """
@@ -929,8 +944,9 @@ def _render_lof_portfolio_review(account: str, review_text: str | None, holdings
 def _render_otc_portfolio_review(account: str, review_text: str | None, holdings: list[dict]) -> str:
     review_text = _review_or_rule_fallback(account, "otc", review_text, holdings)
     return f"""
-<section class="panel">
+<section class="panel portfolio-panel" data-review-type="otc">
   <h3>{escape(account)} 场外基金组合复盘</h3>
+  <p class="panel-intro">基于本账户全部场外基金进行组合层面观察。</p>
   <div class="report-fragment">{_render_markdown_fragment(review_text)}</div>
 </section>
 """
@@ -1259,94 +1275,218 @@ def _wrap_html(title: str, body: str) -> str:
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f6f8fb;
+      --bg: #f3f6fa;
       --card: #ffffff;
-      --text: #1f2328;
-      --muted: #656d76;
-      --line: #d8dee4;
-      --link: #0969da;
-      --soft: #f6f8fa;
+      --text: #182235;
+      --muted: #637086;
+      --line: #dbe3ed;
+      --line-strong: #c8d3e0;
+      --link: #075fca;
+      --link-hover: #044a9e;
+      --soft: #f7f9fc;
+      --primary-soft: #eaf2ff;
+      --success: #087a5b;
+      --warning: #966500;
+      --danger: #b93832;
     }}
     * {{ box-sizing: border-box; }}
+    html {{ min-width: 0; background: var(--bg); }}
     body {{
-      width: min(100%, 960px);
+      width: 100%;
+      max-width: 1120px;
+      min-width: 0;
       margin: 0 auto;
-      padding: 18px 16px 32px;
+      padding: 24px 20px 44px;
       background: var(--bg);
       color: var(--text);
-      font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font: 16px/1.68 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Helvetica, Arial, sans-serif;
       overflow-wrap: anywhere;
+      overflow-x: hidden;
     }}
     a {{ color: var(--link); text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    h1 {{ font-size: 30px; line-height: 1.25; margin: 0 0 10px; }}
-    h2 {{ font-size: 22px; line-height: 1.35; margin: 28px 0 12px; }}
-    h3 {{ font-size: 18px; line-height: 1.45; margin: 18px 0 8px; }}
+    a:hover {{ color: var(--link-hover); text-decoration: underline; }}
+    h1 {{ font-size: 30px; line-height: 1.28; margin: 0; }}
+    h2 {{ font-size: 22px; line-height: 1.35; margin: 0; }}
+    h3 {{ font-size: 18px; line-height: 1.45; margin: 0 0 14px; }}
+    h4 {{ line-height: 1.45; }}
     .muted {{ color: var(--muted); }}
     .hero {{
-      margin-bottom: 18px;
-      padding: 18px;
+      margin-bottom: 20px;
+      padding: 24px;
       background: var(--card);
       border: 1px solid var(--line);
       border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(24, 34, 53, 0.05);
+    }}
+    .hero-kicker {{
+      display: block;
+      margin-bottom: 6px;
+      color: var(--link);
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    .hero-copy {{ max-width: 760px; margin: 10px 0 0; color: var(--muted); }}
+    .meta-row {{ display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 14px; color: var(--muted); }}
+    .meta-row span {{ min-width: 0; }}
+    .dashboard-section {{ margin-top: 26px; }}
+    .section-heading {{
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+    }}
+    .section-heading p {{ margin: 0; color: var(--muted); font-size: 14px; }}
+    .report-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
     }}
     .grid {{
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
     }}
-    .card {{
+    .card, .report-card {{
       display: block;
       min-width: 0;
-      padding: 16px;
+      padding: 18px;
       background: var(--card);
       border: 1px solid var(--line);
       border-radius: 8px;
+      transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
     }}
-    .card:hover {{ text-decoration: none; border-color: #8c959f; }}
-    .card-title {{ display: block; font-size: 18px; font-weight: 700; margin-bottom: 10px; }}
-    .count-list {{ list-style: none; padding: 0; margin: 0; color: var(--muted); }}
-    .count-list li {{ margin: 4px 0; }}
+    .card:hover, .report-card:hover {{
+      text-decoration: none;
+      border-color: #8aadd8;
+      box-shadow: 0 8px 20px rgba(7, 95, 202, 0.08);
+      transform: translateY(-1px);
+    }}
+    .report-card {{ min-height: 126px; }}
+    .report-card.primary {{ border-top: 3px solid var(--link); }}
+    .report-card-kicker {{ display: block; color: var(--muted); font-size: 13px; }}
+    .report-card-title {{ display: block; margin: 8px 0 14px; color: var(--text); font-size: 18px; font-weight: 750; }}
+    .report-card-action {{ color: var(--link); font-size: 14px; font-weight: 650; }}
+    .card-title {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text); font-size: 18px; font-weight: 750; }}
+    .card-arrow {{ color: var(--link); font-size: 20px; font-weight: 500; }}
+    .account-counts {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 16px;
+    }}
+    .account-count {{ padding: 9px 8px; border-radius: 6px; background: var(--soft); text-align: center; }}
+    .account-count strong {{ display: block; color: var(--text); font-size: 20px; line-height: 1.2; }}
+    .account-count span {{ display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }}
     .link-list {{ list-style: none; padding: 0; margin: 0; }}
     .link-list li {{
       padding: 10px 0;
       border-bottom: 1px solid var(--line);
     }}
+    .link-list li:last-child {{ border-bottom: 0; }}
     .panel {{
-      margin-top: 14px;
-      padding: 16px;
+      margin-top: 16px;
+      padding: 20px;
       background: var(--card);
       border: 1px solid var(--line);
       border-radius: 8px;
     }}
     .page-nav {{
-      margin-bottom: 14px;
-      padding-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 16px;
+      padding: 0 2px 12px;
       border-bottom: 1px solid var(--line);
+      font-size: 14px;
     }}
-    details {{
-      margin: 12px 0;
+    .account-nav {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 18px;
+    }}
+    .account-nav a {{
+      padding: 7px 11px;
+      color: var(--text);
       background: var(--card);
       border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: 14px;
+    }}
+    .account-section {{
+      margin: 14px 0;
+      background: var(--card);
+      border: 1px solid var(--line-strong);
       border-radius: 8px;
       overflow: hidden;
     }}
-    summary {{
+    .account-section > summary {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      list-style: none;
       cursor: pointer;
-      padding: 13px 14px;
-      font-weight: 700;
+      padding: 15px 18px;
       background: var(--soft);
+      border-bottom: 1px solid transparent;
     }}
-    .details-body {{ padding: 12px 14px 14px; }}
-    .holding-table-wrap {{ width: 100%; overflow-x: auto; }}
-    table {{
-      display: block;
-      width: max-content;
-      min-width: 100%;
-      max-width: 100%;
-      overflow-x: auto;
-      border-collapse: collapse;
+    .account-section > summary::-webkit-details-marker {{ display: none; }}
+    .account-section[open] > summary {{ border-bottom-color: var(--line); }}
+    .account-section > summary::after {{ content: "+"; flex: 0 0 auto; color: var(--link); font-size: 22px; line-height: 1; }}
+    .account-section[open] > summary::after {{ content: "−"; }}
+    .account-summary-title {{ display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }}
+    .account-name {{ color: var(--text); font-size: 18px; font-weight: 750; }}
+    .account-badges {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .count-badge, .type-badge {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      color: var(--muted);
+      background: #eef2f7;
+      font-size: 12px;
+      font-weight: 650;
       white-space: nowrap;
+    }}
+    .account-content {{ padding: 0 20px 20px; }}
+    .account-content > .panel {{
+      margin: 0;
+      padding: 22px 0;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      background: transparent;
+    }}
+    .account-content > .panel:last-child {{ border-bottom: 0; padding-bottom: 2px; }}
+    .standalone-account {{ border: 1px solid var(--line-strong); border-radius: 8px; background: var(--card); }}
+    .standalone-account .account-content {{ padding-top: 0; }}
+    .panel-intro {{ margin: -6px 0 14px; color: var(--muted); font-size: 14px; }}
+    .summary-list {{ list-style: none; padding: 0; margin: 0; }}
+    .summary-item {{
+      display: grid;
+      grid-template-columns: minmax(230px, 0.72fr) minmax(0, 1.28fr);
+      gap: 10px 18px;
+      align-items: start;
+      padding: 11px 0;
+      border-bottom: 1px solid var(--line);
+    }}
+    .summary-item:last-child {{ border-bottom: 0; }}
+    .summary-identity {{ display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; min-width: 0; }}
+    .summary-code {{ color: var(--muted); font-variant-numeric: tabular-nums; }}
+    .summary-result {{ min-width: 0; color: #344156; }}
+    .summary-item[data-type="stock"] .type-badge {{ color: #075fca; background: #eaf2ff; }}
+    .summary-item[data-type="lof"] .type-badge {{ color: #087a5b; background: #e9f7f2; }}
+    .summary-item[data-type="otc"] .type-badge {{ color: #835b00; background: #fff5d6; }}
+    .holding-list {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
+    .holding-list.fund-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .holding-table-wrap {{ width: 100%; max-width: 100%; overflow-x: auto; }}
+    table {{
+      width: 100%;
+      min-width: 620px;
+      border-collapse: collapse;
       background: var(--card);
     }}
     th, td {{ border: 1px solid var(--line); padding: 8px 10px; text-align: left; }}
@@ -1354,30 +1494,39 @@ def _wrap_html(title: str, body: str) -> str:
     .note {{
       margin: 12px 0;
       padding: 12px;
-      background: #fff8c5;
-      border: 1px solid #eac54f;
+      background: #fff8dc;
+      border: 1px solid #e5ca69;
       border-radius: 8px;
     }}
     .holding-item {{
-      margin: 12px 0;
-      padding: 12px;
+      min-width: 0;
+      padding: 16px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--card);
     }}
-    .holding-item h4 {{
-      margin: 0 0 6px;
-      font-size: 16px;
+    .holding-item[data-type="stock"] {{ border-left: 3px solid #6ca2e6; }}
+    .holding-item[data-type="lof"] {{ border-left: 3px solid #55a98d; }}
+    .holding-item[data-type="otc"] {{ border-left: 3px solid #c6a24c; }}
+    .holding-head {{ display: flex; align-items: start; justify-content: space-between; gap: 12px; }}
+    .holding-head h4 {{
+      min-width: 0;
+      margin: 0;
+      font-size: 17px;
     }}
     .status-line {{
-      margin: 8px 0 10px;
-      padding: 8px 10px;
+      margin: 11px 0 0;
+      padding: 9px 11px;
       background: var(--soft);
       border-left: 3px solid var(--link);
       border-radius: 6px;
       overflow-wrap: anywhere;
     }}
+    .holding-item[data-type="lof"] .status-line,
+    .holding-item[data-type="otc"] .status-line {{ border-left: 0; color: var(--muted); }}
+    .holding-analysis {{ margin-top: 12px; }}
     .report-fragment {{
+      min-width: 0;
       overflow-wrap: anywhere;
     }}
     .report-fragment h4,
@@ -1391,10 +1540,8 @@ def _wrap_html(title: str, body: str) -> str:
     }}
     .stock-brief-section {{
       margin: 10px 0;
-      padding: 8px 10px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fbfdff;
+      padding: 8px 0 8px 12px;
+      border-left: 2px solid #c7d8ee;
     }}
     .stock-brief-section h5 {{
       margin: 0 0 6px;
@@ -1409,7 +1556,10 @@ def _wrap_html(title: str, body: str) -> str:
     .analysis-details summary {{
       padding: 9px 10px;
       font-size: 14px;
+      font-weight: 650;
+      background: var(--soft);
     }}
+    .details-body {{ padding: 12px 14px 14px; }}
     .ai-snippet {{
       margin: 10px 0 0;
       padding: 10px;
@@ -1427,12 +1577,36 @@ def _wrap_html(title: str, body: str) -> str:
       color: var(--muted);
       font-size: 14px;
     }}
+    .archive-details {{
+      margin-top: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--card);
+      overflow: hidden;
+    }}
+    .archive-details > summary {{ padding: 13px 16px; cursor: pointer; font-weight: 700; background: var(--soft); }}
+    .raw-report {{ max-width: 100%; overflow-x: auto; }}
+    .raw-report pre {{ max-width: 100%; overflow-x: auto; white-space: pre-wrap; }}
     @media (max-width: 720px) {{
-      body {{ padding: 16px; font-size: 15px; }}
+      body {{ padding: 12px; font-size: 15px; }}
       h1 {{ font-size: 25px; }}
       h2 {{ font-size: 20px; }}
-      .grid {{ grid-template-columns: 1fr; }}
-      .hero, .card, .panel {{ padding: 14px; }}
+      .hero {{ padding: 18px; }}
+      .section-heading {{ display: block; }}
+      .section-heading p {{ margin-top: 4px; }}
+      .grid, .report-grid {{ grid-template-columns: 1fr; }}
+      .card, .report-card, .panel {{ padding: 15px; }}
+      .report-card {{ min-height: 0; }}
+      .account-counts {{ gap: 6px; }}
+      .account-section > summary {{ align-items: start; padding: 13px 14px; }}
+      .account-name {{ font-size: 17px; }}
+      .account-content {{ padding: 0 14px 14px; }}
+      .account-content > .panel {{ padding: 18px 0; }}
+      .summary-item {{ grid-template-columns: 1fr; gap: 5px; }}
+      .holding-list.fund-grid {{ grid-template-columns: 1fr; }}
+      .holding-item {{ padding: 14px; }}
+      .holding-head {{ display: block; }}
+      .holding-head .type-badge {{ margin-top: 7px; }}
       th, td {{ padding: 7px 8px; }}
     }}
   </style>
@@ -1449,8 +1623,9 @@ def _enhance_report_html(html: str, title: str) -> str:
     body_start = f"""
             <nav class="page-nav"><a href="../index.html">返回首页</a></nav>
             <header class="hero">
+                <span class="hero-kicker">大盘复盘</span>
                 <h1>{escape(title)}</h1>
-                <p class="muted">生成时间：{escape(_now_text())}</p>
+                <div class="meta-row"><span>生成时间：{escape(_now_text())}</span></div>
             </header>
             """
     footer = f"""
@@ -1471,9 +1646,17 @@ def _enhance_report_html(html: str, title: str) -> str:
         html = html.replace(
             "</style>",
             """
-            table { display: block; overflow-x: auto; white-space: nowrap; }
-            body { width: min(100%, 960px); line-height: 1.75; }
-            @media (max-width: 720px) { body { padding: 16px; } }
+            *, *::before, *::after { box-sizing: border-box; }
+            html { width: 100%; max-width: 100%; min-width: 0; background: #f3f6fa; overflow-x: hidden; }
+            body { width: 100%; max-width: 1120px; min-width: 0; margin: 0 auto; padding: 24px 20px 44px; line-height: 1.68; overflow-wrap: anywhere; overflow-x: hidden; }
+            body > * { max-width: 100%; min-width: 0; }
+            .page-nav { margin-bottom: 16px; padding: 0 2px 12px; border-bottom: 1px solid #dbe3ed; font-size: 14px; }
+            .hero { margin-bottom: 20px; padding: 24px; background: #fff; border: 1px solid #dbe3ed; border-radius: 8px; box-shadow: 0 8px 24px rgba(24,34,53,.05); }
+            .hero-kicker { display: block; margin-bottom: 6px; color: #075fca; font-size: 13px; font-weight: 700; }
+            .meta-row { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 14px; color: #637086; }
+            table { display: block; max-width: 100%; overflow-x: auto; white-space: nowrap; }
+            img, svg, canvas { max-width: 100%; height: auto; }
+            @media (max-width: 720px) { body { width: 100%; padding: 12px; font-size: 15px; } .hero { padding: 18px; } h1 { font-size: 25px; } }
             </style>""",
             1,
         )
@@ -1487,7 +1670,7 @@ def _enhance_report_html(html: str, title: str) -> str:
 
 def _render_raw_report_details(raw_report_html: str) -> str:
     return f"""
-<details>
+<details class="archive-details">
   <summary>原始 AI 股票日报</summary>
   <div class="details-body raw-report">
     {raw_report_html}
@@ -1499,7 +1682,7 @@ def _render_raw_report_details(raw_report_html: str) -> str:
 def _render_unmatched_ai_details(unmatched: dict[str, list[str]]) -> str:
     if not unmatched:
         return """
-<details>
+<details class="archive-details">
   <summary>未匹配 AI 报告项</summary>
   <div class="details-body">
     <p class="muted">暂无未匹配内容。</p>
@@ -1511,7 +1694,7 @@ def _render_unmatched_ai_details(unmatched: dict[str, list[str]]) -> str:
         snippet_html = "".join(f'<pre class="ai-snippet">{escape(snippet)}</pre>' for snippet in snippets)
         rows.append(f"<h3>{escape(code)}</h3>{snippet_html}")
     return f"""
-<details>
+<details class="archive-details">
   <summary>未匹配 AI 报告项</summary>
   <div class="details-body">
     <p class="muted">以下内容来自 AI 原始报告，但未在当前 holdings_data.json 持仓中匹配到，仅供排查。</p>
@@ -1563,8 +1746,8 @@ def _holding_analysis_card(
     unfinished_by_code: dict[str, list[str]],
     otc_reviews_by_account: dict[str, str],
 ) -> str:
-    name = str(item.get("name", "") or "-")
     code = str(item.get("code", "") or "-")
+    name = _display_holding_name(item.get("name", ""), code)
     account = str(item.get("account", "") or "")
     asset_type = str(item.get("type", "") or "")
     label = TYPE_LABELS.get(asset_type, asset_type or "-")
@@ -1592,12 +1775,15 @@ def _holding_analysis_card(
         unfinished_by_code,
         otc_reviews_by_account,
     )
+    analysis_html = f'<div class="holding-analysis">{analysis}</div>' if analysis else ""
     return f"""
 <article class="holding-item" data-account="{escape(account, quote=True)}" data-code="{escape(code, quote=True)}" data-type="{escape(asset_type, quote=True)}">
-  <h4>{escape(name)}（{escape(code)}）</h4>
-  <p class="muted">类型：{escape(label)}</p>
+  <div class="holding-head">
+    <h4>{escape(name)}（{escape(code)}）</h4>
+    <span class="type-badge">{escape(label)}</span>
+  </div>
   <p class="status-line">{escape(status)}</p>
-  <div>{analysis}</div>
+  {analysis_html}
 </article>
 """
 
@@ -1611,7 +1797,7 @@ def _render_holding_cards(
 ) -> str:
     if not items:
         return '<p class="muted">暂无持仓。</p>'
-    return "".join(
+    cards = "".join(
         _holding_analysis_card(
             item,
             snippets_by_code,
@@ -1621,6 +1807,9 @@ def _render_holding_cards(
         )
         for item in items
     )
+    fund_only = all(str(item.get("type", "")) in {"lof", "otc"} for item in items)
+    grid_class = "holding-list fund-grid" if fund_only else "holding-list"
+    return f'<div class="{grid_class}">{cards}</div>'
 
 
 def _render_account_summary(
@@ -1633,7 +1822,7 @@ def _render_account_summary(
     rows = []
     for item in items:
         code = str(item.get("code", "") or "").strip()
-        name = str(item.get("name", "") or "-")
+        name = _display_holding_name(item.get("name", ""), code)
         asset_type = str(item.get("type", "") or "")
         label = TYPE_LABELS.get(asset_type, asset_type or "-")
         summaries = summary_by_code.get(code, [])
@@ -1659,16 +1848,60 @@ def _render_account_summary(
         rows.append(
             f'<li class="summary-item" data-account="{escape(account, quote=True)}" '
             f'data-code="{escape(code, quote=True)}" data-type="{escape(asset_type, quote=True)}">'
-            f"<strong>{escape(name)}（{escape(code)}）</strong>"
-            f" <span class=\"muted\">{escape(label)}</span>：{escape(detail)}"
+            '<div class="summary-identity">'
+            f"<strong>{escape(name)}</strong>"
+            f'<span class="summary-code">{escape(code)}</span>'
+            f'<span class="type-badge">{escape(label)}</span>'
+            "</div>"
+            f'<div class="summary-result">{escape(detail)}</div>'
             "</li>"
         )
-    body = f'<ul class="link-list">{"".join(rows)}</ul>' if rows else '<p class="muted">暂无持仓。</p>'
+    body = f'<ul class="summary-list">{"".join(rows)}</ul>' if rows else '<p class="muted">暂无持仓。</p>'
     return f"""
-<section class="panel">
+<section class="panel account-analysis-summary">
   <h3>{escape(account)}分析结果摘要</h3>
+  <p class="panel-intro">每项持仓都在这里有明确状态，详细内容紧随其后。</p>
   {body}
 </section>
+"""
+
+
+def _account_count_badges(items: list[dict]) -> str:
+    counts = {"stock": 0, "lof": 0, "otc": 0}
+    for item in items:
+        asset_type = str(item.get("type", ""))
+        if asset_type in counts:
+            counts[asset_type] += 1
+    labels = (("stock", "A股"), ("lof", "LOF/ETF"), ("otc", "场外基金"))
+    return "".join(
+        f'<span class="count-badge">{label} {counts[key]}</span>'
+        for key, label in labels
+        if counts[key]
+    )
+
+
+def _render_account_content(
+    account: str,
+    items: list[dict],
+    summary_by_code: dict[str, list[str]],
+    snippets_by_code: dict[str, list[str]],
+    unfinished_by_code: dict[str, list[str]],
+    lof_reviews_by_account: dict[str, str],
+    otc_reviews_by_account: dict[str, str],
+) -> str:
+    lof_items = [item for item in items if str(item.get("type", "")) == "lof"]
+    otc_items = [item for item in items if str(item.get("type", "")) == "otc"]
+    lof_review = _render_lof_portfolio_review(account, lof_reviews_by_account.get(account), lof_items) if lof_items else ""
+    otc_review = _render_otc_portfolio_review(account, otc_reviews_by_account.get(account), otc_items) if otc_items else ""
+    return f"""
+    {_render_account_summary(account, items, summary_by_code, unfinished_by_code, otc_reviews_by_account)}
+    <section class="panel holdings-panel">
+      <h3>{escape(account)}持仓明细与分析</h3>
+      <p class="panel-intro">名称、代码、账户和类型来自最新公开持仓快照；AI 只补充分析文本。</p>
+      {_render_holding_cards(items, snippets_by_code, summary_by_code, unfinished_by_code, otc_reviews_by_account)}
+    </section>
+    {lof_review}
+    {otc_review}
 """
 
 
@@ -1681,24 +1914,34 @@ def _render_standard_account_section(
     lof_reviews_by_account: dict[str, str],
     otc_reviews_by_account: dict[str, str],
     is_open: bool,
+    standalone: bool = False,
 ) -> str:
     items = _account_items(groups)
-    lof_items = [item for item in items if str(item.get("type", "")) == "lof"]
-    otc_items = [item for item in items if str(item.get("type", "")) == "otc"]
-    lof_review = _render_lof_portfolio_review(account, lof_reviews_by_account.get(account), lof_items) if lof_items else ""
-    otc_review = _render_otc_portfolio_review(account, otc_reviews_by_account.get(account), otc_items) if otc_items else ""
+    content = _render_account_content(
+        account,
+        items,
+        summary_by_code,
+        snippets_by_code,
+        unfinished_by_code,
+        lof_reviews_by_account,
+        otc_reviews_by_account,
+    )
+    anchor = _account_slug(account)
+    if standalone:
+        return f"""
+<section class="account-section standalone-account" id="account-{escape(anchor, quote=True)}" data-account="{escape(account, quote=True)}">
+  <div class="account-content">{content}</div>
+</section>
+"""
     return f"""
-<details {"open" if is_open else ""}>
-  <summary>{escape(account)}</summary>
-  <div class="details-body">
-    {_render_account_summary(account, items, summary_by_code, unfinished_by_code, otc_reviews_by_account)}
-    {lof_review}
-    {otc_review}
-    <section class="panel">
-      <h3>{escape(account)}持仓明细与分析</h3>
-      {_render_holding_cards(items, snippets_by_code, summary_by_code, unfinished_by_code, otc_reviews_by_account)}
-    </section>
-  </div>
+<details class="account-section" id="account-{escape(anchor, quote=True)}" data-account="{escape(account, quote=True)}" {"open" if is_open else ""}>
+  <summary>
+    <span class="account-summary-title">
+      <span class="account-name">{escape(account)}</span>
+      <span class="account-badges">{_account_count_badges(items)}</span>
+    </span>
+  </summary>
+  <div class="account-content">{content}</div>
 </details>
 """
 
@@ -1776,13 +2019,28 @@ def _build_holding_report_page(
             )
         )
 
+    holding_count = sum(
+        len(_account_items(groups))
+        for groups in accounts.values()
+        if isinstance(groups, dict)
+    )
+    account_links = "".join(
+        f'<a href="#account-{escape(_account_slug(account), quote=True)}">{escape(account)}</a>'
+        for account in account_names
+    )
+
     body = f"""
 <nav class="page-nav"><a href="../index.html">返回首页</a></nav>
 <header class="hero">
+  <span class="hero-kicker">最新持仓日报</span>
   <h1>{escape(title)}</h1>
-  <p class="muted">生成时间：{escape(_now_text())}</p>
-  <p class="muted">本页根据 stock-dashboard 最新 holdings_data.json 生成。持仓名称、代码、账户和类型以 holdings_data.json 为准。AI 分析仅作复盘参考，不构成投资建议。</p>
+  <div class="meta-row">
+    <span>生成时间：{escape(_now_text())}</span>
+    <span>{len(account_names)} 个账户 · {holding_count} 项持仓</span>
+  </div>
+  <p class="hero-copy">持仓身份以 stock-dashboard 最新公开快照为准。账户摘要先交代全部持仓状态，随后给出逐项明细与账户级基金组合复盘。</p>
 </header>
+<nav class="account-nav" aria-label="账户快速导航">{account_links}</nav>
 {''.join(sections)}
 {_render_raw_report_details(raw_report_html)}
 {_render_unmatched_ai_details(context.unmatched)}
@@ -1847,17 +2105,18 @@ def _build_account_page(
     latest_stock_report: ReportPage | None,
     context: HoldingReportContext,
 ) -> str:
-    report_link = '<p class="muted">本次构建未发现 report_*.md，最新持仓日报暂不可用。</p>'
+    report_link = '<span class="muted">本次构建未发现 report_*.md，最新持仓日报暂不可用。</span>'
     if latest_stock_report:
         href = f"../{_relative_href(latest_stock_report.output)}"
-        report_link = f'<p><a href="{escape(href)}">查看最新持仓日报</a></p>'
+        report_link = f'<a href="{escape(href)}">查看最新持仓日报 →</a>'
 
     body = f"""
 <nav class="page-nav"><a href="../index.html">返回首页</a></nav>
 <header class="hero">
+  <span class="hero-kicker">账户持仓复盘</span>
   <h1>{escape(account)}持仓复盘</h1>
-  <p class="muted">本页与总持仓日报使用同一套账户渲染逻辑，仅展示公开持仓字段。</p>
-  {report_link}
+  <p class="hero-copy">本页与总持仓日报共用同一套账户内容组件，仅展示公开持仓字段。</p>
+  <div class="meta-row">{report_link}</div>
 </header>
 {_render_standard_account_section(
     account,
@@ -1867,6 +2126,7 @@ def _build_account_page(
     context.unfinished_by_code,
     context.lof_reviews_by_account,
     context.otc_reviews_by_account,
+    True,
     True,
 )}
 <footer class="disclaimer">{escape(DISCLAIMER)}</footer>
@@ -1922,18 +2182,33 @@ def _reports_index_block(pages: list[ReportPage]) -> str:
     items = []
     if latest_stock:
         items.append(
-            f'<li>最新持仓日报：<a href="{escape(_relative_href(latest_stock.output))}">{escape(latest_stock.title)}</a></li>'
+            f'<a class="report-card primary" href="{escape(_relative_href(latest_stock.output))}">'
+            '<span class="report-card-kicker">最新持仓日报</span>'
+            f'<strong class="report-card-title">{escape(latest_stock.title)}</strong>'
+            '<span class="report-card-action">查看持仓日报 →</span></a>'
         )
     else:
-        items.append('<li>最新持仓日报：<span class="muted">暂无</span></li>')
+        items.append('<div class="report-card"><span class="report-card-kicker">最新持仓日报</span><strong class="report-card-title">暂无</strong></div>')
     if latest_market:
         items.append(
-            f'<li>大盘复盘：<a href="{escape(_relative_href(latest_market.output))}">{escape(latest_market.title)}</a></li>'
+            f'<a class="report-card" href="{escape(_relative_href(latest_market.output))}">'
+            '<span class="report-card-kicker">大盘复盘</span>'
+            f'<strong class="report-card-title">{escape(latest_market.title)}</strong>'
+            '<span class="report-card-action">查看大盘复盘 →</span></a>'
         )
     else:
-        items.append('<li>大盘复盘：<span class="muted">暂无</span></li>')
-    items.append('<li>AI 建议准确性回测：<a href="advice_backtest.html">AI 建议准确性回测</a></li>')
-    return f'<section class="panel"><h2>最新报告入口</h2><ul class="link-list">{"".join(items)}</ul></section>'
+        items.append('<div class="report-card"><span class="report-card-kicker">大盘复盘</span><strong class="report-card-title">暂无</strong></div>')
+    items.append(
+        '<a class="report-card" href="advice_backtest.html">'
+        '<span class="report-card-kicker">模型表现</span>'
+        '<strong class="report-card-title">AI 建议准确性回测</strong>'
+        '<span class="report-card-action">查看历史命中率 →</span></a>'
+    )
+    return (
+        '<section class="dashboard-section">'
+        '<div class="section-heading"><div><h2>报告中心</h2><p>日报、大盘与模型回测集中查看</p></div></div>'
+        f'<div class="report-grid">{"".join(items)}</div></section>'
+    )
 
 
 def _account_cards(account_pages: list[AccountPage]) -> str:
@@ -1947,16 +2222,20 @@ def _account_cards(account_pages: list[AccountPage]) -> str:
         cards.append(
             f"""
 <a class="card" href="{escape(href)}">
-  <span class="card-title">{escape(page.account)}</span>
-  <ul class="count-list">
-    <li>股票数量：{counts.get('stock', 0)}</li>
-    <li>LOF/ETF数量：{counts.get('lof', 0)}</li>
-    <li>场外基金数量：{counts.get('otc', 0)}</li>
-  </ul>
+  <span class="card-title"><span>{escape(page.account)}</span><span class="card-arrow">→</span></span>
+  <span class="account-counts">
+    <span class="account-count"><strong>{counts.get('stock', 0)}</strong><span>A股</span></span>
+    <span class="account-count"><strong>{counts.get('lof', 0)}</strong><span>LOF/ETF</span></span>
+    <span class="account-count"><strong>{counts.get('otc', 0)}</strong><span>场外基金</span></span>
+  </span>
 </a>
 """
         )
-    return f'<section><h2>账户入口</h2><div class="grid">{"".join(cards)}</div></section>'
+    return (
+        '<section class="dashboard-section">'
+        '<div class="section-heading"><div><h2>账户入口</h2><p>按账户查看摘要、明细和基金组合复盘</p></div></div>'
+        f'<div class="grid">{"".join(cards)}</div></section>'
+    )
 
 
 def _build_index(snapshot: dict, pages: list[ReportPage], account_pages: list[AccountPage]) -> str:
@@ -1967,10 +2246,14 @@ def _build_index(snapshot: dict, pages: list[ReportPage], account_pages: list[Ac
         source_line = f'<a href="{escape(source_url)}">{SOURCE_TEXT}</a>'
 
     body = f"""
-<header class="hero">
+<header class="hero home-hero">
+  <span class="hero-kicker">每日自动更新</span>
   <h1>每日持仓复盘</h1>
-  <p class="muted">生成时间：{escape(generated_at)}</p>
-  <p class="muted">数据来源：{source_line}</p>
+  <p class="hero-copy">从账户视角查看 A 股逐项分析、LOF/ETF 组合观察、场外基金组合复盘与历史建议命中率。</p>
+  <div class="meta-row">
+    <span>生成时间：{escape(generated_at)}</span>
+    <span>数据来源：{source_line}</span>
+  </div>
 </header>
 {_reports_index_block(pages)}
 {_account_cards(account_pages)}

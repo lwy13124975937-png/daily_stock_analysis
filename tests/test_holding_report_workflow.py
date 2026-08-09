@@ -38,6 +38,11 @@ class _CountingManager:
 
 
 class HoldingReportWorkflowTests(unittest.TestCase):
+    def test_holding_display_name_does_not_repeat_the_code(self) -> None:
+        self.assertEqual(pages._display_holding_name("测试股票(111111)", "111111"), "测试股票")
+        self.assertEqual(pages._display_holding_name("测试股票（111111）", "111111"), "测试股票")
+        self.assertEqual(pages._display_holding_name("测试股票", "111111"), "测试股票")
+
     def test_snapshot_keeps_all_public_holdings_but_stock_list_is_stock_only(self) -> None:
         raw = {
             "holdings": [
@@ -409,8 +414,92 @@ class HoldingReportWorkflowTests(unittest.TestCase):
                 self.assertNotIn("场内基金/ETF/LOF（", report_html)
                 self.assertNotIn("场外基金（", report_html)
                 self.assertIn("原始 AI 股票日报", report_html)
+                self.assertLess(
+                    report_html.index("账户乙分析结果摘要"),
+                    report_html.index("账户乙持仓明细与分析"),
+                )
+                self.assertLess(
+                    report_html.index("账户乙持仓明细与分析"),
+                    report_html.index("账户乙 LOF/ETF 组合复盘"),
+                )
+                self.assertLess(
+                    report_html.index("账户丙持仓明细与分析"),
+                    report_html.index("账户丙 场外基金组合复盘"),
+                )
+                self.assertIn('class="account-section"', report_html)
+                self.assertIn("overflow-x: hidden", report_html)
+                self.assertIn("box-sizing: border-box", report_html)
                 self.assertEqual(len(list(site_accounts_dir.glob("*.html"))), 3)
                 self.assertEqual(html_check.main(), 0)
+
+    def test_advice_page_preserves_history_but_defaults_to_latest_current_cards(self) -> None:
+        records = []
+        for day, code, name in (
+            ("2099-01-08", "111111", "测试股票甲"),
+            ("2099-01-09", "111111", "测试股票甲"),
+            ("2099-01-10", "222222", "测试股票乙"),
+        ):
+            records.append(
+                {
+                    "date": day,
+                    "code": code,
+                    "name": name,
+                    "account": "账户甲",
+                    "action": "观望",
+                    "score": 50,
+                    "sentiment": "震荡",
+                    "action_group": "持有/观望类",
+                    "is_current_holding_now": True,
+                    "d1_status": "等待验证",
+                    "d5_status": "等待验证",
+                    "d20_status": "等待验证",
+                }
+            )
+        accuracy = advice.build_accuracy_with_metadata(
+            records,
+            latest_report_date="2099-01-10",
+            latest_report_name="report_20990110.md",
+            new_advice_count=1,
+        )
+
+        html = advice.render_html(accuracy)
+
+        self.assertIn("历史全部建议回测</span><span class=\"summary-count\">3 条", html)
+        self.assertIn("查看当前持仓全部历史建议", html)
+        self.assertEqual(len(advice._latest_record_per_code(records)), 2)
+        self.assertIn(".overview-grid,.card-grid,.record-grid,.metric-grid,.period-grid { grid-template-columns:1fr; }", html)
+        self.assertIn("overflow-x:hidden", html)
+
+    def test_advice_markdown_preserves_all_history_records(self) -> None:
+        records = [
+            {
+                "date": f"2099-01-{(index % 28) + 1:02d}",
+                "code": f"{index:06d}",
+                "name": f"测试股票{index}",
+                "action": "观望",
+                "sentiment": "震荡",
+                "is_current_holding_now": True,
+                "d1_status": "等待验证",
+                "d5_status": "等待验证",
+                "d20_status": "等待验证",
+            }
+            for index in range(35)
+        ]
+        accuracy = advice.build_accuracy_with_metadata(
+            records,
+            latest_report_date="2099-01-28",
+            latest_report_name="report_20990128.md",
+            new_advice_count=0,
+        )
+
+        markdown = advice.render_markdown(accuracy, "2099-01-28")
+        history_section = markdown.split("## 历史全部建议回测", 1)[1].split("## 最近错误案例", 1)[0]
+        current_section = markdown.split("## 当前持仓建议回看", 1)[1].split("## 最近建议回看", 1)[0]
+
+        self.assertEqual(history_section.count("\n- "), 35)
+        self.assertEqual(current_section.count("\n- "), 35)
+        self.assertIn("测试股票0(000000)", history_section)
+        self.assertIn("测试股票34(000034)", history_section)
 
     def test_workflow_has_runtime_headroom(self) -> None:
         workflow = (holdings.ROOT_DIR / ".github" / "workflows" / "00-daily-analysis.yml").read_text(

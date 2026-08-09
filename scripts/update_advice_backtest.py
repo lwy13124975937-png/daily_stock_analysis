@@ -911,16 +911,22 @@ def render_record_card(record: dict[str, Any]) -> str:
     score_text = "unknown" if score is None else str(score)
     price_warning = ""
     if record.get("price_warning"):
-        price_warning = f'<p class="muted">价格诊断：{escape(str(record.get("price_warning")))}</p>'
+        price_warning = (
+            '<details class="diagnostic-details"><summary>价格诊断</summary>'
+            f'<p>{escape(str(record.get("price_warning")))}</p></details>'
+        )
     return f"""
 <article class="record-card">
-  <h4>{escape(str(record.get('name') or ''))}（{escape(str(record.get('code') or ''))}）</h4>
-  <p class="muted">{escape(str(record.get('date') or ''))} · {escape(str(record.get('account') or ''))} · {current}</p>
-  <p>建议：{escape(str(record.get('action') or 'unknown'))}｜评分 {escape(score_text)}｜{escape(str(record.get('sentiment') or 'unknown'))}</p>
+  <div class="record-head">
+    <div><h4>{escape(str(record.get('name') or ''))}</h4><span class="record-code">{escape(str(record.get('code') or ''))}</span></div>
+    <span class="holding-state">{current}</span>
+  </div>
+  <p class="record-meta">{escape(str(record.get('date') or ''))} · {escape(str(record.get('account') or ''))}</p>
+  <p class="advice-line"><strong>{escape(str(record.get('action') or 'unknown'))}</strong><span>评分 {escape(score_text)}</span><span>{escape(str(record.get('sentiment') or 'unknown'))}</span></p>
   <div class="period-grid">
-    <span>T+1：{escape(status_text(record, 'd1'))} {escape(format_return(record.get('d1_return')))}</span>
-    <span>T+5：{escape(status_text(record, 'd5'))} {escape(format_return(record.get('d5_return')))}</span>
-    <span>T+20：{escape(status_text(record, 'd20'))} {escape(format_return(record.get('d20_return')))}</span>
+    <span><small>T+1</small><strong>{escape(status_text(record, 'd1'))}</strong><em>{escape(format_return(record.get('d1_return')))}</em></span>
+    <span><small>T+5</small><strong>{escape(status_text(record, 'd5'))}</strong><em>{escape(format_return(record.get('d5_return')))}</em></span>
+    <span><small>T+20</small><strong>{escape(status_text(record, 'd20'))}</strong><em>{escape(format_return(record.get('d20_return')))}</em></span>
   </div>
   {price_warning}
 </article>
@@ -963,16 +969,36 @@ def render_action_stats(by_action: dict[str, Any]) -> str:
     return "".join(cards)
 
 
-def render_html(accuracy: dict[str, Any]) -> str:
-    records = accuracy.get("records", [])
-    current_records = [record for record in records if record.get("is_current_holding_now")]
-    recent_records = accuracy.get("recent_records", [])
-    miss_cases = accuracy.get("miss_cases", [])
+def _latest_record_per_code(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for record in records:
+        code = str(record.get("code") or "")
+        previous = latest.get(code)
+        if previous is None or str(record.get("date") or "") >= str(previous.get("date") or ""):
+            latest[code] = record
+    return sorted(latest.values(), key=lambda item: (str(item.get("date") or ""), str(item.get("code") or "")), reverse=True)
 
-    current_html = "".join(render_record_card(record) for record in current_records[:30]) or '<p class="muted">暂无当前持仓建议样本。</p>'
-    all_html = "".join(render_record_card(record) for record in records[-80:][::-1]) or '<p class="muted">暂无历史建议样本。</p>'
+
+def render_html(accuracy: dict[str, Any]) -> str:
+    records = list(accuracy.get("records", []))
+    current_records = [record for record in records if record.get("is_current_holding_now")]
+    latest_current_records = _latest_record_per_code(current_records)
+    recent_records = list(accuracy.get("recent_records", []))
+    miss_cases = list(accuracy.get("miss_cases", []))
+
+    current_latest_html = "".join(render_record_card(record) for record in latest_current_records) or '<p class="muted">暂无当前持仓建议样本。</p>'
+    current_history_html = "".join(render_record_card(record) for record in current_records[::-1])
+    all_html = "".join(render_record_card(record) for record in records[::-1]) or '<p class="muted">暂无历史建议样本。</p>'
     recent_html = "".join(render_record_card(record) for record in recent_records) or '<p class="muted">暂无最近建议。</p>'
     miss_html = "".join(render_record_card(record) for record in miss_cases) or '<p class="muted">暂无已验证未命中样本。</p>'
+    current_history_details = ""
+    if current_history_html:
+        current_history_details = f"""
+<details class="collection-details">
+  <summary><span>查看当前持仓全部历史建议</span><span class="summary-count">{len(current_records)} 条</span></summary>
+  <div class="collection-body"><div class="record-grid">{current_history_html}</div></div>
+</details>
+"""
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -981,76 +1007,126 @@ def render_html(accuracy: dict[str, Any]) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI 建议准确性回测</title>
   <style>
-    :root {{ color-scheme: light; --border:#d8dee8; --muted:#5f6b7a; --bg:#f6f8fb; --card:#fff; --text:#111827; --accent:#0b65d8; }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; line-height:1.7; color:var(--text); background:var(--bg); }}
-    main {{ max-width:960px; margin:0 auto; padding:24px 16px 48px; }}
-    a {{ color:var(--accent); }}
-    .hero,.panel,.metric-card,.record-card,.small-card {{ background:var(--card); border:1px solid var(--border); border-radius:10px; padding:18px; margin:0 0 18px; }}
-    h1 {{ font-size:28px; margin:0 0 8px; }}
-    h2 {{ font-size:21px; margin:0 0 12px; }}
-    h3,h4 {{ margin:0 0 8px; }}
-    .muted {{ color:var(--muted); }}
-    .metric-grid,.period-grid,.card-grid {{ display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }}
-    .metric-grid div,.period-grid span {{ background:#f8fafc; border:1px solid #e5eaf2; border-radius:8px; padding:10px; overflow-wrap:anywhere; }}
-    .metric-grid span,.metric-grid em {{ display:block; color:var(--muted); font-style:normal; }}
-    .metric-grid strong {{ display:block; font-size:24px; }}
-    .record-card h4 {{ font-size:17px; }}
-    .record-card p {{ margin:6px 0; overflow-wrap:anywhere; }}
+    :root {{ color-scheme:light; --border:#dbe3ed; --border-strong:#c8d3e0; --muted:#637086; --bg:#f3f6fa; --card:#fff; --text:#182235; --accent:#075fca; --soft:#f7f9fc; }}
+    * {{ box-sizing:border-box; }}
+    html {{ min-width:0; background:var(--bg); }}
+    body {{ min-width:0; margin:0; color:var(--text); background:var(--bg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; line-height:1.68; overflow-wrap:anywhere; overflow-x:hidden; }}
+    main {{ width:100%; max-width:1120px; min-width:0; margin:0 auto; padding:24px 20px 48px; }}
+    a {{ color:var(--accent); text-decoration:none; }}
+    a:hover {{ text-decoration:underline; }}
+    .page-nav {{ margin-bottom:16px; padding:0 2px 12px; border-bottom:1px solid var(--border); font-size:14px; }}
+    .hero {{ padding:24px; margin:0 0 20px; background:var(--card); border:1px solid var(--border); border-radius:8px; box-shadow:0 8px 24px rgba(24,34,53,.05); }}
+    .hero-kicker {{ display:block; margin-bottom:6px; color:var(--accent); font-size:13px; font-weight:700; }}
+    .hero h1 {{ margin:0; font-size:30px; line-height:1.28; }}
+    .hero-copy {{ max-width:760px; margin:10px 0 0; color:var(--muted); }}
+    .meta-row {{ display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:14px; color:var(--muted); }}
+    .overview-grid,.card-grid,.record-grid {{ display:grid; gap:12px; min-width:0; }}
+    .overview-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+    .card-grid {{ grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr)); }}
+    .record-grid {{ grid-template-columns:repeat(auto-fit,minmax(min(100%,330px),1fr)); }}
+    .panel,.metric-card,.record-card,.small-card {{ min-width:0; background:var(--card); border:1px solid var(--border); border-radius:8px; }}
+    .panel {{ padding:20px; margin:0 0 16px; }}
+    .metric-card,.small-card {{ padding:18px; margin:0; }}
+    .record-card {{ padding:16px; margin:0; }}
+    h2 {{ margin:0 0 4px; font-size:21px; }}
+    h3,h4 {{ margin:0; }}
+    .section-intro {{ margin:0 0 14px; color:var(--muted); font-size:14px; }}
+    .muted,.record-meta {{ color:var(--muted); }}
+    .metric-card > p {{ margin:8px 0 12px; }}
+    .metric-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }}
+    .metric-grid div {{ min-width:0; padding:11px; background:var(--soft); border:1px solid #e7ecf3; border-radius:6px; }}
+    .metric-grid span,.metric-grid em {{ display:block; color:var(--muted); font-size:13px; font-style:normal; }}
+    .metric-grid strong {{ display:block; margin:3px 0; font-size:23px; font-variant-numeric:tabular-nums; }}
     .small-card p {{ margin:4px 0; }}
-    footer {{ color:var(--muted); border-top:1px solid var(--border); margin-top:24px; padding-top:16px; }}
-    @media (max-width: 640px) {{ main {{ padding:16px; }} h1 {{ font-size:24px; }} .hero,.panel,.metric-card,.record-card,.small-card {{ padding:14px; }} }}
+    .record-head {{ display:flex; align-items:start; justify-content:space-between; gap:10px; }}
+    .record-head h4 {{ display:inline; font-size:17px; }}
+    .record-code {{ margin-left:7px; color:var(--muted); font-size:13px; font-variant-numeric:tabular-nums; }}
+    .holding-state {{ flex:0 0 auto; padding:3px 8px; color:#075fca; background:#eaf2ff; border-radius:999px; font-size:12px; font-weight:650; }}
+    .record-meta {{ margin:7px 0; font-size:13px; }}
+    .advice-line {{ display:flex; flex-wrap:wrap; gap:6px 10px; margin:9px 0; }}
+    .advice-line strong {{ color:var(--accent); }}
+    .period-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; }}
+    .period-grid > span {{ min-width:0; padding:8px; background:var(--soft); border:1px solid #e7ecf3; border-radius:6px; }}
+    .period-grid small,.period-grid strong,.period-grid em {{ display:block; min-width:0; }}
+    .period-grid small,.period-grid em {{ color:var(--muted); font-size:12px; font-style:normal; }}
+    .period-grid strong {{ margin:2px 0; font-size:13px; }}
+    .diagnostic-details {{ margin-top:10px; border-top:1px solid var(--border); }}
+    .diagnostic-details summary {{ padding-top:9px; color:var(--muted); cursor:pointer; font-size:13px; }}
+    .diagnostic-details p {{ margin:7px 0 0; color:var(--muted); font-size:13px; }}
+    .collection-details {{ margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--card); overflow:hidden; }}
+    .collection-details > summary {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; cursor:pointer; background:var(--soft); font-weight:700; }}
+    .summary-count {{ color:var(--muted); font-size:13px; font-weight:600; }}
+    .collection-body {{ padding:14px; }}
+    footer {{ margin-top:24px; padding-top:16px; color:var(--muted); border-top:1px solid var(--border); font-size:14px; }}
+    @media (max-width:640px) {{
+      main {{ padding:12px 12px 36px; }}
+      .hero {{ padding:18px; }}
+      .hero h1 {{ font-size:25px; }}
+      .overview-grid,.card-grid,.record-grid,.metric-grid,.period-grid {{ grid-template-columns:1fr; }}
+      .panel,.metric-card,.small-card,.record-card {{ padding:14px; }}
+      .collection-body {{ padding:10px; }}
+      .record-head {{ display:block; }}
+      .holding-state {{ display:inline-flex; margin-top:7px; }}
+    }}
   </style>
 </head>
 <body>
 <main>
-  <nav><a href="index.html">返回首页</a></nav>
+  <nav class="page-nav"><a href="index.html">返回首页</a></nav>
   <header class="hero">
+    <span class="hero-kicker">历史建议规则回测</span>
     <h1>AI 建议准确性回测</h1>
-    <p class="muted">更新时间：{escape(str(accuracy.get('updated_at') or now_iso()))}</p>
-    <p class="muted">最新读取日报：{escape(str(accuracy.get('latest_report_date') or '暂无'))}</p>
-    <p class="muted">{escape(str(accuracy.get('new_advice_message') or '本次无新增可回测建议。'))}</p>
-    <p class="muted">不调用 Gemini 或任何 LLM，只用历史建议、当前持仓快照和后续真实行情做规则回测。</p>
+    <p class="hero-copy">只使用已生成建议、当前持仓快照与后续真实行情，不调用 Gemini 或任何 LLM。</p>
+    <div class="meta-row">
+      <span>更新时间：{escape(str(accuracy.get('updated_at') or now_iso()))}</span>
+      <span>最新读取日报：{escape(str(accuracy.get('latest_report_date') or '暂无'))}</span>
+      <span>{escape(str(accuracy.get('new_advice_message') or '本次无新增可回测建议。'))}</span>
+    </div>
   </header>
 
-  <section class="card-grid">
+  <section class="overview-grid">
     {render_summary_card("全部历史建议", accuracy.get("summary_all_history", {}))}
     {render_summary_card("当前持仓建议", accuracy.get("summary_current_holdings", {}))}
   </section>
 
   <section class="panel">
     <h2>分周期统计</h2>
+    <p class="section-intro">分别观察日、周、月三个验证窗口。</p>
     <div class="card-grid">{render_period_stats(accuracy.get("summary_all_history", {}))}</div>
   </section>
 
   <section class="panel">
     <h2>按建议类型统计</h2>
+    <p class="section-intro">买入类、卖出类与持有观望类使用各自可解释的命中规则。</p>
     <div class="card-grid">{render_action_stats(accuracy.get("by_action_all_history", {}))}</div>
   </section>
 
   <section class="panel">
     <h2>当前持仓建议回看</h2>
-    {current_html}
+    <p class="section-intro">默认展示每只当前持仓最近一条建议；完整历史仍保留在折叠区。</p>
+    <div class="record-grid">{current_latest_html}</div>
+    {current_history_details}
   </section>
 
-  <section class="panel">
-    <h2>历史全部建议回测</h2>
-    {all_html}
-  </section>
+  <details class="collection-details">
+    <summary><span>历史全部建议回测</span><span class="summary-count">{len(records)} 条</span></summary>
+    <div class="collection-body"><div class="record-grid">{all_html}</div></div>
+  </details>
 
   <section class="panel">
     <h2>最近建议回看</h2>
-    {recent_html}
+    <p class="section-intro">最近 20 条建议及其验证进度。</p>
+    <div class="record-grid">{recent_html}</div>
   </section>
 
-  <section class="panel">
-    <h2>最近错误案例</h2>
-    {miss_html}
-  </section>
+  <details class="collection-details">
+    <summary><span>最近错误案例</span><span class="summary-count">{len(miss_cases)} 条</span></summary>
+    <div class="collection-body"><div class="record-grid">{miss_html}</div></div>
+  </details>
 
   <section class="panel">
-    <h2>数据不足说明</h2>
-    <p>如果后续第 N 个有效交易日尚未出现，显示“等待验证”；如果行情数据源没有返回建议日或后续收盘价，显示“数据不足”。样本不足时不显示 0% 命中率。</p>
+    <h2>数据状态说明</h2>
+    <p>后续第 N 个有效交易日尚未出现时显示“等待验证”；行情源无法返回建议日或目标交易日收盘价时显示“数据不足”。样本不足时不显示误导性的 0% 命中率。</p>
   </section>
 
   <footer>{escape(DISCLAIMER)}</footer>
@@ -1073,6 +1149,11 @@ def markdown_summary_line(summary: dict[str, Any], label: str) -> list[str]:
 
 
 def render_markdown(accuracy: dict[str, Any], report_date: str) -> str:
+    records = sorted(
+        list(accuracy.get("records", [])),
+        key=lambda item: (str(item.get("date") or ""), str(item.get("code") or "")),
+        reverse=True,
+    )
     lines = [
         f"# {report_date} AI 建议准确性回测",
         "",
@@ -1093,15 +1174,25 @@ def render_markdown(accuracy: dict[str, Any], report_date: str) -> str:
     lines.append("")
 
     lines.extend(["## 当前持仓建议回看", ""])
-    current = [record for record in accuracy.get("records", []) if record.get("is_current_holding_now")]
+    current = [record for record in records if record.get("is_current_holding_now")]
     if not current:
         lines.append("暂无当前持仓建议样本。")
-    for record in current[:30]:
+    for record in current:
         lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
     lines.append("")
 
+    lines.extend(["## 最近建议回看", ""])
+    recent_records = list(accuracy.get("recent_records", []))
+    if not recent_records:
+        lines.append("暂无最近建议样本。")
+    for record in recent_records:
+        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action')} / {record.get('sentiment')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
+    lines.append("")
+
     lines.extend(["## 历史全部建议回测", ""])
-    for record in accuracy.get("recent_records", []):
+    if not records:
+        lines.append("暂无历史建议样本。")
+    for record in records:
         lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action')} / {record.get('sentiment')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
     lines.append("")
 
