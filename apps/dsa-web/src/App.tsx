@@ -20,6 +20,7 @@ const ChatPage = lazy(() => import('./pages/ChatPage'));
 const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
 const AlertsPage = lazy(() => import('./pages/AlertsPage'));
 const StockScreeningPage = lazy(() => import('./pages/StockScreeningPage'));
+const SteadyIncomePage = lazy(() => import('./pages/SteadyIncomePage'));
 
 const AppContent: React.FC = () => {
   const location = useLocation();
@@ -78,6 +79,7 @@ const AppContent: React.FC = () => {
         <Route path="/" element={<HomePage />} />
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
+        <Route path="/steady-income" element={<SteadyIncomePage />} />
         <Route path="/screening" element={<StockScreeningPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/alerts" element={<AlertsPage />} />

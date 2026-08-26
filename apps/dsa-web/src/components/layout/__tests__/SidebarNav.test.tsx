@@ -139,6 +139,18 @@ describe('SidebarNav', () => {
     expect(alertsLink).toHaveClass('font-medium');
   });
 
+  it('renders the steady-income module as an independent navigation item', () => {
+    render(
+      <MemoryRouter initialEntries={['/steady-income']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const link = screen.getByRole('link', { name: '稳健收益' });
+    expect(link).toHaveAttribute('href', '/steady-income');
+    expect(link).toHaveClass('font-medium');
+  });
+
   it('opens the logout confirmation and confirms logout', async () => {
     render(
       <MemoryRouter initialEntries={['/chat']}>
