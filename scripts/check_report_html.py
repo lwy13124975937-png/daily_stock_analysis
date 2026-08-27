@@ -12,8 +12,12 @@ from html import unescape
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SITE_DIR = ROOT_DIR / "site"
+SITE_DATA_DIR = ROOT_DIR / "site_data"
 SITE_REPORTS_DIR = ROOT_DIR / "site" / "reports"
 SITE_ACCOUNTS_DIR = ROOT_DIR / "site" / "accounts"
+HOLDINGS_SNAPSHOT_PATH = SITE_DATA_DIR / "holdings_snapshot.json"
+STEADY_INCOME_DATA_PATH = SITE_DATA_DIR / "steady_income.json"
+STEADY_INCOME_PAGE_PATH = SITE_DIR / "steady_income.html"
 RAW_REPORT_MARKER = "<summary>原始 AI 股票日报</summary>"
 REPORT_HTML_RE = re.compile(r"report_(20\d{6})\.html$")
 BAD_SUMMARY_TOKENS = ("**", "#", "###", "####", "```", "|---------|", "AI摘要缺失")
@@ -120,6 +124,14 @@ INCOMPLETE_TAIL_TOKENS = (
     "风格暴露",
 )
 NATURAL_ENDINGS = tuple("。；;：:、，,）)】》”’！？?!…")
+STEADY_INCOME_PROHIBITED_TEXT = ("保证收益", "稳赚", "直接买入", "买入建议")
+STEADY_INCOME_REQUIRED_TEXT = (
+    "稳健收益",
+    "低风险候选",
+    "风险硬门槛优先",
+    "不预测未来分红",
+    "不承诺收益",
+)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -258,6 +270,113 @@ def _current_holding_advice_count(html: str) -> int | None:
 def _report_has_stock_holdings(html: str) -> bool:
     account_html = strip_raw_report(html)
     return 'data-type="stock"' in account_html or "A股个股" in account_html
+
+
+def _snapshot_stock_codes(errors: list[str]) -> set[str]:
+    if not HOLDINGS_SNAPSHOT_PATH.exists():
+        return set()
+    try:
+        payload = json.loads(HOLDINGS_SNAPSHOT_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        errors.append(
+            f"{_page_label(HOLDINGS_SNAPSHOT_PATH)} cannot be read: {type(exc).__name__}: {exc}"
+        )
+        return set()
+
+    codes: set[str] = set()
+    accounts = payload.get("accounts", {}) if isinstance(payload, dict) else {}
+    if not isinstance(accounts, dict):
+        return codes
+    for groups in accounts.values():
+        if not isinstance(groups, dict):
+            continue
+        for item in groups.get("stock", []) or []:
+            if not isinstance(item, dict) or str(item.get("type") or "stock").lower() != "stock":
+                continue
+            code = str(item.get("code") or "").strip()
+            if len(code) == 6 and code.isdigit():
+                codes.add(code)
+    return codes
+
+
+def _check_steady_income_contract(errors: list[str], index_html: str) -> None:
+    stock_codes = _snapshot_stock_codes(errors)
+    if not stock_codes:
+        return
+    if not STEADY_INCOME_DATA_PATH.exists():
+        errors.append("site_data/steady_income.json is missing while stock holdings exist")
+        return
+    if not STEADY_INCOME_PAGE_PATH.exists():
+        errors.append("site/steady_income.html is missing while stock holdings exist")
+        return
+    if 'href="steady_income.html"' not in index_html:
+        errors.append("site/index.html is missing the steady-income entry")
+
+    try:
+        payload = json.loads(STEADY_INCOME_DATA_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        errors.append(
+            f"{_page_label(STEADY_INCOME_DATA_PATH)} cannot be read: {type(exc).__name__}: {exc}"
+        )
+        return
+    if not isinstance(payload, dict):
+        errors.append("site_data/steady_income.json must contain an object")
+        return
+
+    candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
+    excluded = payload.get("excluded") if isinstance(payload.get("excluded"), list) else []
+    results = [item for item in candidates + excluded if isinstance(item, dict)]
+    result_codes = {str(item.get("code") or "").strip() for item in results}
+    candidate_codes = {
+        str(item.get("code") or "").strip() for item in candidates if isinstance(item, dict)
+    }
+    excluded_codes = {
+        str(item.get("code") or "").strip() for item in excluded if isinstance(item, dict)
+    }
+    if result_codes != stock_codes:
+        errors.append(
+            "site_data/steady_income.json stock coverage mismatch: "
+            f"expected={sorted(stock_codes)}, rendered={sorted(result_codes)}"
+        )
+    if int(payload.get("evaluated_count") or 0) != len(stock_codes):
+        errors.append(
+            "site_data/steady_income.json evaluated_count does not match current stock holdings"
+        )
+    if len(results) != len(stock_codes):
+        errors.append("site_data/steady_income.json contains duplicate or malformed stock results")
+    if int(payload.get("qualified_count") or 0) != len(candidates):
+        errors.append("site_data/steady_income.json qualified_count does not match candidate records")
+    if candidate_codes & excluded_codes:
+        errors.append("site_data/steady_income.json repeats a stock in candidates and excluded")
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        if item.get("risk_tier") not in {"稳健", "较稳健"} or not item.get("qualified"):
+            errors.append(
+                "site_data/steady_income.json candidate bypasses the low-risk tier gate: "
+                f"{item.get('code')} {item.get('risk_tier')}"
+            )
+    for item in excluded:
+        if isinstance(item, dict) and item.get("qualified"):
+            errors.append(
+                "site_data/steady_income.json excluded item is incorrectly qualified: "
+                f"{item.get('code')}"
+            )
+
+    steady_html = STEADY_INCOME_PAGE_PATH.read_text(encoding="utf-8", errors="ignore")
+    for text in STEADY_INCOME_REQUIRED_TEXT:
+        if text not in steady_html:
+            errors.append(f"site/steady_income.html is missing required risk language {text!r}")
+    for text in STEADY_INCOME_PROHIBITED_TEXT:
+        if text in steady_html:
+            errors.append(f"site/steady_income.html contains prohibited promise/decision text {text!r}")
+    count_match = re.search(r'id="steady-income-results"[^>]*data-evaluated-count="(\d+)"', steady_html)
+    if not count_match or int(count_match.group(1)) != len(stock_codes):
+        actual = int(count_match.group(1)) if count_match else None
+        errors.append(
+            "site/steady_income.html evaluated count mismatch: "
+            f"expected={len(stock_codes)}, rendered={actual}"
+        )
 
 
 def _account_item_counts(html: str, tag: str, css_class: str) -> dict[str, int]:
@@ -445,15 +564,14 @@ def main() -> int:
         return 1
 
     errors: list[str] = []
+    index_path = SITE_DIR / "index.html"
+    index_html = index_path.read_text(encoding="utf-8", errors="ignore") if index_path.exists() else ""
     latest_report = latest_stock_report_html()
     if latest_report is not None:
         latest_date, latest_page = latest_report
         latest_html = latest_page.read_text(encoding="utf-8", errors="ignore")
         latest_href = f"reports/{latest_page.name}"
-        index_path = SITE_DIR / "index.html"
-        index_html = ""
         if index_path.exists():
-            index_html = index_path.read_text(encoding="utf-8", errors="ignore")
             if latest_href not in index_html:
                 errors.append(
                     f"site/index.html latest report link is stale: expected {latest_href}"
@@ -496,6 +614,8 @@ def main() -> int:
             expected_href = f"accounts/{account_page.name}"
             if index_html and expected_href not in index_html:
                 errors.append(f"site/index.html is missing account link {expected_href}")
+
+    _check_steady_income_contract(errors, index_html)
 
     for page in pages:
         html = page.read_text(encoding="utf-8", errors="ignore")

@@ -50,7 +50,10 @@
 
 - Web：侧栏 `稳健收益`，路由 `/steady-income`。
 - API：`GET /api/v1/steady-income/portfolio`。
+- GitHub Pages：首页报告中心的 `稳健收益`，静态页面 `steady_income.html`。
 - `refresh=true` 可绕过六小时进程内缓存，重新读取公开行情与财务数据。
+
+每日分析 workflow 会在完整持仓快照生成后运行 `scripts/build_steady_income_report.py`。该脚本只读取公开安全的股票名称、代码和账户归属，并复用同一套风险硬门槛生成 `site_data/steady_income.json`；随后 `scripts/build_pages_report.py` 生成静态页面。此过程不调用 LLM。若静态数据未覆盖当前全部 A 股持仓，HTML 检查会阻止 Pages 部署。
 
 单只股票的数据源失败只会把该标的降为“数据不足”，不会把其他标的伪装成合格结果。
 

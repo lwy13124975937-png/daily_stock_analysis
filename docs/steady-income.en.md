@@ -29,7 +29,10 @@ The displayed score is only a within-tier rules score. It is not an expected ret
 
 - Web: `稳健收益` in the sidebar, route `/steady-income`.
 - API: `GET /api/v1/steady-income/portfolio`.
+- GitHub Pages: `稳健收益` in the homepage report center, page `steady_income.html`.
 - Set `refresh=true` to bypass the six-hour in-process cache.
+
+The daily workflow runs `scripts/build_steady_income_report.py` after the sanitized holdings snapshot is available. The script reads only public-safe stock identity fields, reuses the same hard risk gates, writes `site_data/steady_income.json`, and makes no LLM calls. The Pages presentation check blocks deployment when the dataset does not cover every current A-share holding.
 
 Reverting the service, API route, Web page and navigation, tests, and these docs removes the module without affecting the existing analysis, portfolio, backtest, alert, or LLM pipelines.
 

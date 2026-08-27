@@ -22,6 +22,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 REPORTS_DIR = ROOT_DIR / "reports"
 SITE_DATA_DIR = ROOT_DIR / "site_data"
 HOLDINGS_SNAPSHOT_PATH = SITE_DATA_DIR / "holdings_snapshot.json"
+STEADY_INCOME_DATA_PATH = SITE_DATA_DIR / "steady_income.json"
 SITE_DIR = ROOT_DIR / "site"
 SITE_REPORTS_DIR = SITE_DIR / "reports"
 SITE_ACCOUNTS_DIR = SITE_DIR / "accounts"
@@ -235,6 +236,18 @@ def _load_holdings_snapshot() -> dict:
     except Exception as exc:
         print(f"Failed to read holdings snapshot: {type(exc).__name__}: {exc}")
         return {}
+
+
+def _load_steady_income_data() -> dict:
+    if not STEADY_INCOME_DATA_PATH.exists():
+        print(f"No steady-income dataset found: {STEADY_INCOME_DATA_PATH}")
+        return {}
+    try:
+        payload = json.loads(STEADY_INCOME_DATA_PATH.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        print(f"Failed to read steady-income dataset: {type(exc).__name__}: {exc}")
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _counts_for_account(groups: dict) -> dict[str, int]:
@@ -1339,7 +1352,7 @@ def _wrap_html(title: str, body: str) -> str:
     .section-heading p {{ margin: 0; color: var(--muted); font-size: 14px; }}
     .report-grid {{
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 12px;
     }}
     .grid {{
@@ -1570,6 +1583,66 @@ def _wrap_html(title: str, body: str) -> str:
       border-radius: 6px;
       font: 14px/1.65 SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
     }}
+    .steady-overview {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }}
+    .steady-overview-item {{
+      padding: 14px;
+      background: var(--soft);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }}
+    .steady-overview-item strong {{ display: block; font-size: 22px; line-height: 1.25; }}
+    .steady-overview-item span {{ display: block; margin-top: 4px; color: var(--muted); font-size: 13px; }}
+    .steady-list {{ display: grid; grid-template-columns: 1fr; gap: 14px; }}
+    .steady-card {{
+      padding: 18px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--success);
+      border-radius: 8px;
+    }}
+    .steady-card[data-risk-tier="较稳健"] {{ border-left-color: #65934d; }}
+    .steady-card[data-risk-tier="观察"],
+    .steady-card[data-risk-tier="数据不足"] {{ border-left-color: var(--warning); }}
+    .steady-card[data-risk-tier="不纳入"] {{ border-left-color: var(--danger); }}
+    .steady-card-head {{ display: flex; align-items: start; justify-content: space-between; gap: 14px; }}
+    .steady-card-head h3 {{ margin: 0; }}
+    .risk-badge {{
+      flex: 0 0 auto;
+      padding: 4px 9px;
+      color: var(--success);
+      background: #e9f7f2;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 750;
+    }}
+    .steady-card[data-risk-tier="观察"] .risk-badge,
+    .steady-card[data-risk-tier="数据不足"] .risk-badge {{ color: var(--warning); background: #fff5d6; }}
+    .steady-card[data-risk-tier="不纳入"] .risk-badge {{ color: var(--danger); background: #fdeceb; }}
+    .metric-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 14px;
+    }}
+    .metric {{ min-width: 0; padding: 10px; background: var(--soft); border-radius: 6px; }}
+    .metric span {{ display: block; color: var(--muted); font-size: 12px; }}
+    .metric strong {{ display: block; margin-top: 2px; font-size: 15px; font-variant-numeric: tabular-nums; }}
+    .steady-columns {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }}
+    .steady-block {{ min-width: 0; padding-top: 12px; border-top: 1px solid var(--line); }}
+    .steady-block h4 {{ margin: 0 0 7px; font-size: 14px; }}
+    .steady-block ul {{ margin: 0; padding-left: 20px; }}
+    .steady-block li {{ margin: 4px 0; }}
+    .replay-list {{ display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }}
+    .replay-pill {{ padding: 5px 8px; border-radius: 6px; background: var(--soft); font-size: 13px; }}
+    .replay-pill.positive {{ color: var(--success); }}
+    .replay-pill.negative {{ color: var(--danger); }}
+    .steady-excluded {{ margin-top: 16px; }}
+    .steady-excluded > summary {{ cursor: pointer; font-weight: 700; }}
     .disclaimer {{
       margin-top: 30px;
       padding-top: 16px;
@@ -1607,6 +1680,15 @@ def _wrap_html(title: str, body: str) -> str:
       .holding-item {{ padding: 14px; }}
       .holding-head {{ display: block; }}
       .holding-head .type-badge {{ margin-top: 7px; }}
+      .steady-overview {{ grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }}
+      .steady-overview-item {{ padding: 10px 7px; }}
+      .steady-overview-item strong {{ font-size: 19px; }}
+      .steady-overview-item span {{ font-size: 11px; }}
+      .metric-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .steady-columns {{ grid-template-columns: 1fr; }}
+      .steady-card {{ padding: 15px; }}
+      .steady-card-head {{ display: block; }}
+      .steady-card-head .risk-badge {{ display: inline-flex; margin-top: 8px; }}
       th, td {{ padding: 7px 8px; }}
     }}
   </style>
@@ -2176,6 +2258,175 @@ def _build_account_pages(snapshot: dict, pages: list[ReportPage]) -> list[Accoun
     return account_pages
 
 
+def _steady_number(value: object, *, suffix: str = "", decimals: int = 2) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "数据不足"
+    return f"{number:.{decimals}f}{suffix}"
+
+
+def _steady_metric(label: str, value: str) -> str:
+    return (
+        '<div class="metric">'
+        f'<span>{escape(label)}</span><strong>{escape(value)}</strong>'
+        "</div>"
+    )
+
+
+def _steady_bullet_block(title: str, items: list[object], empty_text: str) -> str:
+    clean_items = [str(item).strip() for item in items if str(item).strip()]
+    if not clean_items:
+        clean_items = [empty_text]
+    bullets = "".join(f"<li>{escape(item)}</li>" for item in clean_items)
+    return f'<section class="steady-block"><h4>{escape(title)}</h4><ul>{bullets}</ul></section>'
+
+
+def _steady_replay(result: dict) -> str:
+    periods = result.get("replay_periods") if isinstance(result.get("replay_periods"), list) else []
+    if not periods:
+        return '<p class="muted">完整年度数据不足。</p>'
+    pills = []
+    for item in periods:
+        if not isinstance(item, dict):
+            continue
+        try:
+            number = float(item.get("total_return_pct"))
+        except (TypeError, ValueError):
+            continue
+        state = "positive" if number >= 0 else "negative"
+        pills.append(
+            f'<span class="replay-pill {state}">'
+            f'{escape(str(item.get("label") or "-"))}：{number:+.2f}%</span>'
+        )
+    return f'<div class="replay-list">{"".join(pills)}</div>' if pills else '<p class="muted">完整年度数据不足。</p>'
+
+
+def _steady_price_bands(result: dict) -> str:
+    bands = result.get("price_bands") if isinstance(result.get("price_bands"), dict) else {}
+    if not bands:
+        return '<p class="muted">现金分红证据不足，无法计算。</p>'
+    return (
+        '<div class="metric-grid">'
+        + _steady_metric("约 5% 股息率", _steady_number(bands.get("high_income_price"), suffix=" 元"))
+        + _steady_metric("约 3.5% 股息率", _steady_number(bands.get("balanced_price"), suffix=" 元"))
+        + _steady_metric("约 2.5% 股息率", _steady_number(bands.get("low_income_price"), suffix=" 元"))
+        + "</div>"
+    )
+
+
+def _render_steady_result(result: dict, *, compact: bool = False) -> str:
+    code = str(result.get("code") or "-")
+    name = str(result.get("name") or code)
+    risk_tier = str(result.get("risk_tier") or "数据不足")
+    accounts = "、".join(str(item) for item in result.get("accounts") or [] if str(item).strip())
+    identity_meta = f"账户：{accounts}" if accounts else "当前 A 股持仓"
+    risks = result.get("risks") if isinstance(result.get("risks"), list) else []
+
+    if compact:
+        reason = str(risks[0]) if risks else "未达到低风险候选门槛"
+        return f"""
+<article class="steady-card" data-risk-tier="{escape(risk_tier)}" data-code="{escape(code)}">
+  <div class="steady-card-head">
+    <div><h3>{escape(name)}（{escape(code)}）</h3><p class="muted">{escape(identity_meta)}</p></div>
+    <span class="risk-badge">{escape(risk_tier)}</span>
+  </div>
+  <p>{escape(reason)}</p>
+</article>
+"""
+
+    metrics = "".join(
+        (
+            _steady_metric(
+                "最近有效价格",
+                _steady_number(result.get("current_price"), suffix=" 元")
+                + (f" · {result.get('price_date')}" if result.get("price_date") else ""),
+            ),
+            _steady_metric("TTM 税前股息率", _steady_number(result.get("ttm_dividend_yield_pct"), suffix="%")),
+            _steady_metric("连续现金分红", f"{int(result.get('consecutive_dividend_years') or 0)} 年"),
+            _steady_metric("分红可持续性", str(result.get("dividend_sustainability") or "数据不足")),
+            _steady_metric("近年最大回撤", _steady_number(result.get("max_drawdown_pct"), suffix="%")),
+            _steady_metric("年化波动率", _steady_number(result.get("annualized_volatility_pct"), suffix="%")),
+        )
+    )
+    strengths = result.get("strengths") if isinstance(result.get("strengths"), list) else []
+    return f"""
+<article class="steady-card" data-risk-tier="{escape(risk_tier)}" data-code="{escape(code)}">
+  <div class="steady-card-head">
+    <div><h3>{escape(name)}（{escape(code)}）</h3><p class="muted">{escape(identity_meta)}</p></div>
+    <span class="risk-badge">{escape(risk_tier)}</span>
+  </div>
+  <div class="metric-grid">{metrics}</div>
+  <div class="steady-columns">
+    {_steady_bullet_block("通过证据", strengths, "暂无足够证据")}
+    {_steady_bullet_block("主要风险", risks, "未发现触发硬门槛的异常")}
+  </div>
+  <section class="steady-block"><h4>股息率对应价格</h4>{_steady_price_bands(result)}</section>
+  <section class="steady-block"><h4>最近五期价格与分红复权回放</h4>{_steady_replay(result)}</section>
+</article>
+"""
+
+
+def _build_steady_income_page(payload: dict) -> str:
+    candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
+    excluded = payload.get("excluded") if isinstance(payload.get("excluded"), list) else []
+    evaluated_count = int(payload.get("evaluated_count") or 0)
+    qualified_count = int(payload.get("qualified_count") or 0)
+    as_of = str(payload.get("as_of") or "尚未生成")
+
+    if candidates:
+        candidate_html = '<div class="steady-list">' + "".join(
+            _render_steady_result(item) for item in candidates if isinstance(item, dict)
+        ) + "</div>"
+    else:
+        candidate_html = (
+            '<div class="note"><strong>当前没有标的通过低风险硬门槛。</strong>'
+            '<div class="muted">这不是收益判断，而是风险、分红或数据证据尚不足。</div></div>'
+        )
+
+    excluded_html = "".join(
+        _render_steady_result(item, compact=True) for item in excluded if isinstance(item, dict)
+    )
+    if not excluded_html:
+        excluded_html = '<p class="muted">暂无未纳入标的。</p>'
+
+    body = f"""
+<nav class="page-nav"><a href="index.html">返回首页</a></nav>
+<header class="hero">
+  <span class="hero-kicker">低风险优先 · 规则筛选</span>
+  <h1>稳健收益</h1>
+  <p class="hero-copy">先排除现金流、盈利、分红连续性、回撤和波动不合格的标的，再比较股息与历史稳定性。高股息不能覆盖高风险。</p>
+  <div class="meta-row"><span>评估基准日：{escape(as_of)}</span><span>生成时间：{escape(str(payload.get('generated_at') or _now_text()))}</span></div>
+  <div class="steady-overview">
+    <div class="steady-overview-item"><strong>{evaluated_count}</strong><span>当前 A 股持仓</span></div>
+    <div class="steady-overview-item"><strong>{qualified_count}</strong><span>通过低风险硬门槛</span></div>
+    <div class="steady-overview-item"><strong>{max(evaluated_count - qualified_count, 0)}</strong><span>观察 / 不纳入 / 数据不足</span></div>
+  </div>
+</header>
+<main id="steady-income-results" data-evaluated-count="{evaluated_count}" data-qualified-count="{qualified_count}">
+  <section class="dashboard-section">
+    <div class="section-heading"><div><h2>低风险候选</h2><p>只展示“稳健”或“较稳健”层级；规则分不能跨风险层升级标的。</p></div></div>
+    {candidate_html}
+  </section>
+  <details class="archive-details steady-excluded">
+    <summary>查看未通过硬门槛的 {len(excluded)} 只持仓</summary>
+    <div class="details-body steady-list">{excluded_html}</div>
+  </details>
+  <section class="panel">
+    <h2>判定边界</h2>
+    <ul>
+      <li>仅评估当前持仓中的沪深北 A 股股票；LOF/ETF 与场外基金不参与。</li>
+      <li>风险硬门槛优先，规则分仅在同一风险层内排序。</li>
+      <li>股息率按 TTM 税前现金分红与最近有效收盘价计算。</li>
+      <li>历史回放使用前复权行情；不预测未来分红，不承诺收益。</li>
+    </ul>
+  </section>
+</main>
+<footer class="disclaimer">本页面用于低风险现金流与长期总回报复盘，不构成投资建议。</footer>
+"""
+    return _wrap_html("稳健收益", body)
+
+
 def _reports_index_block(pages: list[ReportPage]) -> str:
     latest_stock = _latest_report(pages, "stock")
     latest_market = _latest_report(pages, "market")
@@ -2204,9 +2455,15 @@ def _reports_index_block(pages: list[ReportPage]) -> str:
         '<strong class="report-card-title">AI 建议准确性回测</strong>'
         '<span class="report-card-action">查看历史命中率 →</span></a>'
     )
+    items.append(
+        '<a class="report-card" href="steady_income.html">'
+        '<span class="report-card-kicker">低风险现金流</span>'
+        '<strong class="report-card-title">稳健收益</strong>'
+        '<span class="report-card-action">查看风险优先筛选 →</span></a>'
+    )
     return (
         '<section class="dashboard-section">'
-        '<div class="section-heading"><div><h2>报告中心</h2><p>日报、大盘与模型回测集中查看</p></div></div>'
+        '<div class="section-heading"><div><h2>报告中心</h2><p>日报、大盘、模型回测与稳健收益集中查看</p></div></div>'
         f'<div class="report-grid">{"".join(items)}</div></section>'
     )
 
@@ -2249,7 +2506,7 @@ def _build_index(snapshot: dict, pages: list[ReportPage], account_pages: list[Ac
 <header class="hero home-hero">
   <span class="hero-kicker">每日自动更新</span>
   <h1>每日持仓复盘</h1>
-  <p class="hero-copy">从账户视角查看 A 股逐项分析、LOF/ETF 组合观察、场外基金组合复盘与历史建议命中率。</p>
+  <p class="hero-copy">从账户视角查看 A 股逐项分析、基金组合复盘、历史建议命中率与低风险稳健收益筛选。</p>
   <div class="meta-row">
     <span>生成时间：{escape(generated_at)}</span>
     <span>数据来源：{source_line}</span>
@@ -2267,6 +2524,7 @@ def build_pages() -> list[Path]:
     (SITE_DIR / ".nojekyll").write_text("", encoding="utf-8")
 
     snapshot = _load_holdings_snapshot()
+    steady_income_data = _load_steady_income_data()
     report_pages = _build_report_pages(snapshot)
     account_pages = _build_account_pages(snapshot, report_pages)
     if report_pages and not account_pages:
@@ -2276,13 +2534,23 @@ def build_pages() -> list[Path]:
         )
 
     index_path = SITE_DIR / "index.html"
+    steady_income_page_path = SITE_DIR / "steady_income.html"
     index_path.write_text(_build_index(snapshot, report_pages, account_pages), encoding="utf-8")
+    steady_income_page_path.write_text(
+        _build_steady_income_page(steady_income_data),
+        encoding="utf-8",
+    )
 
-    generated_files = [SITE_DIR / ".nojekyll", index_path]
+    generated_files = [SITE_DIR / ".nojekyll", index_path, steady_income_page_path]
     generated_files.extend(page.output for page in report_pages)
     generated_files.extend(page.output for page in account_pages)
 
     print(f"Built Pages report site: {SITE_DIR}")
+    try:
+        steady_label = steady_income_page_path.relative_to(ROOT_DIR)
+    except ValueError:
+        steady_label = steady_income_page_path
+    print(f"Generated steady-income page: {steady_label}")
     if report_pages:
         print("Generated report pages:")
         for page in report_pages:

@@ -508,6 +508,9 @@ jobs:
       - name: 更新 AI 建议准确性回测
         run: python scripts/update_advice_backtest.py
 
+      - name: 生成稳健收益规则评估
+        run: python scripts/build_steady_income_report.py
+
       - name: 生成静态报告网页
         run: python scripts/build_pages_report.py
 

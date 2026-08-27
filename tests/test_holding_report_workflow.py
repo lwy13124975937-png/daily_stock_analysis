@@ -308,6 +308,31 @@ class HoldingReportWorkflowTests(unittest.TestCase):
             }
             snapshot_path = site_data_dir / "holdings_snapshot.json"
             snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+            steady_data_path = site_data_dir / "steady_income.json"
+            steady_data_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2099-01-10T18:00:00+08:00",
+                        "as_of": "2099-01-10",
+                        "evaluated_count": 2,
+                        "qualified_count": 0,
+                        "candidates": [],
+                        "excluded": [
+                            {
+                                "code": code,
+                                "name": name,
+                                "accounts": ["账户甲"],
+                                "risk_tier": "数据不足",
+                                "qualified": False,
+                                "risks": ["公开数据不足，未纳入低风险候选"],
+                            }
+                            for code, name in (("111111", "测试股票甲"), ("222222", "测试股票乙"))
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             (reports_dir / "report_20990110.md").write_text(
                 """# 2099-01-10 股票日报
 
@@ -393,6 +418,7 @@ class HoldingReportWorkflowTests(unittest.TestCase):
                 (pages, "ROOT_DIR", root),
                 (pages, "REPORTS_DIR", reports_dir),
                 (pages, "HOLDINGS_SNAPSHOT_PATH", snapshot_path),
+                (pages, "STEADY_INCOME_DATA_PATH", steady_data_path),
                 (pages, "SITE_DIR", site_dir),
                 (pages, "SITE_REPORTS_DIR", site_reports_dir),
                 (pages, "SITE_ACCOUNTS_DIR", site_accounts_dir),
@@ -400,6 +426,9 @@ class HoldingReportWorkflowTests(unittest.TestCase):
                 (html_check, "SITE_DIR", site_dir),
                 (html_check, "SITE_REPORTS_DIR", site_reports_dir),
                 (html_check, "SITE_ACCOUNTS_DIR", site_accounts_dir),
+                (html_check, "HOLDINGS_SNAPSHOT_PATH", snapshot_path),
+                (html_check, "STEADY_INCOME_DATA_PATH", steady_data_path),
+                (html_check, "STEADY_INCOME_PAGE_PATH", site_dir / "steady_income.html"),
             )
             with ExitStack() as stack:
                 for module, name, value in patches:
