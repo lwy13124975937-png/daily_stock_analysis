@@ -2,20 +2,21 @@
 
 ## Purpose
 
-The Steady Income module evaluates current A-share holdings for lower risk, sustainable cash dividends, and long-term total return. It is rule-based, makes no LLM calls, and does not predict short-term price direction.
+The Steady Income module screens the complete active Shanghai/Shenzhen A-share universe for lower risk, sustainable cash dividends, and long-term total return. It is independent from current holdings, rule-based, makes no LLM calls, and does not predict short-term price direction.
 
 Hard risk gates come first. Dividend yield and stability scores only rank stocks inside the same risk tier. A high yield cannot offset losses, negative operating cash flow, excessive drawdown, excessive volatility, or broken dividend continuity.
 
 ## Inputs and outputs
 
-- Scope: Shanghai, Shenzhen, and Beijing listed A-share equities in the current portfolio. HK, US, B-share, index, bond, ETF, LOF, and other fund positions are excluded.
+- Scope: all active Shanghai/Shenzhen A-share equities in the public stock index. Beijing, HK, US, B-share, index, bond, ETF, LOF, and other fund instruments are excluded.
+- Two-stage screen: every stock receives a bulk dividend, profitability, listing-age, and ST-risk pre-screen; only the strongest finite seed set receives the slower long-history, cash-flow, and dividend-detail review.
 - Income: trailing-12-month pre-tax cash dividend per share and dividend yield.
 - Sustainability: consecutive dividend years, parent net profit, operating cash flow, and cash-flow coverage.
 - Risk: annualized volatility and maximum drawdown from roughly seven years of daily data.
 - Replay: the latest five returns between complete calendar year-ends, using the previous year-end as each baseline so cross-year price moves are not omitted. Forward-adjusted prices already reflect dividends and corporate actions.
 - Context: PE, PB, and ROE are supporting evidence only.
 
-The API does not return position quantity, cost, market value, or P&L.
+The Pages module does not use holdings as its candidate universe and never returns account, position quantity, cost, market value, or P&L.
 
 Dividend continuity counts only positive cash-dividend events on or before the evaluation date. TTM yield is recalculated from TTM cash dividend per share and the displayed portfolio quote so the price and yield use the same reference point.
 
@@ -27,13 +28,13 @@ The displayed score is only a within-tier rules score. It is not an expected ret
 
 ## Access and rollback
 
-- Web: `稳健收益` in the sidebar, route `/steady-income`.
-- API: `GET /api/v1/steady-income/portfolio`.
 - GitHub Pages: `稳健收益` in the homepage report center, page `steady_income.html`.
-- Set `refresh=true` to bypass the six-hour in-process cache.
+- Public dataset: `site/data/steady_income.json`, including whole-universe, pre-screen, deep-review, and qualified counts.
 
-The daily workflow runs `scripts/build_steady_income_report.py` after the sanitized holdings snapshot is available. The script reads only public-safe stock identity fields, reuses the same hard risk gates, writes `site_data/steady_income.json`, and makes no LLM calls. The Pages presentation check blocks deployment when the dataset does not cover every current A-share holding.
+The authenticated Web app keeps its existing current-portfolio evaluator under the explicit label `持仓稳健性` (Portfolio Stability), so it is no longer confused with the market-wide Pages screen.
 
-Reverting the service, API route, Web page and navigation, tests, and these docs removes the module without affecting the existing analysis, portfolio, backtest, alert, or LLM pipelines.
+The daily workflow runs `scripts/build_steady_income_report.py` against the public Shanghai/Shenzhen stock index and bulk dividend tables. It applies the market-wide pre-screen, reuses the same hard risk gates for deep evaluation, writes `site_data/steady_income.json`, and makes no LLM calls. The Pages guard blocks deployment when the universe is implausibly small, funnel counts disagree, or the page regresses to a current-holdings scope.
 
-The module evaluates every current A-share equity instead of silently truncating large portfolios. Standardized debt structure, future payout policy, and special dividends are not available as hard gates; missing evidence is not inferred to be safe.
+Reverting the Pages builder, market dataset script, HTML guard, workflow step, tests, and these docs removes the public market screen without affecting the existing analysis, portfolio, backtest, alert, or LLM pipelines.
+
+Every Shanghai/Shenzhen equity enters the basic pre-screen. The deep-review cap is disclosed together with universe and pre-screen counts, so a finite deep review is never presented as an exhaustive per-stock review. Standardized debt structure, future payout policy, and special dividends are not available as hard gates; missing evidence is not inferred to be safe.

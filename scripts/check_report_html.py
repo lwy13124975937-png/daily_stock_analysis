@@ -127,10 +127,27 @@ NATURAL_ENDINGS = tuple("。；;：:、，,）)】》”’！？?!…")
 STEADY_INCOME_PROHIBITED_TEXT = ("保证收益", "稳赚", "直接买入", "买入建议")
 STEADY_INCOME_REQUIRED_TEXT = (
     "稳健收益",
+    "沪深全市场",
     "低风险候选",
     "风险硬门槛优先",
     "不预测未来分红",
     "不承诺收益",
+)
+STEADY_INCOME_PROHIBITED_SCOPE_TEXT = ("当前 A 股持仓", "仅评估当前持仓", "当前持仓中的沪深")
+STEADY_INCOME_MIN_UNIVERSE_SIZE = 3000
+STEADY_INCOME_A_SHARE_PREFIXES = (
+    "000",
+    "001",
+    "002",
+    "003",
+    "300",
+    "301",
+    "600",
+    "601",
+    "603",
+    "605",
+    "688",
+    "689",
 )
 
 try:
@@ -300,14 +317,11 @@ def _snapshot_stock_codes(errors: list[str]) -> set[str]:
 
 
 def _check_steady_income_contract(errors: list[str], index_html: str) -> None:
-    stock_codes = _snapshot_stock_codes(errors)
-    if not stock_codes:
-        return
     if not STEADY_INCOME_DATA_PATH.exists():
-        errors.append("site_data/steady_income.json is missing while stock holdings exist")
+        errors.append("site_data/steady_income.json is missing")
         return
     if not STEADY_INCOME_PAGE_PATH.exists():
-        errors.append("site/steady_income.html is missing while stock holdings exist")
+        errors.append("site/steady_income.html is missing")
         return
     if 'href="steady_income.html"' not in index_html:
         errors.append("site/index.html is missing the steady-income entry")
@@ -323,6 +337,30 @@ def _check_steady_income_contract(errors: list[str], index_html: str) -> None:
         errors.append("site_data/steady_income.json must contain an object")
         return
 
+    if int(payload.get("schema_version") or 0) < 2:
+        errors.append("site_data/steady_income.json must use whole-market schema_version >= 2")
+    universe = payload.get("universe") if isinstance(payload.get("universe"), dict) else {}
+    stats = payload.get("screening_stats") if isinstance(payload.get("screening_stats"), dict) else {}
+    universe_count = int(stats.get("universe_count") or universe.get("count") or 0)
+    prefilter_count = int(stats.get("prefilter_eligible_count") or 0)
+    deep_selected_count = int(stats.get("deep_selected_count") or 0)
+    deep_evaluated_count = int(stats.get("deep_evaluated_count") or 0)
+    if universe.get("market") != "沪深A股" or universe.get("complete") is not True:
+        errors.append("site_data/steady_income.json does not declare a complete Shanghai/Shenzhen A-share universe")
+    if universe_count < STEADY_INCOME_MIN_UNIVERSE_SIZE:
+        errors.append(
+            "site_data/steady_income.json whole-market universe is unexpectedly small: "
+            f"{universe_count}"
+        )
+    if int(universe.get("count") or 0) != universe_count:
+        errors.append("site_data/steady_income.json universe count disagrees with screening stats")
+    if not (universe_count >= prefilter_count >= deep_selected_count >= deep_evaluated_count > 0):
+        errors.append(
+            "site_data/steady_income.json invalid screening funnel: "
+            f"universe={universe_count}, prefilter={prefilter_count}, "
+            f"selected={deep_selected_count}, evaluated={deep_evaluated_count}"
+        )
+
     candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
     excluded = payload.get("excluded") if isinstance(payload.get("excluded"), list) else []
     results = [item for item in candidates + excluded if isinstance(item, dict)]
@@ -333,17 +371,15 @@ def _check_steady_income_contract(errors: list[str], index_html: str) -> None:
     excluded_codes = {
         str(item.get("code") or "").strip() for item in excluded if isinstance(item, dict)
     }
-    if result_codes != stock_codes:
-        errors.append(
-            "site_data/steady_income.json stock coverage mismatch: "
-            f"expected={sorted(stock_codes)}, rendered={sorted(result_codes)}"
-        )
-    if int(payload.get("evaluated_count") or 0) != len(stock_codes):
-        errors.append(
-            "site_data/steady_income.json evaluated_count does not match current stock holdings"
-        )
-    if len(results) != len(stock_codes):
+    invalid_codes = sorted(
+        code
+        for code in result_codes
+        if not re.fullmatch(r"\d{6}", code) or not code.startswith(STEADY_INCOME_A_SHARE_PREFIXES)
+    )
+    if len(result_codes) != len(results) or invalid_codes:
         errors.append("site_data/steady_income.json contains duplicate or malformed stock results")
+    if int(payload.get("evaluated_count") or 0) != deep_evaluated_count or len(results) != deep_evaluated_count:
+        errors.append("site_data/steady_income.json evaluated_count does not match deep-evaluation results")
     if int(payload.get("qualified_count") or 0) != len(candidates):
         errors.append("site_data/steady_income.json qualified_count does not match candidate records")
     if candidate_codes & excluded_codes:
@@ -370,12 +406,20 @@ def _check_steady_income_contract(errors: list[str], index_html: str) -> None:
     for text in STEADY_INCOME_PROHIBITED_TEXT:
         if text in steady_html:
             errors.append(f"site/steady_income.html contains prohibited promise/decision text {text!r}")
-    count_match = re.search(r'id="steady-income-results"[^>]*data-evaluated-count="(\d+)"', steady_html)
-    if not count_match or int(count_match.group(1)) != len(stock_codes):
-        actual = int(count_match.group(1)) if count_match else None
+    for text in STEADY_INCOME_PROHIBITED_SCOPE_TEXT:
+        if text in steady_html:
+            errors.append(f"site/steady_income.html incorrectly limits the market screen to holdings: {text!r}")
+    count_match = re.search(
+        r'id="steady-income-results"[^>]*data-universe-count="(\d+)"[^>]*'
+        r'data-prefilter-count="(\d+)"[^>]*data-evaluated-count="(\d+)"',
+        steady_html,
+    )
+    actual = tuple(int(value) for value in count_match.groups()) if count_match else None
+    expected = (universe_count, prefilter_count, deep_evaluated_count)
+    if actual != expected:
         errors.append(
-            "site/steady_income.html evaluated count mismatch: "
-            f"expected={len(stock_codes)}, rendered={actual}"
+            "site/steady_income.html screening funnel mismatch: "
+            f"expected={expected}, rendered={actual}"
         )
 
 

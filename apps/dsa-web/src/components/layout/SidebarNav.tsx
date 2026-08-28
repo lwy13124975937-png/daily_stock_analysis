@@ -29,7 +29,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'chat', label: '问股', to: '/chat', icon: MessageSquareQuote, badge: 'completion' },
   { key: 'screening', label: '选股', to: '/screening', icon: Search },
   { key: 'portfolio', label: '持仓', to: '/portfolio', icon: BriefcaseBusiness },
-  { key: 'steady-income', label: '稳健收益', to: '/steady-income', icon: ShieldCheck },
+  { key: 'steady-income', label: '持仓稳健性', to: '/steady-income', icon: ShieldCheck },
   { key: 'backtest', label: '回测', to: '/backtest', icon: BarChart3 },
   { key: 'alerts', label: '告警', to: '/alerts', icon: Bell },
   { key: 'settings', label: '设置', to: '/settings', icon: Settings2 },

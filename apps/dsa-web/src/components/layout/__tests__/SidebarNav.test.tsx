@@ -139,14 +139,14 @@ describe('SidebarNav', () => {
     expect(alertsLink).toHaveClass('font-medium');
   });
 
-  it('renders the steady-income module as an independent navigation item', () => {
+  it('labels the current-portfolio evaluator as portfolio stability', () => {
     render(
       <MemoryRouter initialEntries={['/steady-income']}>
         <SidebarNav />
       </MemoryRouter>,
     );
 
-    const link = screen.getByRole('link', { name: '稳健收益' });
+    const link = screen.getByRole('link', { name: '持仓稳健性' });
     expect(link).toHaveAttribute('href', '/steady-income');
     expect(link).toHaveClass('font-medium');
   });

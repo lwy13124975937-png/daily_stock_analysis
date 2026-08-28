@@ -71,7 +71,8 @@ describe('SteadyIncomePage', () => {
   it('shows concise risk-first income evidence and historical replay', async () => {
     render(<MemoryRouter><SteadyIncomePage /></MemoryRouter>);
 
-    expect(await screen.findByRole('heading', { name: '稳健收益' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '持仓稳健性' })).toBeInTheDocument();
+    expect(screen.getByText(/只检查当前 A 股持仓/)).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '稳健样本' })).toBeInTheDocument();
     expect(screen.getAllByText('4.20%')[0]).toBeInTheDocument();
     expect(screen.getAllByText('5 年')[0]).toBeInTheDocument();
@@ -85,7 +86,7 @@ describe('SteadyIncomePage', () => {
   it('keeps rejected candidates collapsed and refreshes without adding analysis calls', async () => {
     render(<MemoryRouter><SteadyIncomePage /></MemoryRouter>);
 
-    await screen.findByRole('heading', { name: '稳健收益' });
+    await screen.findByRole('heading', { name: '持仓稳健性' });
     expect(screen.queryByText('经营现金流非正')).not.toBeVisible();
 
     fireEvent.click(screen.getByRole('button', { name: '重新评估' }));

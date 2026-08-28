@@ -1585,7 +1585,7 @@ def _wrap_html(title: str, body: str) -> str:
     }}
     .steady-overview {{
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
       margin-top: 16px;
     }}
@@ -1680,7 +1680,7 @@ def _wrap_html(title: str, body: str) -> str:
       .holding-item {{ padding: 14px; }}
       .holding-head {{ display: block; }}
       .holding-head .type-badge {{ margin-top: 7px; }}
-      .steady-overview {{ grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }}
+      .steady-overview {{ grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }}
       .steady-overview-item {{ padding: 10px 7px; }}
       .steady-overview-item strong {{ font-size: 19px; }}
       .steady-overview-item span {{ font-size: 11px; }}
@@ -2319,8 +2319,8 @@ def _render_steady_result(result: dict, *, compact: bool = False) -> str:
     code = str(result.get("code") or "-")
     name = str(result.get("name") or code)
     risk_tier = str(result.get("risk_tier") or "数据不足")
-    accounts = "、".join(str(item) for item in result.get("accounts") or [] if str(item).strip())
-    identity_meta = f"账户：{accounts}" if accounts else "当前 A 股持仓"
+    market = str(result.get("market") or ("沪市" if code.startswith("6") else "深市"))
+    identity_meta = f"{market} · 全市场深度评估"
     risks = result.get("risks") if isinstance(result.get("risks"), list) else []
 
     if compact:
@@ -2372,6 +2372,10 @@ def _build_steady_income_page(payload: dict) -> str:
     excluded = payload.get("excluded") if isinstance(payload.get("excluded"), list) else []
     evaluated_count = int(payload.get("evaluated_count") or 0)
     qualified_count = int(payload.get("qualified_count") or 0)
+    universe = payload.get("universe") if isinstance(payload.get("universe"), dict) else {}
+    stats = payload.get("screening_stats") if isinstance(payload.get("screening_stats"), dict) else {}
+    universe_count = int(stats.get("universe_count") or universe.get("count") or 0)
+    prefilter_count = int(stats.get("prefilter_eligible_count") or 0)
     as_of = str(payload.get("as_of") or "尚未生成")
 
     if candidates:
@@ -2380,7 +2384,7 @@ def _build_steady_income_page(payload: dict) -> str:
         ) + "</div>"
     else:
         candidate_html = (
-            '<div class="note"><strong>当前没有标的通过低风险硬门槛。</strong>'
+            '<div class="note"><strong>本次全市场深度评估没有标的通过低风险硬门槛。</strong>'
             '<div class="muted">这不是收益判断，而是风险、分红或数据证据尚不足。</div></div>'
         )
 
@@ -2393,29 +2397,31 @@ def _build_steady_income_page(payload: dict) -> str:
     body = f"""
 <nav class="page-nav"><a href="index.html">返回首页</a></nav>
 <header class="hero">
-  <span class="hero-kicker">低风险优先 · 规则筛选</span>
+  <span class="hero-kicker">沪深全市场 · 低风险优先</span>
   <h1>稳健收益</h1>
-  <p class="hero-copy">先排除现金流、盈利、分红连续性、回撤和波动不合格的标的，再比较股息与历史稳定性。高股息不能覆盖高风险。</p>
+  <p class="hero-copy">覆盖全部沪深 A 股，先做分红、盈利和上市年限预筛，再用现金流、分红连续性、回撤与波动做深度硬门槛。高股息不能覆盖高风险。</p>
   <div class="meta-row"><span>评估基准日：{escape(as_of)}</span><span>生成时间：{escape(str(payload.get('generated_at') or _now_text()))}</span></div>
   <div class="steady-overview">
-    <div class="steady-overview-item"><strong>{evaluated_count}</strong><span>当前 A 股持仓</span></div>
+    <div class="steady-overview-item"><strong>{universe_count}</strong><span>沪深全市场覆盖</span></div>
+    <div class="steady-overview-item"><strong>{prefilter_count}</strong><span>通过基础预筛</span></div>
+    <div class="steady-overview-item"><strong>{evaluated_count}</strong><span>进入深度评估</span></div>
     <div class="steady-overview-item"><strong>{qualified_count}</strong><span>通过低风险硬门槛</span></div>
-    <div class="steady-overview-item"><strong>{max(evaluated_count - qualified_count, 0)}</strong><span>观察 / 不纳入 / 数据不足</span></div>
   </div>
 </header>
-<main id="steady-income-results" data-evaluated-count="{evaluated_count}" data-qualified-count="{qualified_count}">
+<main id="steady-income-results" data-universe-count="{universe_count}" data-prefilter-count="{prefilter_count}" data-evaluated-count="{evaluated_count}" data-qualified-count="{qualified_count}">
   <section class="dashboard-section">
     <div class="section-heading"><div><h2>低风险候选</h2><p>只展示“稳健”或“较稳健”层级；规则分不能跨风险层升级标的。</p></div></div>
     {candidate_html}
   </section>
   <details class="archive-details steady-excluded">
-    <summary>查看未通过硬门槛的 {len(excluded)} 只持仓</summary>
+    <summary>查看深度评估后未通过硬门槛的 {len(excluded)} 只标的</summary>
     <div class="details-body steady-list">{excluded_html}</div>
   </details>
   <section class="panel">
     <h2>判定边界</h2>
     <ul>
-      <li>仅评估当前持仓中的沪深北 A 股股票；LOF/ETF 与场外基金不参与。</li>
+      <li>股票池覆盖全部沪深 A 股，不读取当前持仓作为候选范围；北交所、B 股、LOF/ETF 与场外基金不参与。</li>
+      <li>全市场基础预筛覆盖每只股票；深度评估只处理预筛排名靠前的有限候选，并公开各阶段数量。</li>
       <li>风险硬门槛优先，规则分仅在同一风险层内排序。</li>
       <li>股息率按 TTM 税前现金分红与最近有效收盘价计算。</li>
       <li>历史回放使用前复权行情；不预测未来分红，不承诺收益。</li>
@@ -2457,9 +2463,9 @@ def _reports_index_block(pages: list[ReportPage]) -> str:
     )
     items.append(
         '<a class="report-card" href="steady_income.html">'
-        '<span class="report-card-kicker">低风险现金流</span>'
+        '<span class="report-card-kicker">沪深全市场 · 低风险现金流</span>'
         '<strong class="report-card-title">稳健收益</strong>'
-        '<span class="report-card-action">查看风险优先筛选 →</span></a>'
+        '<span class="report-card-action">查看全市场风险优先筛选 →</span></a>'
     )
     return (
         '<section class="dashboard-section">'
@@ -2506,7 +2512,7 @@ def _build_index(snapshot: dict, pages: list[ReportPage], account_pages: list[Ac
 <header class="hero home-hero">
   <span class="hero-kicker">每日自动更新</span>
   <h1>每日持仓复盘</h1>
-  <p class="hero-copy">从账户视角查看 A 股逐项分析、基金组合复盘、历史建议命中率与低风险稳健收益筛选。</p>
+  <p class="hero-copy">查看持仓逐项分析、基金组合复盘、历史建议命中率，以及独立于当前持仓的沪深全市场稳健收益筛选。</p>
   <div class="meta-row">
     <span>生成时间：{escape(generated_at)}</span>
     <span>数据来源：{source_line}</span>
@@ -2540,8 +2546,20 @@ def build_pages() -> list[Path]:
         _build_steady_income_page(steady_income_data),
         encoding="utf-8",
     )
+    public_data_dir = SITE_DIR / "data"
+    public_data_dir.mkdir(parents=True, exist_ok=True)
+    steady_income_public_data_path = public_data_dir / "steady_income.json"
+    steady_income_public_data_path.write_text(
+        json.dumps(steady_income_data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
-    generated_files = [SITE_DIR / ".nojekyll", index_path, steady_income_page_path]
+    generated_files = [
+        SITE_DIR / ".nojekyll",
+        index_path,
+        steady_income_page_path,
+        steady_income_public_data_path,
+    ]
     generated_files.extend(page.output for page in report_pages)
     generated_files.extend(page.output for page in account_pages)
 

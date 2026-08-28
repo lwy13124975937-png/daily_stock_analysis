@@ -312,8 +312,25 @@ class HoldingReportWorkflowTests(unittest.TestCase):
             steady_data_path.write_text(
                 json.dumps(
                     {
+                        "schema_version": 2,
                         "generated_at": "2099-01-10T18:00:00+08:00",
                         "as_of": "2099-01-10",
+                        "source": "test whole-market source",
+                        "universe": {
+                            "market": "沪深A股",
+                            "count": 5200,
+                            "source": "test:stock-index",
+                            "complete": True,
+                        },
+                        "screening_stats": {
+                            "universe_count": 5200,
+                            "annual_plan_count": 3600,
+                            "prefilter_eligible_count": 20,
+                            "deep_selected_count": 2,
+                            "deep_evaluated_count": 2,
+                            "qualified_count": 0,
+                            "data_insufficient_count": 2,
+                        },
                         "evaluated_count": 2,
                         "qualified_count": 0,
                         "candidates": [],
@@ -321,13 +338,18 @@ class HoldingReportWorkflowTests(unittest.TestCase):
                             {
                                 "code": code,
                                 "name": name,
-                                "accounts": ["账户甲"],
+                                "market": "深市",
                                 "risk_tier": "数据不足",
                                 "qualified": False,
                                 "risks": ["公开数据不足，未纳入低风险候选"],
                             }
-                            for code, name in (("111111", "测试股票甲"), ("222222", "测试股票乙"))
+                            for code, name in (("600001", "全市场测试甲"), ("000002", "全市场测试乙"))
                         ],
+                        "methodology": {
+                            "priority": "风险硬门槛优先，规则分仅在同一风险层内排序",
+                            "scope": "覆盖全部沪深 A 股；全市场先预筛，再做深度风险评估",
+                            "limitations": "不预测未来分红，不承诺收益",
+                        },
                     },
                     ensure_ascii=False,
                 ),

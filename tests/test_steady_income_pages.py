@@ -14,7 +14,10 @@ import pandas as pd
 from scripts import build_pages_report
 from scripts import check_report_html
 from scripts.build_steady_income_report import (
+    PublicMarketSource,
     SteadyIncomeDatasetBuilder,
+    _is_sh_sz_a_share,
+    _prefilter_market,
     build_steady_income_dataset,
 )
 
@@ -49,28 +52,81 @@ def _context() -> dict:
     }
 
 
-def _snapshot() -> dict:
-    return {
-        "generated_at": "2026-08-26 20:00:00",
-        "accounts": {
-            "动态股票账户": {
-                "stock": [
-                    {"account": "动态股票账户", "type": "stock", "name": "测试银行", "code": "600001"}
-                ],
-                "lof": [
-                    {"account": "动态股票账户", "type": "lof", "name": "测试LOF", "code": "160001"}
-                ],
-                "otc": [],
+def _universe() -> list[dict[str, str]]:
+    return [
+        {"code": "600001", "name": "测试银行", "market": "沪市"},
+        {"code": "000002", "name": "测试公用", "market": "深市"},
+        {"code": "300003", "name": "测试成长", "market": "深市"},
+    ]
+
+
+def _plans() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "代码": "600001",
+                "名称": "测试银行",
+                "现金分红-现金分红比例": 20.0,
+                "现金分红-股息率": 0.04,
+                "每股收益": 4.0,
+                "方案进度": "实施分配",
+                "最新公告日期": "2026-06-01",
             },
-            "动态基金账户": {
-                "stock": [],
-                "lof": [],
-                "otc": [
-                    {"account": "动态基金账户", "type": "otc", "name": "测试基金", "code": "012345"}
-                ],
+            {
+                "代码": "000002",
+                "名称": "测试公用",
+                "现金分红-现金分红比例": 10.0,
+                "现金分红-股息率": 0.035,
+                "每股收益": 2.0,
+                "方案进度": "实施分配",
+                "最新公告日期": "2026-06-02",
             },
-        },
-    }
+            {
+                "代码": "300003",
+                "名称": "测试成长",
+                "现金分红-现金分红比例": 0.0,
+                "现金分红-股息率": 0.0,
+                "每股收益": 1.0,
+                "方案进度": "不分配",
+                "最新公告日期": "2026-06-03",
+            },
+            {
+                "代码": "430001",
+                "名称": "北交测试",
+                "现金分红-现金分红比例": 30.0,
+                "现金分红-股息率": 0.05,
+                "每股收益": 5.0,
+                "方案进度": "实施分配",
+                "最新公告日期": "2026-06-04",
+            },
+        ]
+    )
+
+
+def _dividend_history() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"代码": "600001", "上市日期": "2000-01-01", "分红次数": 20},
+            {"代码": "000002", "上市日期": "2001-01-01", "分红次数": 18},
+            {"代码": "300003", "上市日期": "2012-01-01", "分红次数": 2},
+            {"代码": "430001", "上市日期": "2010-01-01", "分红次数": 20},
+        ]
+    )
+
+
+class FakeMarketSource:
+    def __init__(self) -> None:
+        self.fiscal_years: list[int] = []
+
+    def load_universe(self):
+        return _universe(), "mock:whole-sh-sz-market"
+
+    def load_dividend_plans(self, fiscal_year: int):
+        self.fiscal_years.append(fiscal_year)
+        return _plans()
+
+    def load_dividend_history(self):
+        return _dividend_history()
 
 
 class FakeDataManager:
@@ -93,82 +149,106 @@ class FakeDataManager:
 
 
 class SteadyIncomePagesTests(unittest.TestCase):
-    def test_dataset_uses_only_current_stock_holdings(self) -> None:
+    def test_bundled_universe_source_does_not_publish_an_absolute_path(self) -> None:
+        index_path = Path(__file__).resolve().parents[1] / "apps" / "dsa-web" / "public" / "stocks.index.json"
+        source = PublicMarketSource(stock_index_path=index_path)
+
+        with patch("scripts.build_steady_income_report.requests.get", side_effect=RuntimeError("offline")):
+            universe, source_label = source.load_universe()
+
+        self.assertGreaterEqual(len(universe), 3000)
+        self.assertEqual(source_label, "bundled:stocks.index.json")
+        self.assertNotIn(str(index_path.parent), source_label)
+
+    def test_market_code_filter_accepts_only_shanghai_and_shenzhen_a_shares(self) -> None:
+        self.assertTrue(_is_sh_sz_a_share("600001", "600001.SH"))
+        self.assertTrue(_is_sh_sz_a_share("000002", "000002.SZ"))
+        self.assertTrue(_is_sh_sz_a_share("300003", "300003.SZ"))
+        self.assertFalse(_is_sh_sz_a_share("430001", "430001.BJ"))
+        self.assertFalse(_is_sh_sz_a_share("900901", "900901.SH"))
+        self.assertFalse(_is_sh_sz_a_share("200002", "200002.SZ"))
+
+    def test_whole_market_prefilter_is_independent_from_holdings(self) -> None:
+        seeds, stats = _prefilter_market(
+            _universe(),
+            _plans(),
+            _dividend_history(),
+            as_of=date(2026, 8, 26),
+        )
+
+        self.assertEqual(stats["universe_count"], 3)
+        self.assertEqual(stats["prefilter_eligible_count"], 2)
+        self.assertEqual({item["code"] for item in seeds}, {"600001", "000002"})
+        self.assertNotIn("300003", {item["code"] for item in seeds})
+        self.assertNotIn("430001", {item["code"] for item in seeds})
+
+    def test_dataset_evaluates_whole_market_seeds_not_current_holdings(self) -> None:
         manager = FakeDataManager()
-        payload = SteadyIncomeDatasetBuilder(data_manager=manager).build(
-            _snapshot(), as_of=date(2026, 8, 26)
+        source = FakeMarketSource()
+        payload = SteadyIncomeDatasetBuilder(data_manager=manager, market_source=source).build(
+            as_of=date(2026, 8, 26)
         )
 
-        self.assertEqual(manager.fundamental_codes, ["600001"])
-        self.assertEqual(manager.history_codes, ["600001"])
-        self.assertEqual(payload["evaluated_count"], 1)
-        self.assertEqual(payload["qualified_count"], 1)
-        self.assertEqual(payload["candidates"][0]["name"], "测试银行")
-        serialized = json.dumps(payload, ensure_ascii=False)
-        self.assertNotIn("160001", serialized)
-        self.assertNotIn("012345", serialized)
-        self.assertNotIn("LLM", serialized.upper())
-        keys: set[str] = set()
-
-        def collect_keys(value: object) -> None:
-            if isinstance(value, dict):
-                keys.update(str(key) for key in value)
-                for child in value.values():
-                    collect_keys(child)
-            elif isinstance(value, list):
-                for child in value:
-                    collect_keys(child)
-
-        collect_keys(payload)
-        self.assertTrue(
-            keys.isdisjoint({"unit_cost", "shares", "cost", "market_value", "profit", "amount", "total"})
-        )
+        self.assertEqual(set(manager.fundamental_codes), {"600001", "000002"})
+        self.assertEqual(set(manager.history_codes), {"600001", "000002"})
+        self.assertEqual(source.fiscal_years, [2025])
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["universe"]["market"], "沪深A股")
+        self.assertIn("覆盖全部沪深 A 股", payload["methodology"]["scope"])
+        self.assertNotIn("当前持仓", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(payload["evaluated_count"], 2)
+        self.assertEqual(payload["qualified_count"], 2)
 
     def test_data_failure_never_becomes_low_risk_candidate(self) -> None:
-        payload = SteadyIncomeDatasetBuilder(data_manager=FakeDataManager(fail=True)).build(
-            _snapshot(), as_of=date(2026, 8, 26)
-        )
+        payload = SteadyIncomeDatasetBuilder(
+            data_manager=FakeDataManager(fail=True),
+            market_source=FakeMarketSource(),
+        ).build(as_of=date(2026, 8, 26))
 
         self.assertEqual(payload["qualified_count"], 0)
-        self.assertEqual(payload["excluded"][0]["risk_tier"], "数据不足")
-        self.assertFalse(payload["excluded"][0]["qualified"])
+        self.assertTrue(all(item["risk_tier"] == "数据不足" for item in payload["excluded"]))
+        self.assertTrue(all(not item["qualified"] for item in payload["excluded"]))
 
     def test_dataset_file_and_static_page_are_public_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            snapshot_path = root / "holdings_snapshot.json"
-            output_path = root / "steady_income.json"
-            snapshot_path.write_text(json.dumps(_snapshot(), ensure_ascii=False), encoding="utf-8")
-
+            output_path = Path(temp_dir) / "steady_income.json"
             payload = build_steady_income_dataset(
-                snapshot_path=snapshot_path,
                 output_path=output_path,
                 data_manager=FakeDataManager(),
+                market_source=FakeMarketSource(),
                 as_of=date(2026, 8, 26),
             )
             html = build_pages_report._build_steady_income_page(payload)
 
             self.assertTrue(output_path.exists())
             self.assertIn("测试银行（600001）", html)
+            self.assertIn("沪深全市场", html)
             self.assertIn("风险硬门槛优先", html)
             self.assertIn("不承诺收益", html)
-            self.assertNotIn("测试LOF", html)
-            self.assertNotIn("测试基金", html)
+            self.assertNotIn("当前 A 股持仓", html)
+            self.assertNotIn("账户：", html)
             for forbidden in ("unit_cost", "shares", "market_value", "持仓成本", "持仓市值", "盈亏"):
                 self.assertNotIn(forbidden, html)
 
-    def test_homepage_report_center_contains_steady_income_entry(self) -> None:
+            serialized = json.dumps(payload, ensure_ascii=False)
+            for forbidden in ("account", "unit_cost", "shares", "cost", "market_value", "profit", "amount", "total"):
+                self.assertNotIn(f'"{forbidden}"', serialized)
+
+    def test_homepage_report_center_contains_whole_market_entry(self) -> None:
         html = build_pages_report._reports_index_block([])
 
         self.assertIn('href="steady_income.html"', html)
         self.assertIn("稳健收益", html)
-        self.assertIn("低风险现金流", html)
+        self.assertIn("沪深全市场", html)
 
-    def test_html_contract_requires_exact_stock_coverage_and_risk_gate(self) -> None:
-        manager = FakeDataManager()
-        payload = SteadyIncomeDatasetBuilder(data_manager=manager).build(
-            _snapshot(), as_of=date(2026, 8, 26)
-        )
+    def test_html_contract_requires_whole_market_funnel_and_risk_gate(self) -> None:
+        payload = SteadyIncomeDatasetBuilder(
+            data_manager=FakeDataManager(),
+            market_source=FakeMarketSource(),
+        ).build(as_of=date(2026, 8, 26))
+        payload["universe"]["count"] = 5200
+        payload["universe"]["complete"] = True
+        payload["screening_stats"]["universe_count"] = 5200
         html = build_pages_report._build_steady_income_page(payload)
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -177,15 +257,12 @@ class SteadyIncomePagesTests(unittest.TestCase):
             site = root / "site"
             site_data.mkdir()
             site.mkdir()
-            snapshot_path = site_data / "holdings_snapshot.json"
             data_path = site_data / "steady_income.json"
             page_path = site / "steady_income.html"
-            snapshot_path.write_text(json.dumps(_snapshot(), ensure_ascii=False), encoding="utf-8")
             data_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             page_path.write_text(html, encoding="utf-8")
 
             with (
-                patch.object(check_report_html, "HOLDINGS_SNAPSHOT_PATH", snapshot_path),
                 patch.object(check_report_html, "STEADY_INCOME_DATA_PATH", data_path),
                 patch.object(check_report_html, "STEADY_INCOME_PAGE_PATH", page_path),
             ):
@@ -203,6 +280,16 @@ class SteadyIncomePagesTests(unittest.TestCase):
                     '<a href="steady_income.html">稳健收益</a>',
                 )
                 self.assertTrue(any("bypasses the low-risk tier gate" in error for error in errors))
+
+                errors.clear()
+                payload["candidates"][0]["risk_tier"] = "稳健"
+                payload["candidates"][0]["code"] = "430001"
+                data_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                check_report_html._check_steady_income_contract(
+                    errors,
+                    '<a href="steady_income.html">稳健收益</a>',
+                )
+                self.assertTrue(any("malformed stock results" in error for error in errors))
 
     def test_daily_workflow_builds_dataset_before_pages(self) -> None:
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "00-daily-analysis.yml").read_text(

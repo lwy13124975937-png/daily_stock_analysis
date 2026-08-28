@@ -166,16 +166,16 @@ const SteadyIncomePage = () => {
   }, []);
 
   useEffect(() => {
-    document.title = '稳健收益 - DSA';
+    document.title = '持仓稳健性 - DSA';
     void load();
   }, [load]);
 
   return (
     <AppPage className="max-w-6xl space-y-5 pb-12 pt-6">
       <PageHeader
-        eyebrow="LOW-RISK INCOME"
-        title="稳健收益"
-        description="先守住回撤和现金流底线，再比较股息、分红持续性与长期总回报。"
+        eyebrow="PORTFOLIO STABILITY"
+        title="持仓稳健性"
+        description="只检查当前 A 股持仓的回撤、现金流、股息与分红持续性；沪深全市场候选请查看公开稳健收益页面。"
         actions={(
           <Button variant="secondary" onClick={() => void load(true)} isLoading={refreshing} loadingText="重新评估中">
             <RefreshCw className="h-4 w-4" />
