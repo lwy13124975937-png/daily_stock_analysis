@@ -163,6 +163,33 @@ class PublicMarketSource:
             label="historical dividend summary",
         )
 
+    def load_deep_context(self, code: str, as_of: date) -> tuple[dict[str, Any], list[str]]:
+        """Load only the financial and dividend evidence required by the risk gate."""
+        import akshare as ak
+
+        notes: list[str] = []
+        financial = pd.DataFrame()
+        dividends = pd.DataFrame()
+        try:
+            financial = _call_with_retry(
+                lambda: ak.stock_financial_abstract(symbol=code),
+                attempts=2,
+                label=f"{code} financial abstract",
+            )
+            notes.append("财务证据来源：AkShare 财务摘要")
+        except Exception as exc:  # noqa: BLE001 - missing evidence must stay fail-closed.
+            notes.append(f"财务证据不可用：{type(exc).__name__}")
+        try:
+            dividends = _call_with_retry(
+                lambda: ak.stock_history_dividend_detail(symbol=code, indicator="分红", date=""),
+                attempts=2,
+                label=f"{code} dividend history",
+            )
+            notes.append("分红证据来源：AkShare 历史分红")
+        except Exception as exc:  # noqa: BLE001 - missing evidence must stay fail-closed.
+            notes.append(f"分红证据不可用：{type(exc).__name__}")
+        return _build_deep_context(financial, dividends, as_of=as_of), notes
+
 
 def _date_from_any(value: Any) -> date | None:
     if value is None or (isinstance(value, float) and math.isnan(value)):
@@ -177,6 +204,112 @@ def _date_from_any(value: Any) -> date | None:
     if pd.isna(stamp):
         return None
     return stamp.date()
+
+
+def _indicator_value(frame: pd.DataFrame, indicator_names: tuple[str, ...], column: str) -> float | None:
+    if "指标" not in frame.columns or column not in frame.columns:
+        return None
+    names = frame["指标"].astype(str).str.strip()
+    for indicator in indicator_names:
+        matches = frame.loc[names == indicator, column]
+        for value in matches:
+            number = _safe_float(value)
+            if number is not None:
+                return number
+    return None
+
+
+def _financial_evidence(frame: Any, *, as_of: date) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Normalize AkShare's indicator-by-report-date financial abstract."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty or "指标" not in frame.columns:
+        return {}, {}
+    report_columns: list[tuple[date, str]] = []
+    for column in frame.columns:
+        text = str(column).strip()
+        if not re.fullmatch(r"\d{8}", text):
+            continue
+        report_date = _date_from_any(text)
+        if report_date is not None and report_date <= as_of:
+            report_columns.append((report_date, str(column)))
+    report_columns.sort(reverse=True)
+
+    for report_date, column in report_columns:
+        net_profit = _indicator_value(frame, ("归母净利润", "归属母公司股东净利润"), column)
+        operating_cash_flow = _indicator_value(
+            frame,
+            ("经营现金流量净额", "经营活动产生的现金流量净额"),
+            column,
+        )
+        if net_profit is None or operating_cash_flow is None:
+            continue
+        roe = _indicator_value(frame, ("净资产收益率(ROE)", "净资产收益率_ROE"), column)
+        return (
+            {"roe": roe} if roe is not None else {},
+            {
+                "report_date": report_date.isoformat(),
+                "net_profit_parent": net_profit,
+                "operating_cash_flow": operating_cash_flow,
+                "roe": roe,
+            },
+        )
+    return {}, {}
+
+
+def _dividend_evidence(frame: Any, *, as_of: date) -> dict[str, Any]:
+    """Normalize implemented cash dividends; AkShare's `派息` is per ten shares."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty or "派息" not in frame.columns:
+        return {}
+    events_by_key: dict[tuple[str, float], dict[str, Any]] = {}
+    for _, row in frame.iterrows():
+        progress = str(row.get("进度") or "").strip()
+        if progress and "实施" not in progress:
+            continue
+        event_date = _date_from_any(row.get("除权除息日")) or _date_from_any(row.get("公告日期"))
+        per_ten = _safe_float(row.get("派息"))
+        if event_date is None or event_date > as_of or per_ten is None or per_ten <= 0:
+            continue
+        per_share = per_ten / 10.0
+        key = (event_date.isoformat(), round(per_share, 6))
+        events_by_key[key] = {
+            "event_date": event_date.isoformat(),
+            "ex_dividend_date": event_date.isoformat(),
+            "cash_dividend_per_share": round(per_share, 6),
+            "is_pre_tax": True,
+        }
+    events = sorted(events_by_key.values(), key=lambda item: item["event_date"], reverse=True)
+    if not events:
+        return {}
+    ttm_start = as_of - timedelta(days=365)
+    ttm_events = [
+        item
+        for item in events
+        if ttm_start <= date.fromisoformat(item["event_date"]) <= as_of
+    ]
+    return {
+        "events": events,
+        "ttm_event_count": len(ttm_events),
+        "ttm_cash_dividend_per_share": (
+            round(sum(float(item["cash_dividend_per_share"]) for item in ttm_events), 6)
+            if ttm_events
+            else None
+        ),
+        "coverage": "implemented_cash_dividend_pre_tax",
+        "as_of": as_of.isoformat(),
+    }
+
+
+def _build_deep_context(financial: Any, dividends: Any, *, as_of: date) -> dict[str, Any]:
+    growth, financial_report = _financial_evidence(financial, as_of=as_of)
+    dividend = _dividend_evidence(dividends, as_of=as_of)
+    earnings: dict[str, Any] = {}
+    if financial_report:
+        earnings["financial_report"] = financial_report
+    if dividend:
+        earnings["dividend"] = dividend
+    return {
+        "growth": {"data": growth},
+        "earnings": {"data": earnings},
+    }
 
 
 def _yield_quality_score(yield_pct: float) -> float:
@@ -350,9 +483,11 @@ class SteadyIncomeDatasetBuilder:
         notes: list[str] = []
 
         try:
-            context = manager.get_fundamental_context(code, budget_seconds=8.0)
+            loader = getattr(self.market_source, "load_deep_context")
+            context, evidence_notes = loader(code, as_of)
+            notes.extend(str(note) for note in evidence_notes if note)
         except Exception as exc:
-            notes.append(f"基本面数据不可用：{type(exc).__name__}")
+            notes.append(f"稳健收益证据不可用：{type(exc).__name__}")
 
         try:
             history, provider = manager.get_daily_data(

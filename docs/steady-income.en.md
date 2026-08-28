@@ -9,7 +9,7 @@ Hard risk gates come first. Dividend yield and stability scores only rank stocks
 ## Inputs and outputs
 
 - Scope: all active Shanghai/Shenzhen A-share equities in the public stock index. Beijing, HK, US, B-share, index, bond, ETF, LOF, and other fund instruments are excluded.
-- Two-stage screen: every stock receives a bulk dividend, profitability, listing-age, and ST-risk pre-screen; only the strongest finite seed set receives the slower long-history, cash-flow, and dividend-detail review.
+- Two-stage screen: every stock receives a bulk dividend, profitability, listing-age, and ST-risk pre-screen; only the strongest finite seed set receives long price history plus normalized financial abstracts and implemented dividend records.
 - Income: trailing-12-month pre-tax cash dividend per share and dividend yield.
 - Sustainability: consecutive dividend years, parent net profit, operating cash flow, and cash-flow coverage.
 - Risk: annualized volatility and maximum drawdown from roughly seven years of daily data.
@@ -33,7 +33,7 @@ The displayed score is only a within-tier rules score. It is not an expected ret
 
 The authenticated Web app keeps its existing current-portfolio evaluator under the explicit label `持仓稳健性` (Portfolio Stability), so it is no longer confused with the market-wide Pages screen.
 
-The daily workflow runs `scripts/build_steady_income_report.py` against the public Shanghai/Shenzhen stock index and bulk dividend tables. It applies the market-wide pre-screen, reuses the same hard risk gates for deep evaluation, writes `site_data/steady_income.json`, and makes no LLM calls. The Pages guard blocks deployment when the universe is implausibly small, funnel counts disagree, or the page regresses to a current-holdings scope.
+The daily workflow runs `scripts/build_steady_income_report.py` against the public Shanghai/Shenzhen stock index and bulk dividend tables. It applies the market-wide pre-screen, fetches financial abstracts, implemented dividend details, and long price history only for the bounded deep-review seeds, reuses the same hard risk gates, writes `site_data/steady_income.json`, and makes no LLM calls. The Pages guard blocks deployment when the universe is implausibly small, funnel counts disagree, or the page regresses to a current-holdings scope.
 
 Reverting the Pages builder, market dataset script, HTML guard, workflow step, tests, and these docs removes the public market screen without affecting the existing analysis, portfolio, backtest, alert, or LLM pipelines.
 

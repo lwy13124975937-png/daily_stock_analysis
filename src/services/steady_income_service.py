@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Rule-based low-risk, steady-income evaluation for current A-share holdings.
+"""Rule-based low-risk steady-income evaluation and current-holdings service.
 
 The module deliberately avoids LLM calls.  It ranks only inside hard risk
 tiers so an attractive dividend yield cannot hide weak cash flow or excessive
@@ -108,20 +108,29 @@ def _consecutive_dividend_years(events: Iterable[Dict[str, Any]], as_of: date) -
 
 
 def _normalize_history(frame: Any) -> pd.DataFrame:
+    empty_history = pd.DataFrame(
+        {
+            "date": pd.Series(dtype="datetime64[ns]"),
+            "close": pd.Series(dtype="float64"),
+        }
+    )
     if not isinstance(frame, pd.DataFrame) or frame.empty:
-        return pd.DataFrame(columns=["date", "close"])
+        return empty_history
     if "date" not in frame.columns or "close" not in frame.columns:
-        return pd.DataFrame(columns=["date", "close"])
+        return empty_history
     work = frame[["date", "close"]].copy()
     work["date"] = pd.to_datetime(work["date"], errors="coerce")
     work["close"] = pd.to_numeric(work["close"], errors="coerce")
-    return (
+    normalized = (
         work.dropna(subset=["date", "close"])
         .loc[lambda item: item["close"] > 0]
         .sort_values("date")
         .drop_duplicates(subset=["date"], keep="last")
         .reset_index(drop=True)
     )
+    if normalized.empty:
+        return empty_history
+    return normalized
 
 
 def _history_metrics(frame: Any, as_of: date) -> Dict[str, Any]:

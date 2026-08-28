@@ -16,6 +16,9 @@ from scripts import check_report_html
 from scripts.build_steady_income_report import (
     PublicMarketSource,
     SteadyIncomeDatasetBuilder,
+    _build_deep_context,
+    _dividend_evidence,
+    _financial_evidence,
     _is_sh_sz_a_share,
     _prefilter_market,
     build_steady_income_dataset,
@@ -114,9 +117,34 @@ def _dividend_history() -> pd.DataFrame:
     )
 
 
+def _financial_abstract() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"选项": "常用指标", "指标": "归母净利润", "20260630": 100.0, "20251231": 180.0},
+            {"选项": "常用指标", "指标": "经营现金流量净额", "20260630": 135.0, "20251231": 220.0},
+            {"选项": "常用指标", "指标": "净资产收益率(ROE)", "20260630": 13.0, "20251231": 16.0},
+        ]
+    )
+
+
+def _dividend_detail() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "公告日期": f"{year}-06-10",
+                "派息": 24.0,
+                "进度": "实施",
+                "除权除息日": f"{year}-06-20",
+            }
+            for year in range(2022, 2027)
+        ]
+    )
+
+
 class FakeMarketSource:
     def __init__(self) -> None:
         self.fiscal_years: list[int] = []
+        self.deep_codes: list[str] = []
 
     def load_universe(self):
         return _universe(), "mock:whole-sh-sz-market"
@@ -127,6 +155,10 @@ class FakeMarketSource:
 
     def load_dividend_history(self):
         return _dividend_history()
+
+    def load_deep_context(self, code: str, as_of: date):
+        self.deep_codes.append(code)
+        return _build_deep_context(_financial_abstract(), _dividend_detail(), as_of=as_of), ["mock evidence"]
 
 
 class FakeDataManager:
@@ -182,6 +214,35 @@ class SteadyIncomePagesTests(unittest.TestCase):
         self.assertNotIn("300003", {item["code"] for item in seeds})
         self.assertNotIn("430001", {item["code"] for item in seeds})
 
+    def test_deep_evidence_parses_indicator_layout_and_per_ten_dividends(self) -> None:
+        growth, report = _financial_evidence(_financial_abstract(), as_of=date(2026, 8, 26))
+        dividend = _dividend_evidence(_dividend_detail(), as_of=date(2026, 8, 26))
+
+        self.assertEqual(report["report_date"], "2026-06-30")
+        self.assertEqual(report["net_profit_parent"], 100.0)
+        self.assertEqual(report["operating_cash_flow"], 135.0)
+        self.assertEqual(growth["roe"], 13.0)
+        self.assertEqual(dividend["ttm_cash_dividend_per_share"], 2.4)
+        self.assertEqual(len(dividend["events"]), 5)
+        self.assertEqual(dividend["events"][0]["cash_dividend_per_share"], 2.4)
+
+    def test_deep_evidence_never_uses_future_reports_or_unimplemented_dividends(self) -> None:
+        financial = _financial_abstract().copy()
+        financial["20261231"] = [999.0, 999.0, 99.0]
+        dividends = _dividend_detail().copy()
+        dividends.loc[len(dividends)] = {
+            "公告日期": "2026-08-20",
+            "派息": 100.0,
+            "进度": "预案",
+            "除权除息日": "2026-09-20",
+        }
+
+        _growth, report = _financial_evidence(financial, as_of=date(2026, 8, 26))
+        dividend = _dividend_evidence(dividends, as_of=date(2026, 8, 26))
+
+        self.assertEqual(report["net_profit_parent"], 100.0)
+        self.assertEqual(dividend["ttm_cash_dividend_per_share"], 2.4)
+
     def test_dataset_evaluates_whole_market_seeds_not_current_holdings(self) -> None:
         manager = FakeDataManager()
         source = FakeMarketSource()
@@ -189,8 +250,9 @@ class SteadyIncomePagesTests(unittest.TestCase):
             as_of=date(2026, 8, 26)
         )
 
-        self.assertEqual(set(manager.fundamental_codes), {"600001", "000002"})
+        self.assertEqual(manager.fundamental_codes, [])
         self.assertEqual(set(manager.history_codes), {"600001", "000002"})
+        self.assertEqual(set(source.deep_codes), {"600001", "000002"})
         self.assertEqual(source.fiscal_years, [2025])
         self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["universe"]["market"], "沪深A股")

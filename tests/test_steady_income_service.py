@@ -147,6 +147,20 @@ class SteadyIncomeServiceTests(unittest.TestCase):
         self.assertEqual(result["risk_tier"], "数据不足")
         self.assertTrue(any("三年以上完整年度行情" in item for item in result["risks"]))
 
+    def test_empty_typed_history_is_data_insufficient_instead_of_crashing(self) -> None:
+        result = evaluate_steady_income_candidate(
+            code="600003",
+            current_price=None,
+            price_date=None,
+            context=_context(),
+            history=pd.DataFrame(columns=["date", "close"]),
+            as_of=date(2026, 8, 26),
+        )
+
+        self.assertEqual(result["risk_tier"], "数据不足")
+        self.assertFalse(result["qualified"])
+        self.assertTrue(any("长期行情" in item for item in result["risks"]))
+
     def test_future_and_zero_cash_events_do_not_extend_dividend_streak(self) -> None:
         context = _context()
         context["earnings"]["data"]["dividend"]["events"] = [
