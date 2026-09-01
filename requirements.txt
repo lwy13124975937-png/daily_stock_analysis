@@ -7,15 +7,15 @@ python-dotenv>=1.0.0        # Environment variable configuration
 tenacity>=8.2.0             # Retry support with exponential backoff
 sqlalchemy>=2.0.0           # ORM database access
 schedule>=1.2.0             # Scheduled task runner
-exchange-calendars>=4.13.0   # Trading calendars; 4.5.x is incompatible with pandas 3 Timedelta "T"
+exchange-calendars==4.13.0   # Trading calendars; 4.5.x is incompatible with pandas 3 Timedelta "T"
 
 # Data source dependencies, ordered by fallback priority
 efinance>=0.5.5             # Priority 0: East Money data source https://github.com/Micro-sheep/efinance
-akshare>=1.12.0             # Priority 1: East Money crawler data source
+akshare==1.18.64            # Priority 1: pinned because report/dividend field contracts are fixture-tested
 tushare>=1.4.0              # Priority 2: Tushare Pro API
 pytdx>=1.72                 # Priority 2: Tongdaxin quote servers
 baostock>=0.8.0             # Priority 3: Baostock data
-yfinance>=0.2.0             # Priority 4: Yahoo Finance (Fallback)
+yfinance==1.7.0             # Priority 4: pinned; as-of dividend/fundamental contracts are fixture-tested
 longbridge>=0.2.77           # Priority 5: Longbridge OpenAPI fallback for US/HK stocks; OAuth capability checked at runtime
 tickflow>=0.1.0            # TickFlow official SDK (Issue #632, market review enhancement)
 # Built-in optional AlphaSift screening engine
@@ -25,7 +25,7 @@ git+https://github.com/ZhuLinsen/alphasift.git@1a0ed8c99b3615c0cb1076e6029827ffc
 lark-oapi>=1.0.0             # Feishu API
 
 # Data processing
-pandas>=2.0.0               # Data analysis
+pandas==3.0.3               # Data analysis; pinned with exchange-calendars compatibility
 pypinyin>=0.50.0            # Name-to-code resolver (pinyin matching)
 openpyxl>=3.1.0             # Excel (.xlsx) parsing for import
 numpy>=1.24.0               # Numeric computing
@@ -44,10 +44,11 @@ google-search-results>=2.4.0  # SerpAPI
 
 # Network requests
 requests>=2.31.0            # HTTP requests
-markdown2>=2.4.0            # Markdown to HTML
+markdown2==2.5.5            # Markdown to HTML; public output is sanitized by pinned nh3
+nh3==0.3.7                  # Allowlist sanitizer for all public Markdown-derived HTML
 imgkit>=1.2.0              # Markdown to image; requires wkhtmltopdf
 fake-useragent>=1.4.0       # Random User-Agent support
-httpx[socks]                # HTTP client with SOCKS proxy support; optional OpenAI dependency
+httpx[socks]==0.28.1        # HTTP client and FastAPI/Starlette test-client contract
 dingtalk-stream >= 0.24.3    # DingTalk Stream SDK
 # Database
 # SQLite is built into Python and does not need an extra package
@@ -64,6 +65,6 @@ lxml_html_clean             # Fix for lxml.html.clean ImportError in newer lxml 
 jinja2>=3.1.0               # Jinja2 template engine for report rendering
 
 # FastAPI Web framework
-fastapi>=0.109.0            # Modern Python Web framework
+fastapi==0.115.14           # Pinned with Starlette <0.47 and httpx 0.28 test-client compatibility
 uvicorn[standard]>=0.27.0   # ASGI server
 python-multipart>=0.0.6     # FastAPI File/Form upload support

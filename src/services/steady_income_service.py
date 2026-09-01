@@ -13,10 +13,27 @@ import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from src.core.session_calendar import ExchangeSessionCalendar, SessionCalendar, SessionCalendarUnavailable
+from src.services.steady_income_contracts import (
+    STEADY_INCOME_EVALUATOR_VERSION,
+    STEADY_INCOME_EVIDENCE_VERSION,
+    STEADY_INCOME_MODEL_VERSION,
+    STEADY_INCOME_PRICE_MODEL_VERSION,
+    STEADY_INCOME_RULESET_VERSION,
+    STEADY_INCOME_SCHEMA_VERSION,
+    STEADY_INCOME_SECTOR_MODEL_VERSION,
+    VERSION_FINGERPRINT,
+    SectorModel,
+    SteadyTerminalStatus,
+    public_risk_label,
+    resolve_sector_model,
+)
 
 
 RISK_TIER_ORDER = {
@@ -28,6 +45,8 @@ RISK_TIER_ORDER = {
 }
 QUALIFIED_TIERS = {"稳健", "较稳健"}
 CACHE_TTL_SECONDS = 6 * 60 * 60
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+HISTORY_YEAR_MIN_COVERAGE = 0.95
 A_SHARE_EQUITY_PREFIXES = (
     "000",
     "001",
@@ -133,16 +152,28 @@ def _normalize_history(frame: Any) -> pd.DataFrame:
     return normalized
 
 
-def _history_metrics(frame: Any, as_of: date) -> Dict[str, Any]:
+def _history_metrics(
+    frame: Any,
+    as_of: date,
+    *,
+    calendar: SessionCalendar | None = None,
+    price_adjustment: str = "unknown",
+) -> Dict[str, Any]:
+    """Compute price risk and year coverage against official sessions."""
+
     history = _normalize_history(frame)
     history = history.loc[history["date"].dt.date <= as_of].reset_index(drop=True)
+    empty_result = {
+        "annualized_volatility_pct": None,
+        "max_drawdown_pct": None,
+        "replay_periods": [],
+        "positive_replay_periods": 0,
+        "history_coverage": [],
+        "price_adjustment": price_adjustment or "unknown",
+        "calendar_status": "available",
+    }
     if len(history) < 2:
-        return {
-            "annualized_volatility_pct": None,
-            "max_drawdown_pct": None,
-            "replay_periods": [],
-            "positive_replay_periods": 0,
-        }
+        return empty_result
 
     closes = history["close"]
     returns = closes.pct_change().dropna()
@@ -152,10 +183,49 @@ def _history_metrics(frame: Any, as_of: date) -> Dict[str, Any]:
     drawdown = closes / closes.cummax() - 1.0
     max_drawdown = abs(float(drawdown.min() * 100.0)) if not drawdown.empty else None
 
+    session_calendar = calendar
+    if session_calendar is None:
+        try:
+            session_calendar = ExchangeSessionCalendar()
+        except SessionCalendarUnavailable:
+            result = dict(empty_result)
+            result.update(
+                {
+                    "annualized_volatility_pct": round(volatility, 2) if volatility is not None else None,
+                    "max_drawdown_pct": round(max_drawdown, 2) if max_drawdown is not None else None,
+                    "calendar_status": "unavailable",
+                }
+            )
+            return result
+
     complete_years = history.loc[history["date"].dt.year < as_of.year].copy()
     year_ends: List[Dict[str, Any]] = []
+    coverage_rows: List[Dict[str, Any]] = []
     for year, group in complete_years.groupby(complete_years["date"].dt.year):
-        if len(group) < 120:
+        expected = list(session_calendar.sessions_between(date(int(year), 1, 1), date(int(year), 12, 31)))
+        actual_dates = sorted(set(group["date"].dt.date))
+        actual_sessions = len(set(expected).intersection(actual_dates))
+        expected_sessions = len(expected)
+        coverage_ratio = actual_sessions / expected_sessions if expected_sessions else 0.0
+        boundary_ok = bool(
+            expected
+            and actual_dates
+            and actual_dates[0] <= expected[min(4, len(expected) - 1)]
+            and actual_dates[-1] >= expected[max(0, len(expected) - 5)]
+        )
+        complete = bool(expected_sessions and coverage_ratio >= HISTORY_YEAR_MIN_COVERAGE and boundary_ok)
+        coverage_rows.append(
+            {
+                "year": int(year),
+                "history_start": actual_dates[0].isoformat() if actual_dates else None,
+                "history_end": actual_dates[-1].isoformat() if actual_dates else None,
+                "actual_sessions": actual_sessions,
+                "expected_sessions": expected_sessions,
+                "coverage_ratio": round(coverage_ratio, 4),
+                "complete": complete,
+            }
+        )
+        if not complete:
             continue
         year_ends.append(
             {
@@ -169,13 +239,13 @@ def _history_metrics(frame: Any, as_of: date) -> Dict[str, Any]:
     for previous, current in zip(year_ends, year_ends[1:]):
         if current["year"] != previous["year"] + 1:
             continue
-        total_return = (current["close"] / previous["close"] - 1.0) * 100.0
+        period_return = (current["close"] / previous["close"] - 1.0) * 100.0
         replay_periods.append(
             {
                 "label": str(current["year"]),
                 "start_date": previous["date"].isoformat(),
                 "end_date": current["date"].isoformat(),
-                "total_return_pct": round(total_return, 2),
+                "adjusted_price_return_pct": round(period_return, 2),
             }
         )
     replay_periods = replay_periods[-5:]
@@ -183,17 +253,12 @@ def _history_metrics(frame: Any, as_of: date) -> Dict[str, Any]:
         "annualized_volatility_pct": round(volatility, 2) if volatility is not None else None,
         "max_drawdown_pct": round(max_drawdown, 2) if max_drawdown is not None else None,
         "replay_periods": replay_periods,
-        "positive_replay_periods": sum(1 for item in replay_periods if item["total_return_pct"] > 0),
-    }
-
-
-def _price_bands(ttm_cash: Optional[float]) -> Optional[Dict[str, float]]:
-    if ttm_cash is None or ttm_cash <= 0:
-        return None
-    return {
-        "high_income_price": round(ttm_cash / 0.05, 2),
-        "balanced_price": round(ttm_cash / 0.035, 2),
-        "low_income_price": round(ttm_cash / 0.025, 2),
+        "positive_replay_periods": sum(
+            1 for item in replay_periods if item["adjusted_price_return_pct"] > 0
+        ),
+        "history_coverage": coverage_rows,
+        "price_adjustment": price_adjustment or "unknown",
+        "calendar_status": "available",
     }
 
 
@@ -211,6 +276,110 @@ def _yield_score(dividend_yield: Optional[float]) -> int:
     return 3
 
 
+def _parse_iso_date(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
+
+
+def _implemented_dividend_events(events: Iterable[Dict[str, Any]], as_of: date) -> list[Dict[str, Any]]:
+    result: list[Dict[str, Any]] = []
+    selected: dict[str, Dict[str, Any]] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        status = str(event.get("implementation_status") or "").strip().lower()
+        implemented = event.get("implemented") is True or status == "implemented"
+        event_date = _parse_iso_date(event.get("ex_dividend_date") or event.get("event_date"))
+        cash = _safe_float(event.get("cash_dividend_per_share"))
+        if not implemented or event_date is None or event_date > as_of or cash is None or cash <= 0:
+            continue
+        normalized = dict(event)
+        normalized["event_date"] = event_date.isoformat()
+        normalized["ex_dividend_date"] = event_date.isoformat()
+        normalized["cash_dividend_per_share"] = cash
+        identity = event_date.isoformat()
+        previous = selected.get(identity)
+        if previous is None or str(normalized.get("announcement_date") or "") >= str(
+            previous.get("announcement_date") or ""
+        ):
+            selected[identity] = normalized
+    result.extend(selected.values())
+    return sorted(result, key=lambda item: str(item.get("event_date") or ""))
+
+
+def _financial_flows_are_comparable(financial: Dict[str, Any]) -> bool:
+    profit_period = _parse_iso_date(financial.get("net_profit_period_end"))
+    cash_period = _parse_iso_date(financial.get("operating_cash_flow_period_end"))
+    profit_unit = str(financial.get("net_profit_unit") or "").strip()
+    cash_unit = str(financial.get("operating_cash_flow_unit") or "").strip()
+    profit_basis = str(financial.get("net_profit_flow_basis") or "").strip().lower()
+    cash_basis = str(financial.get("operating_cash_flow_flow_basis") or "").strip().lower()
+    return bool(
+        profit_period
+        and cash_period
+        and profit_period == cash_period
+        and profit_unit
+        and cash_unit
+        and profit_unit == cash_unit
+        and profit_basis
+        and cash_basis
+        and profit_basis == cash_basis
+    )
+
+
+def _provider_cash_flow_coverage(financial: Dict[str, Any]) -> float | None:
+    """Return an explicit same-period ratio supplied by the financial provider.
+
+    This is deliberately separate from the raw-flow calculation.  Some public
+    provider responses expose raw amounts without a machine-verifiable unit or
+    period basis, but also expose their own dimensionless same-column ratio.
+    Using that ratio avoids guessing a currency unit or mixing flow periods.
+    """
+
+    ratio = _safe_float(financial.get("cash_flow_coverage_ratio"))
+    ratio_period = _parse_iso_date(financial.get("cash_flow_coverage_period_end"))
+    report_period = _parse_iso_date(financial.get("period_end") or financial.get("report_date"))
+    source = str(financial.get("cash_flow_coverage_source") or "").strip()
+    if ratio is None or ratio_period is None or report_period is None:
+        return None
+    if ratio_period != report_period or source != "provider_reported_same_period_ratio":
+        return None
+    return ratio
+
+
+_EVIDENCE_ISSUE_CODES = {
+    "当前价格": "missing_current_price",
+    "行情日期": "missing_price_date",
+    "行情日期晚于评估日": "future_price_date",
+    "行情日期早于最近应有交易日": "stale_price_date",
+    "TTM 股息率": "missing_ttm_dividend_yield",
+    "TTM 每股现金分红": "missing_ttm_cash_dividend",
+    "现金分红记录": "missing_implemented_dividend_history",
+    "长期行情": "missing_price_history",
+    "三年以上完整年度行情": "insufficient_history_coverage",
+    "财务报告期间": "missing_financial_period",
+    "财务披露时点证据": "missing_available_at",
+    "同期间利润/经营现金流": "missing_financial_flows",
+    "财务流量期间/口径/单位一致性": "unverifiable_financial_flow_semantics",
+    "金融行业专用监管指标": "missing_regulatory_metrics",
+    "标准行业分类": "missing_canonical_sector",
+    "交易日历": "trading_calendar_unavailable",
+}
+
+
+def _context_industry(context: Dict[str, Any]) -> str:
+    master = context.get("security_master")
+    if isinstance(master, dict) and master.get("industry"):
+        return str(master["industry"]).strip()
+    for key in ("profile", "company_profile", "basic_info"):
+        block = _block_data(context, key)
+        if block.get("industry"):
+            return str(block["industry"]).strip()
+    return ""
+
+
 def evaluate_steady_income_candidate(
     *,
     code: str,
@@ -219,31 +388,69 @@ def evaluate_steady_income_candidate(
     context: Dict[str, Any],
     history: Any,
     as_of: date,
+    sector_model: SectorModel | str | None = None,
+    mode: str = "live",
+    calendar: SessionCalendar | None = None,
+    price_adjustment: str = "unknown",
+    evaluation_moment: datetime | None = None,
 ) -> Dict[str, Any]:
-    """Evaluate one stock using transparent rules and no predictive model."""
+    """Evaluate one stock using versioned, fail-closed evidence rules."""
+
+    if mode not in {"live", "historical"}:
+        raise ValueError("mode must be 'live' or 'historical'")
 
     growth = _block_data(context, "growth")
     valuation = _block_data(context, "valuation")
     earnings = _block_data(context, "earnings")
     dividend = earnings.get("dividend") if isinstance(earnings.get("dividend"), dict) else {}
     financial = earnings.get("financial_report") if isinstance(earnings.get("financial_report"), dict) else {}
-    events = dividend.get("events") if isinstance(dividend.get("events"), list) else []
+    raw_events = dividend.get("events") if isinstance(dividend.get("events"), list) else []
+    events = _implemented_dividend_events(raw_events, as_of)
+    industry = _context_industry(context)
+    resolved_sector = SectorModel(sector_model) if sector_model else resolve_sector_model(industry)
 
-    ttm_cash = _safe_float(dividend.get("ttm_cash_dividend_per_share"))
+    ttm_start = as_of - timedelta(days=365)
+    ttm_events = [
+        event
+        for event in events
+        if ttm_start <= date.fromisoformat(str(event["event_date"])[:10]) <= as_of
+    ]
+    ttm_cash = (
+        sum(float(event["cash_dividend_per_share"]) for event in ttm_events)
+        if ttm_events
+        else None
+    )
     normalized_price = _safe_float(current_price)
     if normalized_price is not None and normalized_price <= 0:
         normalized_price = None
-    ttm_yield = _safe_float(dividend.get("ttm_dividend_yield_pct"))
+    ttm_yield = None
     if ttm_cash is not None and ttm_cash > 0 and normalized_price is not None:
         ttm_yield = ttm_cash / normalized_price * 100.0
     streak = _consecutive_dividend_years(events, as_of)
     net_profit = _safe_float(financial.get("net_profit_parent"))
     operating_cash_flow = _safe_float(financial.get("operating_cash_flow"))
-    cash_flow_coverage = None
-    if net_profit is not None and net_profit > 0 and operating_cash_flow is not None:
+    cash_flow_coverage = _provider_cash_flow_coverage(financial)
+    financial_flows_comparable = _financial_flows_are_comparable(financial)
+    if cash_flow_coverage is None and (
+        financial_flows_comparable
+        and net_profit is not None
+        and net_profit > 0
+        and operating_cash_flow is not None
+    ):
         cash_flow_coverage = operating_cash_flow / net_profit
 
-    metrics = _history_metrics(history, as_of)
+    effective_calendar = calendar
+    if effective_calendar is None:
+        try:
+            effective_calendar = ExchangeSessionCalendar()
+        except SessionCalendarUnavailable:
+            effective_calendar = None
+    metrics = _history_metrics(
+        history,
+        as_of,
+        calendar=effective_calendar,
+        price_adjustment=price_adjustment,
+    )
     volatility = metrics["annualized_volatility_pct"]
     max_drawdown = metrics["max_drawdown_pct"]
     replay_periods = metrics["replay_periods"]
@@ -253,11 +460,28 @@ def evaluate_steady_income_candidate(
     pe_ratio = _safe_float(valuation.get("pe_ratio"))
     pb_ratio = _safe_float(valuation.get("pb_ratio"))
 
-    essential_missing = []
+    essential_missing: List[str] = []
+    parsed_price_date = _parse_iso_date(price_date)
+    effective_moment = evaluation_moment or datetime.now(SHANGHAI_TZ)
+    if effective_moment.tzinfo is None:
+        raise ValueError("evaluation_moment must be timezone-aware")
+    local_evaluation_date = effective_moment.astimezone(SHANGHAI_TZ).date()
     if normalized_price is None:
         essential_missing.append("当前价格")
-    if not price_date:
+    if parsed_price_date is None:
         essential_missing.append("行情日期")
+    elif parsed_price_date > as_of:
+        essential_missing.append("行情日期晚于评估日")
+    elif effective_calendar is not None:
+        if as_of == local_evaluation_date:
+            latest_expected_session = effective_calendar.completed_session_at(effective_moment)
+        else:
+            expected_sessions = list(
+                effective_calendar.sessions_between(date(as_of.year - 1, 1, 1), as_of)
+            )
+            latest_expected_session = expected_sessions[-1] if expected_sessions else None
+        if latest_expected_session is not None and parsed_price_date < latest_expected_session:
+            essential_missing.append("行情日期早于最近应有交易日")
     if ttm_yield is None:
         essential_missing.append("TTM 股息率")
     if ttm_cash is None or ttm_cash <= 0:
@@ -268,15 +492,36 @@ def evaluate_steady_income_candidate(
         essential_missing.append("长期行情")
     if len(replay_periods) < 3:
         essential_missing.append("三年以上完整年度行情")
-    if net_profit is None or operating_cash_flow is None:
-        essential_missing.append("利润/经营现金流")
+    period_end = _parse_iso_date(financial.get("period_end") or financial.get("report_date"))
+    available_at = _parse_iso_date(financial.get("available_at") or financial.get("announced_at"))
+    if period_end is None or period_end > as_of:
+        essential_missing.append("财务报告期间")
+    if mode == "historical" and (available_at is None or available_at > as_of):
+        essential_missing.append("财务披露时点证据")
+
+    if resolved_sector == SectorModel.NORMAL_CORPORATE:
+        if net_profit is None or operating_cash_flow is None:
+            essential_missing.append("同期间利润/经营现金流")
+        elif not financial_flows_comparable and cash_flow_coverage is None:
+            essential_missing.append("财务流量期间/口径/单位一致性")
+    elif resolved_sector in {
+        SectorModel.BANK,
+        SectorModel.INSURER,
+        SectorModel.BROKER,
+        SectorModel.UNSUPPORTED_FINANCIAL,
+    }:
+        essential_missing.append("金融行业专用监管指标")
+    else:
+        essential_missing.append("标准行业分类")
+    if metrics.get("calendar_status") != "available":
+        essential_missing.append("交易日历")
 
     hard_failures: List[str] = []
     if ttm_yield is not None and ttm_yield > 10:
         hard_failures.append("TTM 股息率超过 10%，需警惕高股息陷阱")
-    if net_profit is not None and net_profit <= 0:
+    if resolved_sector == SectorModel.NORMAL_CORPORATE and net_profit is not None and net_profit <= 0:
         hard_failures.append("最新归母净利润非正")
-    if operating_cash_flow is not None and operating_cash_flow <= 0:
+    if resolved_sector == SectorModel.NORMAL_CORPORATE and operating_cash_flow is not None and operating_cash_flow <= 0:
         hard_failures.append("最新经营现金流非正")
     if max_drawdown is not None and max_drawdown > 50:
         hard_failures.append("近年最大回撤超过 50%")
@@ -286,9 +531,9 @@ def evaluate_steady_income_candidate(
         hard_failures.append("近 12 个月没有可验证现金分红")
 
     sustainability = "偏弱"
-    if streak >= 4 and cash_flow_coverage is not None and cash_flow_coverage >= 1.0:
+    if resolved_sector == SectorModel.NORMAL_CORPORATE and streak >= 4 and cash_flow_coverage is not None and cash_flow_coverage >= 1.0:
         sustainability = "较强"
-    elif streak >= 3 and cash_flow_coverage is not None and cash_flow_coverage >= 0.8:
+    elif resolved_sector == SectorModel.NORMAL_CORPORATE and streak >= 3 and cash_flow_coverage is not None and cash_flow_coverage >= 0.8:
         sustainability = "中等"
 
     risk_tier = "观察"
@@ -339,10 +584,10 @@ def evaluate_steady_income_candidate(
         strengths.append(f"TTM 税前股息率 {ttm_yield:.2f}%")
     if streak:
         strengths.append(f"可验证连续分红 {streak} 年")
-    if cash_flow_coverage is not None:
+    if resolved_sector == SectorModel.NORMAL_CORPORATE and cash_flow_coverage is not None:
         strengths.append(f"经营现金流/归母净利润 {cash_flow_coverage:.2f} 倍")
     if replay_periods:
-        strengths.append(f"最近 {len(replay_periods)} 个完整年度中 {positive_periods} 个复权总回报为正")
+        strengths.append(f"最近 {len(replay_periods)} 个完整年度中 {positive_periods} 个历史复权价格阶段为正")
 
     risks = list(hard_failures)
     if essential_missing:
@@ -356,11 +601,95 @@ def evaluate_steady_income_candidate(
     if max_drawdown is not None and max_drawdown > 38:
         risks.append(f"近年最大回撤 {max_drawdown:.1f}%")
 
+    qualified = risk_tier in QUALIFIED_TIERS
+    ranking_score = min(int(round(score)), 100) if qualified else None
+    if resolved_sector in {
+        SectorModel.BANK,
+        SectorModel.INSURER,
+        SectorModel.BROKER,
+        SectorModel.UNSUPPORTED_FINANCIAL,
+    }:
+        failure_code = "unsupported_sector_model"
+    elif essential_missing:
+        failure_code = "insufficient_evidence"
+    else:
+        failure_code = "none"
+
+    evidence_issues = [
+        _EVIDENCE_ISSUE_CODES.get(reason, "unknown_evidence_issue")
+        for reason in essential_missing
+    ]
+    if failure_code == "unsupported_sector_model":
+        terminal_status = SteadyTerminalStatus.UNSUPPORTED_SECTOR_MODEL.value
+    elif failure_code == "insufficient_evidence":
+        terminal_status = SteadyTerminalStatus.INSUFFICIENT_EVIDENCE.value
+    elif qualified:
+        terminal_status = SteadyTerminalStatus.EVALUATED_QUALIFIED.value
+    else:
+        terminal_status = SteadyTerminalStatus.EVALUATED_REJECTED.value
+
+    financial_evidence = (
+        dict(financial.get("evidence"))
+        if isinstance(financial.get("evidence"), dict)
+        else {}
+    )
+    financial_evidence.update(
+        {
+            "status": financial_evidence.get("status") or (
+                "complete" if available_at is not None else "current_known_only"
+            ),
+            "evidence_mode": financial_evidence.get("evidence_mode") or (
+                "point_in_time" if available_at is not None else "current_known_live"
+            ),
+            "period_end": period_end.isoformat() if period_end else None,
+            "announced_at": _parse_iso_date(financial.get("announced_at")).isoformat()
+            if _parse_iso_date(financial.get("announced_at"))
+            else None,
+            "available_at": available_at.isoformat() if available_at else None,
+            "source": financial_evidence.get("source") or "fundamental_context",
+            "fetched_at": financial_evidence.get("fetched_at"),
+            "unit": financial_evidence.get("unit"),
+            "flow_basis": financial_evidence.get("flow_basis"),
+            "period_unit_aligned": financial_flows_comparable,
+            "provider_ratio_used": cash_flow_coverage is not None and not financial_flows_comparable,
+            "evidence_version": STEADY_INCOME_EVIDENCE_VERSION,
+        }
+    )
+    dividend_evidence = (
+        dict(dividend.get("evidence"))
+        if isinstance(dividend.get("evidence"), dict)
+        else {}
+    )
+    dividend_evidence.update(
+        {
+            "status": dividend_evidence.get("status") or ("complete" if events else "evidence_unavailable"),
+            "as_of": as_of.isoformat(),
+            "implemented_event_count": len(events),
+            "source": dividend_evidence.get("source") or "fundamental_context",
+            "fetched_at": dividend_evidence.get("fetched_at"),
+            "unit": dividend_evidence.get("unit") or "cash_per_share_pre_tax",
+            "evidence_version": STEADY_INCOME_EVIDENCE_VERSION,
+            "event_date_semantics": "ex_dividend_date",
+        }
+    )
+
     return {
+        "schema_version": STEADY_INCOME_SCHEMA_VERSION,
+        "model_version": STEADY_INCOME_MODEL_VERSION,
+        "ruleset_version": STEADY_INCOME_RULESET_VERSION,
+        "evaluator_version": STEADY_INCOME_EVALUATOR_VERSION,
+        "sector_model_version": STEADY_INCOME_SECTOR_MODEL_VERSION,
+        "evidence_version": STEADY_INCOME_EVIDENCE_VERSION,
+        "price_model_version": STEADY_INCOME_PRICE_MODEL_VERSION,
         "code": code,
+        "sector_model": resolved_sector.value,
+        "industry": industry or None,
         "risk_tier": risk_tier,
-        "qualified": risk_tier in QUALIFIED_TIERS,
-        "score": min(int(round(score)), 100),
+        "public_risk_label": public_risk_label(risk_tier),
+        "qualified": qualified,
+        "ranking_score": ranking_score,
+        "score": ranking_score,
+        "score_deprecated": True,
         "current_price": normalized_price,
         "price_date": price_date,
         "ttm_dividend_yield_pct": round(ttm_yield, 4) if ttm_yield is not None else None,
@@ -375,10 +704,23 @@ def evaluate_steady_income_candidate(
         "annualized_volatility_pct": volatility,
         "positive_replay_periods": positive_periods,
         "replay_periods": replay_periods,
-        "price_bands": _price_bands(ttm_cash),
+        "history_coverage": metrics.get("history_coverage", []),
+        "price_adjustment": metrics.get("price_adjustment", "unknown"),
         "strengths": strengths[:4],
         "risks": risks[:4],
         "data_status": "完整" if not essential_missing else "部分数据" if strengths else "数据不足",
+        "failure_code": failure_code,
+        "terminal_status": terminal_status,
+        "evidence_issues": evidence_issues,
+        "evidence": {
+            "financial": financial_evidence,
+            "dividend": dividend_evidence,
+            "price": {
+                "date": parsed_price_date.isoformat() if parsed_price_date else None,
+                "adjustment": metrics.get("price_adjustment", "unknown"),
+                "provider": context.get("price_provider"),
+            },
+        },
     }
 
 
@@ -387,13 +729,24 @@ class SteadyIncomeService:
 
     _cache_lock = threading.RLock()
     _cache: Dict[
-        Tuple[Optional[int], str, Tuple[Tuple[str, Optional[float], str], ...]],
+        Tuple[str, Optional[int], str, Tuple[Tuple[str, Optional[float], str], ...]],
         Tuple[float, Dict[str, Any]],
     ] = {}
 
-    def __init__(self, *, portfolio_service: Any = None, data_manager: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        portfolio_service: Any = None,
+        data_manager: Any = None,
+        data_manager_factory: Any = None,
+        calendar: SessionCalendar | None = None,
+    ) -> None:
         self._portfolio_service = portfolio_service
         self._data_manager = data_manager
+        self._data_manager_factory = data_manager_factory
+        self._manager_local = threading.local()
+        self._injected_manager_lock = threading.RLock()
+        self._calendar = calendar
 
     @property
     def portfolio_service(self) -> Any:
@@ -410,6 +763,20 @@ class SteadyIncomeService:
 
             self._data_manager = DataFetcherManager()
         return self._data_manager
+
+    def _manager_for_worker(self) -> Any:
+        if self._data_manager is not None:
+            return self._data_manager
+        manager = getattr(self._manager_local, "manager", None)
+        if manager is None:
+            if self._data_manager_factory is not None:
+                manager = self._data_manager_factory()
+            else:
+                from data_provider.base import DataFetcherManager
+
+                manager = DataFetcherManager()
+            self._manager_local.manager = manager
+        return manager
 
     @staticmethod
     def _collect_cn_positions(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -447,19 +814,24 @@ class SteadyIncomeService:
         context: Dict[str, Any] = {}
         history: Any = pd.DataFrame()
         warnings: List[str] = []
+        manager = self._manager_for_worker()
+        lock = self._injected_manager_lock if self._data_manager is not None else threading.Lock()
         try:
-            context = self.data_manager.get_fundamental_context(code, budget_seconds=8.0)
+            with lock:
+                context = manager.get_fundamental_context(code, budget_seconds=8.0)
         except Exception as exc:
             warnings.append(f"基本面数据不可用：{type(exc).__name__}")
         try:
-            history, provider = self.data_manager.get_daily_data(
-                code,
-                start_date=start_date,
-                end_date=as_of.isoformat(),
-                days=2000,
-            )
+            with lock:
+                history, provider = manager.get_daily_data(
+                    code,
+                    start_date=start_date,
+                    end_date=as_of.isoformat(),
+                    days=2000,
+                )
             if provider:
                 warnings.append(f"历史行情来源：{provider}")
+                context["price_provider"] = str(provider)
         except Exception as exc:
             warnings.append(f"历史行情不可用：{type(exc).__name__}")
 
@@ -470,17 +842,37 @@ class SteadyIncomeService:
             context=context,
             history=history,
             as_of=as_of,
+            mode="live",
+            calendar=self._calendar,
+            price_adjustment=str(context.get("price_adjustment") or "unknown"),
         )
         result["data_notes"] = warnings
         return result
 
-    def evaluate_portfolio(self, *, account_id: Optional[int] = None, refresh: bool = False) -> Dict[str, Any]:
-        snapshot = self.portfolio_service.get_portfolio_snapshot(account_id=account_id, cost_method="fifo")
-        as_of_raw = snapshot.get("as_of") or date.today().isoformat()
+    def evaluate_portfolio(
+        self,
+        *,
+        account_id: Optional[int] = None,
+        as_of: date | None = None,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
+        snapshot = self.portfolio_service.get_portfolio_snapshot(
+            account_id=account_id,
+            as_of=as_of,
+            cost_method="fifo",
+        )
+        as_of_raw = snapshot.get("as_of")
+        if not as_of_raw:
+            raise ValueError("portfolio snapshot is missing as_of")
         try:
-            as_of = date.fromisoformat(str(as_of_raw)[:10])
-        except ValueError:
-            as_of = date.today()
+            snapshot_as_of = date.fromisoformat(str(as_of_raw)[:10])
+        except ValueError as exc:
+            raise ValueError(f"invalid portfolio as_of: {as_of_raw!r}") from exc
+        if as_of is not None and snapshot_as_of != as_of:
+            raise ValueError(
+                f"portfolio snapshot as_of mismatch: requested={as_of.isoformat()} actual={snapshot_as_of.isoformat()}"
+            )
+        as_of = snapshot_as_of
         positions = self._collect_cn_positions(snapshot)
         warnings: List[str] = []
         position_signature = tuple(
@@ -491,7 +883,7 @@ class SteadyIncomeService:
             )
             for item in positions
         )
-        cache_key = (account_id, as_of.isoformat(), position_signature)
+        cache_key = (VERSION_FINGERPRINT, account_id, as_of.isoformat(), position_signature)
         now = time.time()
         with self._cache_lock:
             expired_keys = [
@@ -518,17 +910,43 @@ class SteadyIncomeService:
                     except Exception as exc:
                         results.append(
                             {
+                                "schema_version": STEADY_INCOME_SCHEMA_VERSION,
+                                "model_version": STEADY_INCOME_MODEL_VERSION,
+                                "ruleset_version": STEADY_INCOME_RULESET_VERSION,
+                                "evaluator_version": STEADY_INCOME_EVALUATOR_VERSION,
+                                "sector_model_version": STEADY_INCOME_SECTOR_MODEL_VERSION,
+                                "evidence_version": STEADY_INCOME_EVIDENCE_VERSION,
+                                "price_model_version": STEADY_INCOME_PRICE_MODEL_VERSION,
                                 "code": code,
+                                "sector_model": SectorModel.UNKNOWN.value,
+                                "industry": None,
                                 "risk_tier": "数据不足",
+                                "public_risk_label": public_risk_label("数据不足"),
                                 "qualified": False,
-                                "score": 0,
+                                "ranking_score": None,
+                                "score": None,
+                                "score_deprecated": True,
+                                "current_price": None,
+                                "price_date": None,
+                                "ttm_dividend_yield_pct": None,
+                                "ttm_cash_dividend_per_share": None,
                                 "consecutive_dividend_years": 0,
                                 "dividend_sustainability": "偏弱",
+                                "cash_flow_coverage_ratio": None,
+                                "roe_pct": None,
+                                "pe_ratio": None,
+                                "pb_ratio": None,
+                                "max_drawdown_pct": None,
+                                "annualized_volatility_pct": None,
                                 "positive_replay_periods": 0,
                                 "replay_periods": [],
+                                "history_coverage": [],
+                                "price_adjustment": "unknown",
                                 "strengths": [],
                                 "risks": ["评估失败，未纳入稳健收益候选"],
                                 "data_status": "数据不足",
+                                "failure_code": "unknown_internal",
+                                "evidence": {},
                                 "data_notes": [f"{type(exc).__name__}"],
                             }
                         )
@@ -543,20 +961,40 @@ class SteadyIncomeService:
         qualified = [item for item in results if item.get("qualified")]
         excluded = [item for item in results if not item.get("qualified")]
         response = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "schema_version": STEADY_INCOME_SCHEMA_VERSION,
+            "model_version": STEADY_INCOME_MODEL_VERSION,
+            "ruleset_version": STEADY_INCOME_RULESET_VERSION,
+            "evaluator_version": STEADY_INCOME_EVALUATOR_VERSION,
+            "sector_model_version": STEADY_INCOME_SECTOR_MODEL_VERSION,
+            "evidence_version": STEADY_INCOME_EVIDENCE_VERSION,
+            "price_model_version": STEADY_INCOME_PRICE_MODEL_VERSION,
+            "generated_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
             "as_of": as_of.isoformat(),
             "source": "current_portfolio",
+            "data_status": (
+                "valid_zero"
+                if not results
+                else "degraded"
+                if any(item.get("data_status") != "完整" for item in results)
+                else "complete"
+            ),
+            "selection_mode": "portfolio",
+            "universe_count": len(results),
+            "prefilter_count": len(results),
+            "deep_budget": len(results),
+            "deep_evaluated_count": len(results),
+            "unevaluated_count": 0,
+            "is_exhaustive": True,
             "evaluated_count": len(results),
             "qualified_count": len(qualified),
             "candidates": qualified,
             "excluded": excluded,
             "warnings": warnings,
             "methodology": {
-                "priority": "风险硬门槛优先，评分仅在同一风险层内排序",
+                "priority": "风险硬门槛优先，规则分仅对证据完整且可比较的低风险候选生成",
                 "dividend": "TTM 税前现金分红/当前持仓行情价格",
-                "replay": "最近五个完整年度末之间的前复权总回报，已反映分红和拆并股影响",
-                "price_bands": "按 TTM 每股现金分红分别倒推 5%、3.5%、2.5% 股息率价格",
-                "limitations": "基于公开行情、分红和利润现金流证据；不预测未来分红，也不替代负债与派息政策核查",
+                "replay": "最近五个交易日历覆盖完整年度之间的历史复权价格回放",
+                "limitations": "不预测未来分红；金融行业缺少专用监管证据时直接标为数据不足",
             },
         }
         with self._cache_lock:

@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Callable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -66,6 +67,18 @@ from src.services.run_diagnostics import (
     sanitize_diagnostic_text,
 )
 from src.enums import ReportType
+from src.reports.structured_stock_report import (
+    build_structured_stock_report,
+    write_structured_stock_report,
+)
+from src.reports.contracts import FailureCode
+from src.reports.portfolio_review import (
+    PortfolioReviewResult,
+    fallback_for_exception,
+    portfolio_review_from_ai,
+    render_portfolio_review_markdown,
+    rule_fallback_portfolio_review,
+)
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
 from src.core.trading_calendar import (
     build_market_phase_context,
@@ -81,6 +94,7 @@ from bot.models import BotMessage
 logger = logging.getLogger(__name__)
 PORTFOLIO_REVIEW_MAX_TOKENS = 900
 LLM_CALL_MIN_INTERVAL_SECONDS = 12.0
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 # 防御性 guard：当实例绕过 __init__（如测试中 __new__）构造时，
 # double-check 初始化 _single_stock_notify_lock 仍然线程安全。
@@ -141,9 +155,13 @@ class StockAnalysisPipeline:
         self.notifier = NotificationService(source_message=source_message)
         self._single_stock_notify_lock = threading.Lock()
         self._portfolio_review_sections_cache: Optional[str] = None
+        self._portfolio_review_results_cache: Optional[List[PortfolioReviewResult]] = None
         self._llm_call_lock = threading.Lock()
         self._last_llm_call_at = 0.0
         self._llm_min_interval_seconds = LLM_CALL_MIN_INTERVAL_SECONDS
+        self._report_run_id: Optional[str] = None
+        self._report_generated_at: Optional[datetime] = None
+        self._expected_stock_codes: List[str] = []
         
         # 初始化搜索服务（可选，初始化失败不应阻断主分析流程）
         try:
@@ -2317,7 +2335,10 @@ class StockAnalysisPipeline:
         """
         start_time = time.time()
         self._portfolio_review_sections_cache = None
+        self._portfolio_review_results_cache = None
         self._last_llm_call_at = 0.0
+        self._report_run_id = f"stock-{uuid.uuid4().hex}"
+        self._report_generated_at = datetime.now(SHANGHAI_TZ)
         
         # 使用配置中的股票列表
         if stock_codes is None:
@@ -2327,9 +2348,11 @@ class StockAnalysisPipeline:
         if not stock_codes:
             logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
             return []
+
+        self._expected_stock_codes = list(dict.fromkeys(str(code).strip() for code in stock_codes if str(code).strip()))
         
         logger.info(f"===== 开始分析 {len(stock_codes)} 只股票 =====")
-        logger.info(f"股票列表: {', '.join(stock_codes)}")
+        logger.info("本轮股票列表已冻结: count=%s", len(self._expected_stock_codes))
         logger.info(f"并发数: {self.max_workers}, 模式: {'仅获取数据' if dry_run else '完整分析'}")
 
         # 冻结本轮运行的统一参考时间，避免跨市场收盘边界时同批股票使用不同目标交易日。
@@ -2582,8 +2605,34 @@ class StockAnalysisPipeline:
             report = self._generate_aggregate_report(results, report_type, failed_results=failed_results)
             filepath = self.notifier.save_report_to_file(report)
             logger.info(f"决策仪表盘日报已保存: {filepath}")
+            markdown_path = Path(filepath)
+            report_date_match = re.search(r"(20\d{6})", markdown_path.stem)
+            report_date = (
+                datetime.strptime(report_date_match.group(1), "%Y%m%d").date()
+                if report_date_match
+                else datetime.now(SHANGHAI_TZ).date()
+            )
+            generated_at = datetime.now(SHANGHAI_TZ)
+            self._report_generated_at = generated_at
+            structured = build_structured_stock_report(
+                results=results,
+                failed_results=failed_results or [],
+                expected_stock_codes=self._expected_stock_codes,
+                generated_at=generated_at,
+                run_id=self._report_run_id,
+                report_date=report_date,
+                markdown_file=f"reports/{markdown_path.name}",
+                portfolio_reviews=[
+                    item.to_dict() for item in (self._portfolio_review_results_cache or [])
+                ],
+            )
+            structured_path = markdown_path.with_suffix(".json")
+            write_structured_stock_report(structured_path, structured)
+            logger.info("结构化股票日报已保存: %s", structured_path)
         except Exception as e:
-            logger.error(f"保存本地报告失败: {e}")
+            # Markdown can remain available for local diagnosis, but missing or
+            # invalid structured output will be rejected by publish validators.
+            logger.exception("保存本地/结构化报告失败: %s", e)
 
     def _send_notifications(
         self,
@@ -3144,8 +3193,10 @@ class StockAnalysisPipeline:
         snapshot = self._load_holdings_snapshot()
         if not snapshot:
             self._portfolio_review_sections_cache = ""
+            self._portfolio_review_results_cache = []
             return report
 
+        self._portfolio_review_results_cache = []
         sections = [
             self._build_asset_portfolio_review_section(snapshot, "lof"),
             self._build_asset_portfolio_review_section(snapshot, "otc"),
@@ -3223,31 +3274,18 @@ class StockAnalysisPipeline:
         asset_type: str,
         holdings: List[Dict[str, str]],
     ) -> str:
-        holding_lines = [f"- {item['name']}（{item['code']}）" for item in holdings]
-        review_text = self._generate_account_portfolio_review(account, asset_type, holdings)
-        if review_text:
-            body = review_text
-        else:
-            body = self._build_rule_based_portfolio_review(account, asset_type, holdings)
-
-        return "\n".join(
-            [
-                f"### {account}",
-                "",
-                "#### 持有标的" if asset_type == "lof" else "#### 持有基金",
-                "",
-                *holding_lines,
-                "",
-                self._sanitize_portfolio_review_text(body),
-            ]
-        )
+        result = self._generate_account_portfolio_review(account, asset_type, holdings)
+        if self._portfolio_review_results_cache is None:
+            self._portfolio_review_results_cache = []
+        self._portfolio_review_results_cache.append(result)
+        return render_portfolio_review_markdown(result)
 
     def _generate_account_portfolio_review(
         self,
         account: str,
         asset_type: str,
         holdings: List[Dict[str, str]],
-    ) -> str:
+    ) -> PortfolioReviewResult:
         prompt = self._build_portfolio_review_prompt(account, asset_type, holdings)
         try:
             self._wait_for_llm_slot(f"portfolio:{asset_type}:{account}")
@@ -3258,107 +3296,24 @@ class StockAnalysisPipeline:
             )
         except Exception as exc:
             logger.warning("账户级基金组合复盘 AI 调用失败，使用规则兜底: %s", exc)
-            return self._build_rule_based_portfolio_review(account, asset_type, holdings)
+            return fallback_for_exception(account, asset_type, holdings, exc)
         if not generated:
-            return self._build_rule_based_portfolio_review(account, asset_type, holdings)
-        generated = generated.strip()
-        if self._portfolio_review_looks_truncated(generated):
-            return self._build_rule_based_portfolio_review(account, asset_type, holdings)
-        return generated
-
-    @staticmethod
-    def _infer_fund_themes(name: str, code: str = "") -> List[str]:
-        text = f"{name} {code}".lower()
-        theme_rules: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-            ("科技成长", ("科技", "ai", "人工智能", "半导体", "芯片", "算力", "互联网", "软件", "硬科技")),
-            ("基建链", ("电网", "基建", "工程", "建筑", "电力设备")),
-            ("资源品", ("有色", "黄金", "白银", "稀土", "资源", "矿业", "铜", "铝", "煤炭", "能源")),
-            ("红利价值", ("红利", "股息", "价值")),
-            ("海外资产", ("纳斯达克", "标普", "美国", "全球", "海外", "qdii", "港股", "港美")),
-            ("医药", ("医药", "生物", "创新药")),
-            ("新能源", ("新能源", "光伏", "电池")),
-            ("宽基指数", ("沪深300", "中证500", "a500", "宽基", "创业板", "上证50", "指数")),
-            ("固收债券", ("债", "纯债", "固收")),
-        )
-        themes: List[str] = []
-        for theme, keywords in theme_rules:
-            if any(keyword.lower() in text for keyword in keywords):
-                themes.append(theme)
-        return themes
-
-    @classmethod
-    def _summarize_fund_themes(cls, holdings: List[Dict[str, str]], fallback_label: str) -> Tuple[str, str]:
-        theme_counts: Dict[str, int] = defaultdict(int)
-        for item in holdings:
-            for theme in cls._infer_fund_themes(item.get("name", ""), item.get("code", "")):
-                theme_counts[theme] += 1
-
-        if not theme_counts:
-            return fallback_label, "暂无法从名称准确归类，后续应结合基金实际投向继续观察。"
-
-        ordered = sorted(theme_counts.items(), key=lambda pair: (-pair[1], pair[0]))
-        theme_text = "、".join(theme for theme, _count in ordered[:4])
-        concentrated = [theme for theme, count in ordered if count > 1]
-        if concentrated:
-            exposure_text = f"可能存在主题集中在：{'、'.join(concentrated[:3])}。"
-        else:
-            exposure_text = "整体更偏多主题分散配置。"
-        return theme_text, exposure_text
-
-    @classmethod
-    def _build_rule_based_portfolio_review(
-        cls,
-        account: str,
-        asset_type: str,
-        holdings: List[Dict[str, str]],
-    ) -> str:
-        count = len(holdings)
-        if asset_type == "lof":
-            themes, exposure = cls._summarize_fund_themes(holdings, "主题较分散 / 暂无法从名称准确归类")
-            return "\n".join(
-                [
-                    "#### 组合观察",
-                    "",
-                    "- AI 组合复盘未完成，以下为规则版组合兜底复盘。",
-                    f"- 该账户持有 {count} 只 LOF/ETF，主要用于场内基金配置观察。",
-                    f"- 根据名称粗略识别主题：{themes}。",
-                    "",
-                    "#### 配置节奏",
-                    "",
-                    "- 当前仅做组合层面观察，不做单只基金短线判断。",
-                    "- 后续应重点看对应主题是否继续强势，以及组合是否过度集中。",
-                    "",
-                    "#### 后续观察",
-                    "",
-                    "- 观察组合中重复主题是否过高。",
-                    "- 观察是否存在单一方向暴露过重。",
-                ]
+            return rule_fallback_portfolio_review(
+                account,
+                asset_type,
+                holdings,
+                failure_code=FailureCode.INVALID_RESPONSE,
             )
-
-        themes, exposure = cls._summarize_fund_themes(holdings, "风格较分散 / 暂无法从名称准确归类")
-        return "\n".join(
-            [
-                "#### 组合观察",
-                "",
-                "- AI 组合复盘未完成，以下为规则版组合兜底复盘。",
-                f"- 该账户持有 {count} 只场外基金，适合从组合层面观察风格暴露。",
-                f"- 根据名称粗略识别风格：{themes}。",
-                "",
-                "#### 风格暴露",
-                "",
-                f"- {exposure}",
-                "",
-                "#### 配置节奏",
-                "",
-                "- 当前仅做组合层面观察，不做单只基金短线判断。",
-                "- 后续应结合市场风格和组合集中度观察。",
-                "",
-                "#### 后续观察",
-                "",
-                "- 观察是否过度集中在单一主题。",
-                "- 观察不同基金之间是否高度重叠。",
-            ]
-        )
+        generated = generated.strip()
+        result = portfolio_review_from_ai(account, asset_type, holdings, generated)
+        if result is None:
+            return rule_fallback_portfolio_review(
+                account,
+                asset_type,
+                holdings,
+                failure_code=FailureCode.LLM_TRUNCATED,
+            )
+        return result
 
     @staticmethod
     def _build_portfolio_review_prompt(
@@ -3401,102 +3356,6 @@ class StockAnalysisPipeline:
 请只输出 Markdown 正文，使用以下结构，不要重复“持有标的/持有基金”清单：
 {section_hint}
 """
-
-    @staticmethod
-    def _portfolio_review_looks_truncated(text: str) -> bool:
-        clean = (text or "").strip()
-        if not clean:
-            return False
-        lines = [line.strip() for line in clean.splitlines() if line.strip()]
-        if not lines:
-            return False
-
-        suspicious_suffixes = (
-            "组合在",
-            "基于当前持仓清单做",
-            "基于当前持仓清单",
-            "呈现出明显的",
-            "该组合呈现",
-            "当前组合在",
-            "当前处于典型的",
-            "典型的",
-        )
-        incomplete_tail_tokens = (
-            "在",
-            "的",
-            "和",
-            "与",
-            "及",
-            "但",
-            "因此",
-            "同时",
-            "主要",
-            "整体",
-            "风格暴露",
-        )
-        natural_endings = tuple("。；;：:、，,）)】》”’！？?!…")
-
-        for line in lines:
-            current = re.sub(r"^[-*+]\s+", "", line).strip()
-            current = re.sub(r"^\d+[.)、]\s+", "", current).strip()
-            current = re.sub(r"^#{1,6}\s+", "", current).strip()
-            if not current:
-                continue
-            if any(current.endswith(suffix) for suffix in suspicious_suffixes):
-                return True
-            if any(current.endswith(token) for token in incomplete_tail_tokens):
-                return True
-            if current.count("“") > current.count("”"):
-                return True
-            if len(current) > 40 and not current.endswith(natural_endings):
-                return True
-        return False
-
-    @staticmethod
-    def _portfolio_review_incomplete_text(asset_type: str) -> str:
-        prefix = "LOF/ETF 组合复盘失败" if asset_type == "lof" else "场外基金组合复盘失败"
-        return f"{prefix}：模型输出疑似截断，本次组合复盘未完成。"
-
-    @staticmethod
-    def _portfolio_review_failure_text(asset_type: str, exc: Exception) -> str:
-        raw = str(exc) or type(exc).__name__
-        lower = raw.lower()
-        if any(token in lower for token in ("503", "serviceunavailable", "high demand", "overloaded")):
-            reason = "Gemini 模型服务暂不可用，本次组合复盘未完成。"
-        elif any(token in lower for token in ("429", "resource_exhausted", "quota", "free tier requests limit")):
-            reason = "Gemini API 额度超限，本次组合复盘未完成。"
-        elif any(token in lower for token in ("timeout", "timed out")):
-            reason = "AI 请求超时，本次组合复盘未完成。"
-        else:
-            reason = (raw[:120] + "…") if len(raw) > 120 else raw
-        prefix = "LOF/ETF 组合复盘失败" if asset_type == "lof" else "场外基金组合复盘失败"
-        return f"{prefix}：{reason}"
-
-    @staticmethod
-    def _sanitize_portfolio_review_text(text: str) -> str:
-        clean = text or ""
-        replacements = (
-            ("买入", "配置观察"),
-            ("卖出", "风险观察"),
-            ("观望", "继续跟踪"),
-            ("交易建议", "配置观察"),
-            ("交易评级", "配置观察"),
-            ("股票评级", "配置观察"),
-            ("评级", "观察结论"),
-            ("打分", "观察"),
-            ("评分", "观察"),
-            ("持仓金额", "持仓规模"),
-            ("持仓成本", "持仓信息"),
-            ("单位成本", "持仓信息"),
-            ("成本", "持仓信息"),
-            ("份额", "持仓数量"),
-            ("金额", "规模"),
-            ("市值", "规模"),
-            ("盈亏", "波动结果"),
-        )
-        for old, new in replacements:
-            clean = clean.replace(old, new)
-        return clean.strip()
 
     @staticmethod
     def _compact_analysis_failure_reason(reason: str) -> str:

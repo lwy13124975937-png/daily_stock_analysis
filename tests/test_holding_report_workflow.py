@@ -4,17 +4,52 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import ExitStack
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts import build_pages_report as pages
 from scripts import build_stock_list_from_holdings as holdings
 from scripts import check_report_coverage as coverage
-from scripts import check_report_html as html_check
 from scripts import check_report_valid as report_valid
 from scripts import update_advice_backtest as advice
+from src.reports.contracts import HOLDINGS_SCHEMA_VERSION, REPORT_SCHEMA_VERSION
+from src.reports.public_holdings import (
+    build_public_holdings_snapshot,
+    public_source_descriptor,
+    stock_items_from_snapshot,
+)
+
+
+def _structured_report(*, success: bool = True) -> dict:
+    results = [
+        {
+            "code": "111111", "name": "测试股票甲", "success": success,
+            "failure_code": "none" if success else "provider_unavailable",
+            "public_message": "" if success else "本标的模型服务暂不可用，未能完成。",
+            "action_raw": "观望" if success else "",
+            "action_normalized": "observe" if success else "unknown",
+            "sentiment_raw": "震荡" if success else "",
+            "sentiment_normalized": "neutral" if success else "unknown",
+            "score": 50 if success else None, "public_summary": "结构化摘要。" if success else "", "sections": {},
+        },
+        {
+            "code": "222222", "name": "测试股票乙", "success": False,
+            "failure_code": "provider_unavailable", "public_message": "本标的模型服务暂不可用，未能完成。",
+            "action_raw": "", "action_normalized": "unknown", "sentiment_raw": "",
+            "sentiment_normalized": "unknown", "score": None, "public_summary": "", "sections": {},
+        },
+    ]
+    success_ids = [item["code"] for item in results if item["success"]]
+    failure_ids = [item["code"] for item in results if not item["success"]]
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION, "run_id": "run-fixture",
+        "generated_at": "2099-01-10T18:30:00+08:00", "market_data_as_of": "2099-01-09",
+        "anchor_session": "2099-01-09", "report_date": "2099-01-10", "report_type": "stock_daily",
+        "expected_stock_codes": ["111111", "222222"], "expected_count": 2,
+        "success_count": len(success_ids), "failure_count": len(failure_ids),
+        "success_ids": success_ids, "failure_ids": failure_ids,
+        "status": "degraded" if success_ids else "failed", "results": results, "portfolio_reviews": [],
+    }
 
 
 class _DailyFrame:
@@ -29,550 +64,119 @@ class _DailyFrame:
 class _CountingManager:
     def __init__(self) -> None:
         self.calls: list[str] = []
-        self.kwargs: list[dict] = []
 
-    def get_daily_data(self, code: str, **kwargs):
+    def get_daily_data(self, code: str, **_: object):
         self.calls.append(code)
-        self.kwargs.append(kwargs)
         return _DailyFrame(), "mock"
 
 
 class HoldingReportWorkflowTests(unittest.TestCase):
-    def test_holding_display_name_does_not_repeat_the_code(self) -> None:
-        self.assertEqual(pages._display_holding_name("测试股票(111111)", "111111"), "测试股票")
-        self.assertEqual(pages._display_holding_name("测试股票（111111）", "111111"), "测试股票")
-        self.assertEqual(pages._display_holding_name("测试股票", "111111"), "测试股票")
+    def test_snapshot_whitelists_fields_and_stock_list_keeps_all_accounts(self) -> None:
+        raw = {"holdings": [
+            {"account": "账户甲", "type": "stock", "code": "111111", "name": "测试股票", "shares": 10},
+            {"account": "账户乙", "type": "A股", "code": "111111", "name": "测试股票", "unit_cost": 12.3},
+            {"account": "账户乙", "type": "ETF", "code": "222222", "name": "测试场内基金", "market_value": 456},
+            {"account": "账户丙", "type": "fund", "code": "333333", "name": "测试场外基金", "profit": 78},
+            {"account": "账户丙", "type": "mystery", "code": "444444", "name": "未知类型"},
+        ]}
+        snapshot, warnings = build_public_holdings_snapshot(raw, r"C:\private\holdings.json")
+        stocks = stock_items_from_snapshot(snapshot)
 
-    def test_snapshot_keeps_all_public_holdings_but_stock_list_is_stock_only(self) -> None:
-        raw = {
-            "holdings": [
-                {
-                    "account": "账户甲",
-                    "type": "stock",
-                    "code": "111111",
-                    "name": "测试股票",
-                    "shares": 10,
-                    "unit_cost": 12.3,
-                },
-                {
-                    "account": "账户乙",
-                    "type": "ETF",
-                    "code": "222222",
-                    "name": "测试场内基金",
-                    "market_value": 456,
-                },
-                {
-                    "account": "账户丙",
-                    "type": "fund",
-                    "code": "333333",
-                    "name": "测试场外基金",
-                    "profit": 78,
-                },
-            ]
-        }
+        self.assertEqual(snapshot["schema_version"], HOLDINGS_SCHEMA_VERSION)
+        self.assertEqual(stocks, [{"code": "111111", "name": "测试股票", "type": "stock", "accounts": ["账户乙", "账户甲"]}])
+        self.assertEqual(snapshot["source_kind"], "local_file")
+        self.assertIsNone(snapshot["source_link"])
+        self.assertNotIn("C:\\private", json.dumps(snapshot, ensure_ascii=False))
+        self.assertTrue(any("unsupported enabled type" in item for item in warnings))
+        for groups in snapshot["accounts"].values():
+            for items in groups.values():
+                for item in items:
+                    self.assertEqual(set(item), {"account", "type", "name", "code"})
 
-        snapshot, type_codes, stock_list = holdings.build_holdings_snapshot(raw, "test:fixture")
+    def test_public_source_rejects_unsafe_url_schemes(self) -> None:
+        for source in ("javascript:alert(1)", "file:///tmp/holdings.json", "data:text/plain,secret"):
+            self.assertIsNone(public_source_descriptor(source, {"holdings": []})["source_link"])
 
-        self.assertEqual(stock_list, ["111111"])
+    def test_public_source_drops_query_and_fragment_secrets(self) -> None:
+        descriptor = public_source_descriptor(
+            "https://api.github.com/repos/lwy13124975937-png/stock-dashboard/contents/holdings_data.json?token=secret#fragment",
+            {"holdings": []},
+        )
         self.assertEqual(
-            type_codes,
-            {"stock": ["111111"], "lof": ["222222"], "otc": ["333333"]},
+            descriptor["source_link"],
+            "https://api.github.com/repos/lwy13124975937-png/stock-dashboard/contents/holdings_data.json",
         )
-        self.assertEqual(set(snapshot["accounts"]), {"账户甲", "账户乙", "账户丙"})
-        public_items = [
-            item
-            for groups in snapshot["accounts"].values()
-            for items in groups.values()
-            for item in items
-        ]
-        self.assertEqual(len(public_items), 3)
-        self.assertTrue(
-            all(set(item) == {"account", "type", "name", "code"} for item in public_items)
+        self.assertNotIn("secret", json.dumps(descriptor))
+
+    def test_holdings_log_url_never_contains_query_secret(self) -> None:
+        self.assertEqual(
+            holdings._safe_url_for_log("https://example.com/input.json?token=secret#part"),
+            "https://example.com/input.json",
         )
 
-    def test_actions_refuses_stock_list_only_without_full_snapshot(self) -> None:
+    def test_actions_refuses_stock_list_without_full_snapshot(self) -> None:
         with patch.object(holdings, "_load_holdings_data", side_effect=RuntimeError("private source unavailable")):
-            with patch.dict(
-                os.environ,
-                {"GITHUB_ACTIONS": "true", "STOCK_LIST": "111111,222222"},
-                clear=False,
-            ):
+            with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "STOCK_LIST": "111111"}, clear=False):
                 self.assertEqual(holdings.build_stock_list(), "")
 
-    def test_build_stock_list_writes_analysis_list_and_full_snapshot(self) -> None:
+    def test_build_stock_list_writes_full_snapshot_and_stock_only_list(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             raw_path = root / "holdings_data.json"
-            site_data_dir = root / "site_data"
-            snapshot_path = site_data_dir / "holdings_snapshot.json"
-            stock_list_path = site_data_dir / "current_stock_list.json"
+            site_data = root / "site_data"
             github_env = root / "github_env.txt"
-            raw_path.write_text(
-                json.dumps(
-                    {
-                        "holdings": [
-                            {"account": "账户甲", "type": "stock", "code": "111111", "name": "测试股票"},
-                            {"account": "账户乙", "type": "lof", "code": "222222", "name": "测试场内基金"},
-                            {"account": "账户丙", "type": "otc", "code": "333333", "name": "测试场外基金"},
-                        ]
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-
-            with ExitStack() as stack:
-                stack.enter_context(patch.object(holdings, "ROOT_DIR", root))
-                stack.enter_context(patch.object(holdings, "SITE_DATA_DIR", site_data_dir))
-                stack.enter_context(patch.object(holdings, "SNAPSHOT_PATH", snapshot_path))
-                stack.enter_context(patch.object(holdings, "CURRENT_STOCK_LIST_PATH", stock_list_path))
-                stack.enter_context(
-                    patch.dict(
-                        os.environ,
-                        {
-                            "HOLDINGS_DATA_PATH": str(raw_path),
-                            "GITHUB_ENV": str(github_env),
-                            "GITHUB_ACTIONS": "true",
-                        },
-                        clear=False,
-                    )
-                )
+            raw_path.write_text(json.dumps({"holdings": [
+                {"account": "账户甲", "type": "stock", "code": "111111", "name": "测试股票"},
+                {"account": "账户乙", "type": "lof", "code": "222222", "name": "测试基金"},
+                {"account": "账户丙", "type": "otc", "code": "333333", "name": "测试场外基金"},
+            ]}, ensure_ascii=False), encoding="utf-8")
+            with (
+                patch.object(holdings, "ROOT_DIR", root),
+                patch.object(holdings, "SITE_DATA_DIR", site_data),
+                patch.object(holdings, "SNAPSHOT_PATH", site_data / "holdings_snapshot.json"),
+                patch.object(holdings, "CURRENT_STOCK_LIST_PATH", site_data / "current_stock_list.json"),
+                patch.dict(os.environ, {"HOLDINGS_DATA_PATH": str(raw_path), "GITHUB_ENV": str(github_env), "GITHUB_ACTIONS": "true"}, clear=False),
+            ):
                 self.assertEqual(holdings.build_stock_list(), "111111")
-
-            current_payload = json.loads(stock_list_path.read_text(encoding="utf-8"))
-            snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-            self.assertEqual([item["code"] for item in current_payload["stocks"]], ["111111"])
-            self.assertEqual(set(snapshot_payload["accounts"]), {"账户甲", "账户乙", "账户丙"})
+            current = json.loads((site_data / "current_stock_list.json").read_text(encoding="utf-8"))
+            snapshot = json.loads((site_data / "holdings_snapshot.json").read_text(encoding="utf-8"))
+            self.assertEqual([item["code"] for item in current["stocks"]], ["111111"])
+            self.assertEqual(set(snapshot["accounts"]), {"账户甲", "账户乙", "账户丙"})
             self.assertEqual(github_env.read_text(encoding="utf-8").strip(), "STOCK_LIST=111111")
 
-    def test_coverage_accepts_success_and_unfinished_stock(self) -> None:
+    def test_coverage_uses_exact_structured_identity_including_failures(self) -> None:
+        report = _structured_report()
+        coverage.validate_coverage(["111111", "222222"], report)
+        with self.assertRaises(coverage.CoverageValidationError):
+            coverage.validate_coverage(["111111", "333333"], report)
+
+    def test_report_validation_requires_structured_counts_and_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            current_list = root / "site_data" / "current_stock_list.json"
-            current_list.parent.mkdir(parents=True)
-            current_list.write_text(
-                json.dumps(
-                    {
-                        "stocks": [
-                            {"account": "账户甲", "type": "stock", "name": "测试股票甲", "code": "111111"},
-                            {"account": "账户甲", "type": "stock", "name": "测试股票乙", "code": "222222"},
-                            {"account": "账户乙", "type": "lof", "name": "测试基金", "code": "333333"},
-                        ]
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            reports_dir = root / "reports"
-            reports_dir.mkdir()
-            (reports_dir / "report_20990110.md").write_text(
-                """# 2099-01-10 股票日报
-
-## 分析结果摘要
-
-- 测试股票甲(111111)：观望 | 评分 50 | 震荡
-
-## 测试股票甲(111111)
-
-完整分析。
-
-## 未完成分析标的
-
-- 测试股票乙(222222)：行情数据获取失败
-""",
-                encoding="utf-8",
-            )
-
-            passed, missing = coverage.check_coverage(
-                current_list,
-                root / "site_data" / "holdings_snapshot.json",
-                reports_dir,
-            )
-
-            self.assertTrue(passed)
-            self.assertEqual(missing, [])
-
-    def test_report_validation_uses_latest_log_and_last_summary(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            reports_dir = root / "reports"
-            logs_dir = root / "logs"
-            reports_dir.mkdir()
-            logs_dir.mkdir()
-            report = reports_dir / "report_20990110.md"
-            report.write_text("# 正常日报\n" + ("有效正文。" * 200), encoding="utf-8")
-
-            old_log = logs_dir / "stock_analysis_debug_20990109.log"
-            latest_log = logs_dir / "stock_analysis_debug_20990110.log"
-            old_log.write_text("成功: 0, 失败: 2\n", encoding="utf-8")
-            latest_log.write_text(
-                "成功: 0, 失败: 2\n中间日志\n成功：2，失败：0\n",
-                encoding="utf-8",
-            )
-            os.utime(old_log, (1, 1))
-            os.utime(latest_log, (2, 2))
-
-            self.assertEqual(report_valid.validate_report(reports_dir, logs_dir), 0)
+            path = Path(temp_dir) / "report_20990110.json"
+            path.write_text(json.dumps(_structured_report(), ensure_ascii=False), encoding="utf-8")
+            self.assertEqual(report_valid.validate_report_file(path)["success_count"], 1)
+            path.write_text(json.dumps(_structured_report(success=False), ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                report_valid.validate_report_file(path)
 
     def test_price_history_is_cached_per_canonical_code(self) -> None:
         manager = _CountingManager()
         provider = advice.DataFetcherPriceProvider()
         provider._manager = manager
-
         first, first_error = provider.get_bars("SH600961", date(2026, 6, 18))
         second, second_error = provider.get_bars("600961.SH", date(2026, 6, 19))
-
         self.assertIsNone(first_error)
         self.assertIsNone(second_error)
         self.assertEqual(first, second)
         self.assertEqual(manager.calls, ["600961"])
-        self.assertEqual(provider.request_count, 1)
-        self.assertLessEqual(manager.kwargs[0]["start_date"], "2026-03-20")
 
-    def test_verified_advice_does_not_refetch_or_keep_stale_diagnostic(self) -> None:
-        class UnexpectedProvider(advice.PriceProvider):
-            def get_bars(self, code: str, analysis_date: date):
-                raise AssertionError(f"unexpected price fetch for {code} on {analysis_date}")
-
-        record = {
-            "date": "2026-06-18",
-            "code": "600961",
-            "action": "观望",
-            "sentiment": "震荡",
-            "price_warning": "旧价格诊断",
-            "d1_status": "已验证",
-            "d1_close": 10.1,
-            "d5_status": "已验证",
-            "d5_close": 10.2,
-            "d20_status": "已验证",
-            "d20_close": 10.3,
-        }
-
-        result = advice.evaluate_record(record, UnexpectedProvider())
-
-        self.assertNotIn("price_warning", result)
-        self.assertTrue(all(result[f"{period}_status"] == "已验证" for period in advice.PERIODS))
-
-    def test_large_history_fetches_once_per_unique_code(self) -> None:
-        manager = _CountingManager()
-        provider = advice.DataFetcherPriceProvider()
-        provider._manager = manager
-        codes = ["111111", "222222", "333333", "444444", "555555", "666666"]
-
-        for index in range(68):
-            provider.get_bars(codes[index % len(codes)], date(2026, 6, 15) + timedelta(days=index // 6))
-
-        self.assertEqual(provider.request_count, len(codes))
-        self.assertEqual(len(manager.calls), len(codes))
-
-    def test_pages_keep_account_contract_and_pass_html_guard(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            reports_dir = root / "reports"
-            site_data_dir = root / "site_data"
-            site_dir = root / "site"
-            site_reports_dir = site_dir / "reports"
-            site_accounts_dir = site_dir / "accounts"
-            reports_dir.mkdir()
-            site_data_dir.mkdir()
-            site_dir.mkdir()
-
-            snapshot = {
-                "generated_at": "2099-01-10 18:00:00",
-                "source_url": "test:fixture",
-                "accounts": {
-                    "账户甲": {
-                        "stock": [
-                            {"account": "账户甲", "type": "stock", "name": "测试股票甲", "code": "111111"},
-                            {"account": "账户甲", "type": "stock", "name": "测试股票乙", "code": "222222"},
-                        ],
-                        "lof": [],
-                        "otc": [],
-                    },
-                    "账户乙": {
-                        "stock": [],
-                        "lof": [
-                            {"account": "账户乙", "type": "lof", "name": "科技主题LOF", "code": "333333"}
-                        ],
-                        "otc": [],
-                    },
-                    "账户丙": {
-                        "stock": [],
-                        "lof": [],
-                        "otc": [
-                            {"account": "账户丙", "type": "otc", "name": "全球主题基金", "code": "444444"}
-                        ],
-                    },
-                },
-                "type_labels": holdings.TYPE_LABELS,
-            }
-            snapshot_path = site_data_dir / "holdings_snapshot.json"
-            snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
-            steady_data_path = site_data_dir / "steady_income.json"
-            steady_data_path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 2,
-                        "generated_at": "2099-01-10T18:00:00+08:00",
-                        "as_of": "2099-01-10",
-                        "source": "test whole-market source",
-                        "universe": {
-                            "market": "沪深A股",
-                            "count": 5200,
-                            "source": "test:stock-index",
-                            "complete": True,
-                        },
-                        "screening_stats": {
-                            "universe_count": 5200,
-                            "annual_plan_count": 3600,
-                            "prefilter_eligible_count": 20,
-                            "deep_selected_count": 2,
-                            "deep_evaluated_count": 2,
-                            "qualified_count": 0,
-                            "data_insufficient_count": 2,
-                        },
-                        "evaluated_count": 2,
-                        "qualified_count": 0,
-                        "candidates": [],
-                        "excluded": [
-                            {
-                                "code": code,
-                                "name": name,
-                                "market": "深市",
-                                "risk_tier": "数据不足",
-                                "qualified": False,
-                                "risks": ["公开数据不足，未纳入低风险候选"],
-                            }
-                            for code, name in (("600001", "全市场测试甲"), ("000002", "全市场测试乙"))
-                        ],
-                        "methodology": {
-                            "priority": "风险硬门槛优先，规则分仅在同一风险层内排序",
-                            "scope": "覆盖全部沪深 A 股；全市场先预筛，再做深度风险评估",
-                            "limitations": "不预测未来分红，不承诺收益",
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            (reports_dir / "report_20990110.md").write_text(
-                """# 2099-01-10 股票日报
-
-## 分析结果摘要
-
-- 测试股票甲(111111)：观望 | 评分 50 | 震荡
-
-## 测试股票甲(111111)
-
-### 核心结论
-
-公司基本面保持稳定。
-
-### 作战计划
-
-- 关注后续公开信息变化。
-
-## 未完成分析标的
-
-- 测试股票乙(222222)：Gemini 模型服务暂不可用
-
-## LOF/ETF 组合复盘
-
-### 账户乙
-
-#### 持有标的
-
-- 科技主题LOF(333333)
-
-#### 组合观察
-
-- 主题暴露偏科技成长，组合结构清晰。
-
-#### 配置节奏
-
-- 当前仅做账户配置观察。
-
-#### 后续观察
-
-- 关注对应指数和行业景气变化。
-
-## 场外基金组合复盘
-
-### 账户丙
-
-#### 持有基金
-
-- 全球主题基金(444444)
-
-#### 组合观察
-
-组合在
-""",
-                encoding="utf-8",
-            )
-
-            current_record = {
-                "date": "2099-01-10",
-                "code": "111111",
-                "name": "测试股票甲",
-                "account": "账户甲",
-                "action": "观望",
-                "score": 50,
-                "sentiment": "震荡",
-                "action_group": "持有/观望类",
-                "is_current_holding_now": True,
-                "d1_status": "等待验证",
-                "d5_status": "等待验证",
-                "d20_status": "等待验证",
-            }
-            accuracy = advice.build_accuracy_with_metadata(
-                [current_record],
-                latest_report_date="2099-01-10",
-                latest_report_name="report_20990110.md",
-                new_advice_count=1,
-            )
-            (site_dir / "advice_backtest.html").write_text(
-                advice.render_html(accuracy),
-                encoding="utf-8",
-            )
-
-            patches = (
-                (pages, "ROOT_DIR", root),
-                (pages, "REPORTS_DIR", reports_dir),
-                (pages, "HOLDINGS_SNAPSHOT_PATH", snapshot_path),
-                (pages, "STEADY_INCOME_DATA_PATH", steady_data_path),
-                (pages, "SITE_DIR", site_dir),
-                (pages, "SITE_REPORTS_DIR", site_reports_dir),
-                (pages, "SITE_ACCOUNTS_DIR", site_accounts_dir),
-                (html_check, "ROOT_DIR", root),
-                (html_check, "SITE_DIR", site_dir),
-                (html_check, "SITE_REPORTS_DIR", site_reports_dir),
-                (html_check, "SITE_ACCOUNTS_DIR", site_accounts_dir),
-                (html_check, "HOLDINGS_SNAPSHOT_PATH", snapshot_path),
-                (html_check, "STEADY_INCOME_DATA_PATH", steady_data_path),
-                (html_check, "STEADY_INCOME_PAGE_PATH", site_dir / "steady_income.html"),
-            )
-            with ExitStack() as stack:
-                for module, name, value in patches:
-                    stack.enter_context(patch.object(module, name, value))
-                pages.build_pages()
-
-                report_html = (site_reports_dir / "report_20990110.html").read_text(encoding="utf-8")
-                self.assertEqual(report_html.count('class="summary-item"'), 4)
-                self.assertEqual(report_html.count('class="holding-item"'), 4)
-                self.assertIn("规则版组合兜底复盘", report_html)
-                self.assertNotIn("A股个股（", report_html)
-                self.assertNotIn("场内基金/ETF/LOF（", report_html)
-                self.assertNotIn("场外基金（", report_html)
-                self.assertIn("原始 AI 股票日报", report_html)
-                self.assertLess(
-                    report_html.index("账户乙分析结果摘要"),
-                    report_html.index("账户乙持仓明细与分析"),
-                )
-                self.assertLess(
-                    report_html.index("账户乙持仓明细与分析"),
-                    report_html.index("账户乙 LOF/ETF 组合复盘"),
-                )
-                self.assertLess(
-                    report_html.index("账户丙持仓明细与分析"),
-                    report_html.index("账户丙 场外基金组合复盘"),
-                )
-                self.assertIn('class="account-section"', report_html)
-                self.assertIn("overflow-x: hidden", report_html)
-                self.assertIn("box-sizing: border-box", report_html)
-                self.assertEqual(len(list(site_accounts_dir.glob("*.html"))), 3)
-                self.assertEqual(html_check.main(), 0)
-
-    def test_advice_page_preserves_history_but_defaults_to_latest_current_cards(self) -> None:
-        records = []
-        for day, code, name in (
-            ("2099-01-08", "111111", "测试股票甲"),
-            ("2099-01-09", "111111", "测试股票甲"),
-            ("2099-01-10", "222222", "测试股票乙"),
-        ):
-            records.append(
-                {
-                    "date": day,
-                    "code": code,
-                    "name": name,
-                    "account": "账户甲",
-                    "action": "观望",
-                    "score": 50,
-                    "sentiment": "震荡",
-                    "action_group": "持有/观望类",
-                    "is_current_holding_now": True,
-                    "d1_status": "等待验证",
-                    "d5_status": "等待验证",
-                    "d20_status": "等待验证",
-                }
-            )
-        accuracy = advice.build_accuracy_with_metadata(
-            records,
-            latest_report_date="2099-01-10",
-            latest_report_name="report_20990110.md",
-            new_advice_count=1,
-        )
-
-        html = advice.render_html(accuracy)
-
-        self.assertIn("历史全部建议回测</span><span class=\"summary-count\">3 条", html)
-        self.assertIn("查看当前持仓全部历史建议", html)
-        self.assertEqual(len(advice._latest_record_per_code(records)), 2)
-        self.assertIn(".overview-grid,.card-grid,.record-grid,.metric-grid,.period-grid { grid-template-columns:1fr; }", html)
-        self.assertIn("overflow-x:hidden", html)
-
-    def test_advice_markdown_preserves_all_history_records(self) -> None:
-        records = [
-            {
-                "date": f"2099-01-{(index % 28) + 1:02d}",
-                "code": f"{index:06d}",
-                "name": f"测试股票{index}",
-                "action": "观望",
-                "sentiment": "震荡",
-                "is_current_holding_now": True,
-                "d1_status": "等待验证",
-                "d5_status": "等待验证",
-                "d20_status": "等待验证",
-            }
-            for index in range(35)
-        ]
-        accuracy = advice.build_accuracy_with_metadata(
-            records,
-            latest_report_date="2099-01-28",
-            latest_report_name="report_20990128.md",
-            new_advice_count=0,
-        )
-
-        markdown = advice.render_markdown(accuracy, "2099-01-28")
-        history_section = markdown.split("## 历史全部建议回测", 1)[1].split("## 最近错误案例", 1)[0]
-        current_section = markdown.split("## 当前持仓建议回看", 1)[1].split("## 最近建议回看", 1)[0]
-
-        self.assertEqual(history_section.count("\n- "), 35)
-        self.assertEqual(current_section.count("\n- "), 35)
-        self.assertIn("测试股票0(000000)", history_section)
-        self.assertIn("测试股票34(000034)", history_section)
-
-    def test_workflow_has_runtime_headroom(self) -> None:
-        workflow = (holdings.ROOT_DIR / ".github" / "workflows" / "00-daily-analysis.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("vars.ANALYSIS_TIMEOUT_MINUTES || '45'", workflow)
+    def test_workflow_has_one_official_post_close_run_and_non_deploy_modes(self) -> None:
+        workflow = (holdings.ROOT_DIR / ".github" / "workflows" / "00-daily-analysis.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("cron:"), 1)
         self.assertIn("cron: '23 10 * * 1-5'", workflow)
-        self.assertIn("cron: '23 12 * * 1-5'", workflow)
-
-        ordered_steps = (
-            "检查持仓日报链路回归",
-            "生成持仓自选股列表",
-            "执行股票分析",
-            "检查有效股票日报",
-            "检查日报 code 覆盖",
-            "更新 AI 建议准确性回测",
-            "生成静态报告网页",
-            "检查静态报告网页",
-            "Upload Pages artifact",
-        )
-        positions = [workflow.index(step) for step in ordered_steps]
-        self.assertEqual(positions, sorted(positions))
+        self.assertIn("pages-only", workflow)
+        self.assertIn("validated-build-inputs", workflow)
+        self.assertNotIn('echo "STOCK_LIST=', workflow)
 
 
 if __name__ == "__main__":

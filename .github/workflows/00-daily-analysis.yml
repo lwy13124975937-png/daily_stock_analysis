@@ -1,11 +1,9 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 交易日北京时间 18:23 / 20:23
-  # 避开 GitHub Actions 整点高峰，并增加一次晚间补跑机会。
+  # 定时触发 - 交易日北京时间 18:23。一天只产生一个正式收盘后建议。
   schedule:
     - cron: '23 10 * * 1-5'    # 周一到周五，UTC 10:23 = 北京时间 18:23
-    - cron: '23 12 * * 1-5'    # 周一到周五，UTC 12:23 = 北京时间 20:23
   
   # 手动触发
   workflow_dispatch:
@@ -19,6 +17,7 @@ on:
           - full          # 完整分析（股票+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
+          - pages-only    # 仅从上一版已验证结构化产物重建 Pages（0 次 LLM）
       force_run:
         description: '强制运行（跳过交易日检查）'
         required: false
@@ -27,6 +26,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -37,36 +37,83 @@ concurrency:
 
 jobs:
   analyze:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 添加超时限制，防止任务卡死
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '45') }}
     
     steps:
-      - name: 随机延迟（避免固定时间访问）
-        run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
-      
       - name: 检出代码
         uses: actions/checkout@v5
+
+      - name: 确定运行模式和业务日期
+        run: |
+          echo "MODE=${{ github.event.inputs.mode || 'full' }}" >> "$GITHUB_ENV"
+          echo "REPORT_DATE=$(TZ='Asia/Shanghai' date '+%Y%m%d')" >> "$GITHUB_ENV"
       
       - name: 设置 Python 环境
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: requirements.lock
       
       - name: 安装依赖
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.lock
       
       - name: 创建必要目录
         run: |
-          mkdir -p data logs reports
+          mkdir -p data logs reports site_data
+
+      - name: 查找上一版已验证构建输入
+        id: previous-build
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'pages-only' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: '00-daily-analysis.yml',
+              branch: 'main',
+              status: 'success',
+              per_page: 50,
+            });
+            for (const run of runs) {
+              if (run.id === context.runId) continue;
+              const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+                per_page: 100,
+              });
+              if (artifacts.some((artifact) => artifact.name === 'validated-build-inputs')) {
+                core.setOutput('run-id', String(run.id));
+                return;
+              }
+            }
+            core.setFailed('No previous successful validated-build-inputs artifact exists.');
+
+      - name: 恢复上一版已验证构建输入
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'pages-only' }}
+        uses: actions/download-artifact@v6
+        with:
+          name: validated-build-inputs
+          path: .
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.previous-build.outputs.run-id }}
+
+      - name: 读取 pages-only 结构化报告日期
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'pages-only' }}
+        run: |
+          REPORT_DATE=$(python -c "import json,pathlib; items=[json.loads(p.read_text(encoding='utf-8')) for p in pathlib.Path('reports').glob('report_*.json')]; print(max(str(x['report_date']).replace('-','') for x in items))")
+          echo "REPORT_DATE=$REPORT_DATE" >> "$GITHUB_ENV"
 
       - name: 检查持仓日报链路回归
         run: python -m unittest -q tests.test_holding_report_workflow
 
       - name: 生成持仓自选股列表
+        if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' || github.event.inputs.mode == 'stocks-only') }}
         env:
           HOLDINGS_DATA_URL: https://raw.githubusercontent.com/lwy13124975937-png/stock-dashboard/main/holdings_data.json
           HOLDINGS_DATA_API_URL: https://api.github.com/repos/lwy13124975937-png/stock-dashboard/contents/holdings_data.json?ref=main
@@ -76,6 +123,7 @@ jobs:
         run: python scripts/build_stock_list_from_holdings.py
       
       - name: 执行股票分析
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'pages-only' }}
         env:
           # ==========================================
           # AI 配置
@@ -403,15 +451,12 @@ jobs:
             echo "✅ LITELLM 配置文件已写入: $LITELLM_CONFIG"
           fi
 
-          # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
-          
           echo "=========================================="
           echo "🚀 A股自选股智能分析系统"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           echo "🎯 运行模式: $MODE"
-          echo "📊 自选股: $STOCK_LIST"
+          echo "📊 自选股列表已通过 fingerprint 日志确认，不在 Actions 输出完整代码清单"
           echo "📝 报告类型: $REPORT_TYPE"
           echo ""
           echo "=========================================="
@@ -484,8 +529,11 @@ jobs:
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
             python main.py --no-market-review $FORCE_RUN_ARG
-          else
+          elif [ "$MODE" = "full" ]; then
             python main.py $FORCE_RUN_ARG
+          else
+            echo "ERROR: unsupported analysis mode: $MODE" >&2
+            exit 2
           fi
 
       - name: 上传 debug logs
@@ -498,23 +546,40 @@ jobs:
           retention-days: 30
 
       - name: 检查有效股票日报
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'market-only' }}
-        run: python scripts/check_report_valid.py
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' || github.event.inputs.mode == 'stocks-only' || github.event.inputs.mode == 'pages-only' }}
+        run: python scripts/check_report_valid.py --report "reports/report_${REPORT_DATE}.json"
 
       - name: 检查日报 code 覆盖
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'market-only' }}
-        run: python scripts/check_report_coverage.py
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' || github.event.inputs.mode == 'stocks-only' || github.event.inputs.mode == 'pages-only' }}
+        run: python scripts/check_report_coverage.py --stock-list site_data/current_stock_list.json --report "reports/report_${REPORT_DATE}.json"
 
       - name: 更新 AI 建议准确性回测
-        run: python scripts/update_advice_backtest.py
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' }}
+        run: python scripts/update_advice_backtest.py --report "reports/report_${REPORT_DATE}.json"
 
       - name: 生成稳健收益规则评估
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' }}
         run: python scripts/build_steady_income_report.py
 
+      - name: 保存已验证的确定性构建输入
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: validated-build-inputs
+          path: |
+            reports/
+            site_data/
+            data/advice_history.jsonl
+            data/advice_history_manifest.json
+            data/advice_accuracy.json
+          retention-days: 30
+
       - name: 生成静态报告网页
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' || github.event.inputs.mode == 'pages-only' }}
         run: python scripts/build_pages_report.py
 
       - name: 检查静态报告网页
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' || github.event.inputs.mode == 'pages-only' }}
         run: python scripts/check_report_html.py
 
       - name: 上传分析报告
@@ -529,14 +594,17 @@ jobs:
           retention-days: 30
 
       - name: Setup Pages
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' || github.event.inputs.mode == 'pages-only' }}
         uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' || github.event.inputs.mode == 'pages-only' }}
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
       - name: Deploy to GitHub Pages
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'full' || github.event.inputs.mode == 'pages-only' }}
         id: deployment
         uses: actions/deploy-pages@v4
       

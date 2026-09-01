@@ -2,39 +2,33 @@
 
 ## Purpose
 
-The Steady Income module screens the complete active Shanghai/Shenzhen A-share universe for lower risk, sustainable cash dividends, and long-term total return. It is independent from current holdings, rule-based, makes no LLM calls, and does not predict short-term price direction.
+Steady Income screens the Shanghai/Shenzhen A-share universe with a risk-first, evidence-timed ruleset. It is independent from current holdings, makes no LLM calls, and does not predict short-term price direction. `Rule low risk A/B` is a screening label, not capital protection, guaranteed income, or a buy instruction.
 
-Hard risk gates come first. Dividend yield and stability scores only rank stocks inside the same risk tier. A high yield cannot offset losses, negative operating cash flow, excessive drawdown, excessive volatility, or broken dividend continuity.
+## Evidence contract
 
-## Inputs and outputs
+- Cash dividends count only when implementation is explicit, an effective ex-dividend date exists, the date is on or before `as_of`, and cash per share is positive. Announcement dates never substitute for cash-event dates.
+- Financial evidence records both `period_end` and `available_at`. Historical mode accepts it only when `available_at <= as_of`.
+- Historical mode refuses to run when point-in-time universe, security status, disclosure availability, or dividend evidence is unavailable. It does not reuse today's universe as a no-lookahead backtest.
+- Canonical industry data selects the sector model. Company-name substrings are not an industry classifier. Banks, insurers, and brokers fail closed when their dedicated regulatory evidence is unavailable; they never use the normal-corporate operating-cash-flow model.
+- Price dates are checked against the latest completed official A-share session, so pre-close runs do not require a close that does not exist yet. Historical coverage reports expected and actual sessions, coverage ratio, boundaries, provider, and adjustment semantics.
+- Until the Provider contract proves point-in-time total-return semantics, the UI calls the output a historical adjusted-price replay rather than a no-lookahead total return.
 
-- Scope: all active Shanghai/Shenzhen A-share equities in the public stock index. Beijing, HK, US, B-share, index, bond, ETF, LOF, and other fund instruments are excluded.
-- Two-stage screen: every stock receives a bulk dividend, profitability, listing-age, and ST-risk pre-screen; only the strongest finite seed set receives long price history plus normalized financial abstracts and implemented dividend records.
-- Income: trailing-12-month pre-tax cash dividend per share and dividend yield.
-- Sustainability: consecutive dividend years, parent net profit, operating cash flow, and cash-flow coverage.
-- Risk: annualized volatility and maximum drawdown from roughly seven years of daily data.
-- Replay: the latest five returns between complete calendar year-ends, using the previous year-end as each baseline so cross-year price moves are not omitted. Forward-adjusted prices already reflect dividends and corporate actions.
-- Context: PE, PB, and ROE are supporting evidence only.
+Schema, model, evaluator, sector-model, evidence, and price-model versions are included in payloads and cache keys. Missing trustworthy evidence produces `data insufficient`; values are not fabricated.
 
-The Pages module does not use holdings as its candidate universe and never returns account, position quantity, cost, market value, or P&L.
+## Screening and display
 
-Dividend continuity counts only positive cash-dividend events on or before the evaluation date. TTM yield is recalculated from TTM cash dividend per share and the displayed portfolio quote so the price and yield use the same reference point.
+Every universe security receives the cheap screen. A configurable, sector-stratified subset receives deep evidence evaluation. Structured output and Pages disclose selection_mode, deep budget, evaluated and unevaluated counts, and is_exhaustive. In shortlist mode, zero qualified means only that none of the evaluated shortlist passed; it is not a whole-market zero. Each requested security has exactly one terminal status; completed evaluation means qualified plus rule-rejected. A completed valid zero, a partial degraded run, and a provider outage are rendered as different outcomes.
 
-## Risk tiers
+Qualified candidates are shown by default. Excluded and data-insufficient securities are compact and collapsed. Ranking scores exist only inside an evidence-complete comparable set. The default page does not show dividend-implied observation prices because they are not intrinsic values or recommended entry prices.
 
-`稳健` and `较稳健` are qualified low-risk candidates. `观察` is not qualified. `不纳入` means a hard failure was triggered. `数据不足` means the evidence is incomplete.
+The Pages dataset never exposes account, quantity, cost, market value, or P&L fields.
 
-The displayed score is only a within-tier rules score. It is not an expected return and cannot promote a stock across a risk tier.
+## Build and access
 
-## Access and rollback
+- GitHub Pages: `steady_income.html`.
+- Public dataset: `site/data/steady_income.json`.
+- The authenticated current-portfolio evaluator remains separately named `Portfolio Stability`.
 
-- GitHub Pages: `稳健收益` in the homepage report center, page `steady_income.html`.
-- Public dataset: `site/data/steady_income.json`, including whole-universe, pre-screen, deep-review, and qualified counts.
+`scripts/build_steady_income_report.py` produces versioned data only. `scripts/build_pages_report.py` is the sole site owner and builds a fresh staging tree, validates manifest hashes, build IDs, links, HTML safety, and cross-dataset dates, then transactionally promotes the validated tree while preserving the previous site on failure. No LLM is called.
 
-The authenticated Web app keeps its existing current-portfolio evaluator under the explicit label `持仓稳健性` (Portfolio Stability), so it is no longer confused with the market-wide Pages screen.
-
-The daily workflow runs `scripts/build_steady_income_report.py` against the public Shanghai/Shenzhen stock index and bulk dividend tables. It applies the market-wide pre-screen, fetches financial abstracts, implemented dividend details, and long price history only for the bounded deep-review seeds, reuses the same hard risk gates, writes `site_data/steady_income.json`, and makes no LLM calls. The Pages guard blocks deployment when the universe is implausibly small, funnel counts disagree, or the page regresses to a current-holdings scope.
-
-Reverting the Pages builder, market dataset script, HTML guard, workflow step, tests, and these docs removes the public market screen without affecting the existing analysis, portfolio, backtest, alert, or LLM pipelines.
-
-Every Shanghai/Shenzhen equity enters the basic pre-screen. The deep-review cap is disclosed together with universe and pre-screen counts, so a finite deep review is never presented as an exhaustive per-stock review. Standardized debt structure, future payout policy, and special dividends are not available as hard gates; missing evidence is not inferred to be safe.
+When disclosure dates, historical security-state data, or financial regulatory metrics are unavailable from current Providers, the corresponding historical or financial-sector evaluation remains unavailable/insufficient by design.

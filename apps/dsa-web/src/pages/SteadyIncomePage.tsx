@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Activity, CircleDollarSign, RefreshCw, ShieldCheck, TrendingDown, WalletCards } from 'lucide-react';
+import { Activity, RefreshCw, ShieldCheck, TrendingDown, WalletCards } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { steadyIncomeApi } from '../api/steadyIncome';
 import type { ParsedApiError } from '../api/error';
@@ -55,10 +55,10 @@ const CandidateCard = ({ item, name, compact = false }: CandidateCardProps) => (
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Badge variant={riskVariant(item.riskTier)} size="md">{item.riskTier}</Badge>
-          {!compact ? (
+          <Badge variant={riskVariant(item.riskTier)} size="md">{item.publicRiskLabel}</Badge>
+          {!compact && item.rankingScore != null ? (
             <span className="rounded-full border border-border/60 px-2.5 py-1 text-xs text-secondary-text">
-              同层规则分 {item.score}
+              同层规则分 {item.rankingScore}
             </span>
           ) : null}
         </div>
@@ -96,38 +96,24 @@ const CandidateCard = ({ item, name, compact = false }: CandidateCardProps) => (
             </section>
           </div>
 
-          {item.priceBands ? (
-            <section>
-              <div className="mb-2 flex items-center gap-2">
-                <CircleDollarSign className="h-4 w-4 text-cyan" />
-                <h3 className="text-sm font-semibold text-foreground">股息率价格带</h3>
-              </div>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                <Metric label="高股息观察价" value={formatNumber(item.priceBands.highIncomePrice)} hint="对应约 5% TTM 股息率" />
-                <Metric label="平衡观察价" value={formatNumber(item.priceBands.balancedPrice)} hint="对应约 3.5% TTM 股息率" />
-                <Metric label="低收益上沿" value={formatNumber(item.priceBands.lowIncomePrice)} hint="对应约 2.5% TTM 股息率" />
-              </div>
-            </section>
-          ) : null}
-
           <section>
             <div className="mb-2 flex items-center gap-2">
               <Activity className="h-4 w-4 text-cyan" />
-              <h3 className="text-sm font-semibold text-foreground">五期复权总回报</h3>
-              <span className="text-xs text-secondary-text">含分红和拆并股影响</span>
+              <h3 className="text-sm font-semibold text-foreground">历史复权价格回放</h3>
+              <span className="text-xs text-secondary-text">仅展示 Provider 当前复权口径</span>
             </div>
             {item.replayPeriods.length ? (
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
                 {item.replayPeriods.map((period) => (
                   <div key={`${item.code}-${period.label}`} className="rounded-lg border border-border/55 px-3 py-2">
                     <p className="text-xs text-secondary-text">{period.label}</p>
-                    <p className={`mt-1 font-semibold tabular-nums ${period.totalReturnPct >= 0 ? 'text-success' : 'text-danger'}`}>
-                      {period.totalReturnPct > 0 ? '+' : ''}{period.totalReturnPct.toFixed(2)}%
+                    <p className={`mt-1 font-semibold tabular-nums ${period.adjustedPriceReturnPct >= 0 ? 'text-success' : 'text-danger'}`}>
+                      {period.adjustedPriceReturnPct > 0 ? '+' : ''}{period.adjustedPriceReturnPct.toFixed(2)}%
                     </p>
                   </div>
                 ))}
               </div>
-            ) : <p className="text-sm text-secondary-text">完整年度行情不足，暂不做历史稳定性判断。</p>}
+            ) : <p className="text-sm text-secondary-text">交易日历覆盖不足，暂不做年度历史稳定性判断。</p>}
           </section>
         </>
       ) : (
@@ -167,6 +153,7 @@ const SteadyIncomePage = () => {
 
   useEffect(() => {
     document.title = '持仓稳健性 - DSA';
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initialize the report from the API
     void load();
   }, [load]);
 
@@ -216,6 +203,20 @@ const SteadyIncomePage = () => {
           </div>
 
           {data.warnings.map((warning) => <InlineAlert key={warning} variant="warning" message={warning} />)}
+          {data.dataStatus === 'provider_unavailable' ? (
+            <InlineAlert
+              variant="warning"
+              title="数据源异常，评估未完成"
+              message="当前不能得出没有合格标的的结论，请等待数据源恢复后重新评估。"
+            />
+          ) : null}
+          {data.dataStatus === 'degraded' || data.dataStatus === 'partial' ? (
+            <InlineAlert
+              variant="warning"
+              title="评估结果不完整"
+              message="仅部分证券完成证据评估，当前结果不能代表完整筛选结论。"
+            />
+          ) : null}
 
           {data.candidates.length ? (
             <section className="space-y-3" aria-labelledby="qualified-heading">
@@ -230,8 +231,12 @@ const SteadyIncomePage = () => {
           ) : (
             <EmptyState
               icon={<TrendingDown className="h-7 w-7" />}
-              title={data.evaluatedCount ? '当前没有股票通过低风险门槛' : '还没有可评估的 A 股持仓'}
-              description={data.evaluatedCount ? '这是有效结果，不会为了凑数放宽回撤、现金流或分红持续性条件。' : '先在持仓页录入 A 股交易，再回来做稳健收益评估。'}
+              title={data.dataStatus === 'provider_unavailable'
+                ? '数据源异常，不能判断是否存在合格标的'
+                : data.evaluatedCount ? '当前没有股票通过低风险门槛' : '还没有可评估的 A 股持仓'}
+              description={data.dataStatus === 'provider_unavailable'
+                ? '本次评估没有正常完成，这不是合法的零候选结论。'
+                : data.evaluatedCount ? '这是有效结果，不会为了凑数放宽回撤、现金流或分红持续性条件。' : '先在持仓页录入 A 股交易，再回来做稳健收益评估。'}
               action={data.evaluatedCount ? undefined : <Link className="btn-primary" to="/portfolio">前往持仓</Link>}
             />
           )}
@@ -258,7 +263,6 @@ const SteadyIncomePage = () => {
                     priority: '排序原则',
                     dividend: '股息口径',
                     replay: '历史回放',
-                    price_bands: '价格带口径',
                     limitations: '能力边界',
                   }[key] || key}</dt>
                   <dd className="mt-1 leading-6 text-secondary-text">{value}</dd>

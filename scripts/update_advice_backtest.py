@@ -12,34 +12,69 @@ import argparse
 import json
 import math
 import re
-import shutil
+import statistics
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from html import escape
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from src.core.session_calendar import (
+    ExchangeSessionCalendar,
+    SessionCalendar,
+    SessionCalendarUnavailable,
+    nth_session_after,
+)
+from src.reports.contracts import (
+    ADVICE_EVALUATION_VERSION,
+    ADVICE_HISTORY_SCHEMA_VERSION,
+    ActionCode,
+    DataIntegrityError,
+    FailureCode,
+    SentimentCode,
+    normalize_action,
+    normalize_sentiment,
+    public_advice_record,
+    read_json_strict,
+    read_jsonl_strict,
+    read_jsonl_strict_bytes,
+    sha256_bytes,
+    write_json_atomic,
+    write_jsonl_atomic,
+)
+
+
 REPORTS_DIR = ROOT_DIR / "reports"
 DATA_DIR = ROOT_DIR / "data"
-SITE_DIR = ROOT_DIR / "site"
-SITE_DATA_DIR = SITE_DIR / "data"
+SITE_DATA_DIR = ROOT_DIR / "site_data"
 SITE_DATA_HISTORY_PATH = SITE_DATA_DIR / "advice_history.jsonl"
 SITE_DATA_ACCURACY_PATH = SITE_DATA_DIR / "advice_accuracy.json"
+SITE_DATA_HISTORY_MANIFEST_PATH = SITE_DATA_DIR / "advice_history_manifest.json"
 LOCAL_HISTORY_PATH = DATA_DIR / "advice_history.jsonl"
 LOCAL_ACCURACY_PATH = DATA_DIR / "advice_accuracy.json"
+LOCAL_HISTORY_MANIFEST_PATH = DATA_DIR / "advice_history_manifest.json"
 SNAPSHOT_PATH = ROOT_DIR / "site_data" / "holdings_snapshot.json"
-CURRENT_STOCK_LIST_PATH = ROOT_DIR / "site_data" / "current_stock_list.json"
 PAGES_HISTORY_URL = (
     "https://lwy13124975937-png.github.io/"
     "daily_stock_analysis/data/advice_history.jsonl"
 )
+PAGES_HISTORY_MANIFEST_URL = (
+    "https://lwy13124975937-png.github.io/"
+    "daily_stock_analysis/data/advice_history_manifest.json"
+)
+PAGES_ACCURACY_URL = (
+    "https://lwy13124975937-png.github.io/"
+    "daily_stock_analysis/data/advice_accuracy.json"
+)
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = ADVICE_HISTORY_SCHEMA_VERSION
+EVALUATION_VERSION = ADVICE_EVALUATION_VERSION
 PERIODS = {"d1": 1, "d5": 5, "d20": 20}
 HOLD_BAND = {"d1": 0.03, "d5": 0.05, "d20": 0.08}
 REPORTABLE_TYPE = "stock"
@@ -64,8 +99,14 @@ SENSITIVE_KEYS = {
 class Holding:
     code: str
     name: str
-    account: str
+    accounts: tuple[str, ...]
     type: str
+
+    @property
+    def account(self) -> str:
+        """Legacy display alias; stock advice itself is not account-specific."""
+
+        return " / ".join(self.accounts)
 
 
 @dataclass(frozen=True)
@@ -180,6 +221,30 @@ class MockErrorPriceProvider(PriceProvider):
         return list(self.bars_by_code.get(code, [])), self.error
 
 
+class StaticSessionCalendar:
+    """Deterministic calendar used only by local self-tests and fixtures."""
+
+    def __init__(self, sessions: Iterable[date]):
+        self.sessions = sorted(set(sessions))
+
+    def sessions_between(self, start: date, end: date) -> list[date]:
+        return [session for session in self.sessions if start <= session <= end]
+
+    def completed_session_at(self, moment: datetime) -> date:
+        available = [session for session in self.sessions if session <= moment.astimezone(SHANGHAI_TZ).date()]
+        if not available:
+            raise SessionCalendarUnavailable("static calendar has no completed session")
+        return available[-1]
+
+
+@dataclass(frozen=True)
+class HistoryLoadResult:
+    records: list[dict[str, Any]]
+    status: str
+    source: str
+    manifest: dict[str, Any]
+
+
 def now_iso() -> str:
     return datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds")
 
@@ -191,7 +256,9 @@ def now_text() -> str:
 def report_date_text(report_path: Path) -> str:
     match = re.search(r"(20\d{6})", report_path.stem)
     if not match:
-        return datetime.fromtimestamp(report_path.stat().st_mtime, SHANGHAI_TZ).strftime("%Y-%m-%d")
+        raise DataIntegrityError(
+            f"report filename has no explicit YYYYMMDD business date: {report_path}"
+        )
     raw = match.group(1)
     return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
 
@@ -214,57 +281,34 @@ def clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def compact_summary(value: Any, *, limit: int = 500) -> str:
+    """Bound public summaries without cutting a sentence or Markdown token."""
+
+    text = clean_text(value)
+    if len(text) <= limit:
+        return text
+    candidates = [
+        match.end()
+        for match in re.finditer(r"[。！？；.!?;](?:[\"'”’）》】])?", text[: limit + 1])
+    ]
+    if candidates:
+        return text[: candidates[-1]].rstrip() + "（摘要已截取）"
+    # A source with no trustworthy boundary is kept intact.  A half sentence
+    # is more misleading than a slightly longer public summary.
+    return text
+
+
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def load_snapshot(path: Path = SNAPSHOT_PATH) -> dict:
     if not path.exists():
-        print(f"WARNING: holdings snapshot not found: {path}", file=sys.stderr)
-        return {}
-    try:
-        return read_json(path)
-    except Exception as exc:
-        print(f"WARNING: cannot read holdings snapshot {path}: {exc}", file=sys.stderr)
-        return {}
-
-
-def load_current_stock_list(path: Path = CURRENT_STOCK_LIST_PATH) -> dict[str, Holding]:
-    if not path.exists():
-        print(f"WARNING: current stock list not found: {path}", file=sys.stderr)
-        return {}
-    try:
-        payload = read_json(path)
-    except Exception as exc:
-        print(f"WARNING: cannot read current stock list {path}: {exc}", file=sys.stderr)
-        return {}
-    stocks = payload.get("stocks", []) if isinstance(payload, dict) else []
-    if not isinstance(stocks, list):
-        return {}
-
-    holdings: dict[str, Holding] = {}
-    for item in stocks:
-        if not isinstance(item, dict):
-            continue
-        if clean_text(item.get("type")).lower() != REPORTABLE_TYPE:
-            continue
-        code = normalize_code(item.get("code"))
-        if not code:
-            continue
-        holdings[code] = Holding(
-            code=code,
-            name=clean_text(item.get("name")) or code,
-            account=clean_text(item.get("account")) or "",
-            type=REPORTABLE_TYPE,
-        )
-
-    if holdings:
-        print(
-            "WARNING: using current_stock_list.json for current holding identity; "
-            "full holdings_snapshot.json is still required for account pages.",
-            file=sys.stderr,
-        )
-    return holdings
+        raise DataIntegrityError(f"holdings snapshot not found: {path}")
+    payload = read_json_strict(path)
+    if not isinstance(payload, dict) or not isinstance(payload.get("accounts"), dict):
+        raise DataIntegrityError(f"invalid holdings snapshot schema: {path}")
+    return payload
 
 
 def current_stock_holdings(snapshot: dict) -> dict[str, Holding]:
@@ -272,7 +316,7 @@ def current_stock_holdings(snapshot: dict) -> dict[str, Holding]:
     if not isinstance(accounts, dict):
         return {}
 
-    holdings: dict[str, Holding] = {}
+    aggregate: dict[str, dict[str, Any]] = {}
     for account, groups in accounts.items():
         if not isinstance(groups, dict):
             continue
@@ -285,25 +329,41 @@ def current_stock_holdings(snapshot: dict) -> dict[str, Holding]:
             code = normalize_code(item.get("code"))
             if not code:
                 continue
-            holdings[code] = Holding(
-                code=code,
-                name=clean_text(item.get("name")) or code,
-                account=clean_text(item.get("account")) or clean_text(account),
-                type=REPORTABLE_TYPE,
+            entry = aggregate.setdefault(
+                code,
+                {"name": clean_text(item.get("name")) or code, "accounts": set()},
             )
-    return holdings
+            account_name = clean_text(item.get("account")) or clean_text(account)
+            if account_name:
+                entry["accounts"].add(account_name)
+    return {
+        code: Holding(
+            code=code,
+            name=str(entry["name"]),
+            accounts=tuple(sorted(entry["accounts"])),
+            type=REPORTABLE_TYPE,
+        )
+        for code, entry in aggregate.items()
+    }
 
 
 def load_current_stock_holdings() -> dict[str, Holding]:
     snapshot = load_snapshot()
     holdings = current_stock_holdings(snapshot)
-    if holdings:
-        return holdings
-    return load_current_stock_list()
+    if not holdings:
+        raise DataIntegrityError("holdings snapshot contains no enabled stock holdings")
+    return holdings
 
 
 def latest_stock_report(reports_dir: Path = REPORTS_DIR) -> Path | None:
     reports = [p for p in reports_dir.glob("report_20*.md") if p.is_file()]
+    if not reports:
+        return None
+    return max(reports, key=lambda path: (report_date_key(path), path.name))
+
+
+def latest_structured_stock_report(reports_dir: Path = REPORTS_DIR) -> Path | None:
+    reports = [p for p in reports_dir.glob("report_20*.json") if p.is_file()]
     if not reports:
         return None
     return max(reports, key=lambda path: (report_date_key(path), path.name))
@@ -377,7 +437,10 @@ def is_failed_advice_text(text: str) -> bool:
 def extract_advice_from_report(report_path: Path, holdings: dict[str, Holding]) -> list[dict[str, Any]]:
     if report_path is None or not report_path.exists():
         return []
-    markdown_text = report_path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        markdown_text = report_path.read_bytes().decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise DataIntegrityError(f"invalid UTF-8 legacy report: {report_path}: {exc}") from exc
     summary_section = _split_section(markdown_text, "分析结果摘要")
     if not summary_section:
         summary_section = markdown_text
@@ -400,16 +463,26 @@ def extract_advice_from_report(report_path: Path, holdings: dict[str, Holding]) 
             "code": code,
             "name": holding.name or report_name or code,
             "type": REPORTABLE_TYPE,
-            "account": holding.account,
-            "action": action,
+            "accounts": list(holding.accounts),
+            "action_raw": action,
+            "action_normalized": normalize_action(action).value,
             "score": score,
-            "sentiment": sentiment,
+            "sentiment_raw": sentiment,
+            "sentiment_normalized": normalize_sentiment(sentiment).value,
             "summary": summary[:240],
             "source_report": f"reports/{report_path.name}",
             "holding_snapshot_date": snapshot_date,
             "is_current_holding_when_advised": True,
             "advice_close": None,
             "created_at": now_iso(),
+            "anchor_session": report_date,
+            "anchor_precision": "legacy_date_only",
+            "anchor_assumption": "旧 Markdown 日报无精确生成时刻；按日报日期做兼容锚定。",
+            "report_date": report_date,
+            "run_id": "legacy_markdown",
+            "recommendation_id": f"legacy:{report_date}:{code}",
+            "revision": 1,
+            "official": True,
         }
 
     if not records:
@@ -417,68 +490,327 @@ def extract_advice_from_report(report_path: Path, holdings: dict[str, Holding]) 
     return list(records.values())
 
 
-def read_history_file(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    if not path.exists():
-        return records
-    for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError as exc:
-            print(f"WARNING: skip invalid history line {path}:{line_number}: {exc}", file=sys.stderr)
-            continue
-        if isinstance(item, dict):
-            records.append(item)
-    return records
-
-
-def fetch_pages_history(url: str = PAGES_HISTORY_URL) -> list[dict[str, Any]]:
-    request = Request(url, headers={"User-Agent": "daily-stock-analysis-advice-backtest"})
+def extract_advice_from_structured_report(
+    report_path: Path,
+    holdings: dict[str, Holding],
+) -> list[dict[str, Any]]:
+    payload = read_json_strict(report_path)
+    if not isinstance(payload, dict):
+        raise DataIntegrityError(f"structured report must be an object: {report_path}")
+    required = (
+        "schema_version",
+        "run_id",
+        "generated_at",
+        "market_data_as_of",
+        "anchor_session",
+        "report_date",
+        "results",
+    )
+    missing = [field for field in required if field not in payload]
+    if missing:
+        raise DataIntegrityError(f"structured report missing fields {missing}: {report_path}")
+    anchor_session = parse_date(payload.get("anchor_session"))
+    report_date = parse_date(payload.get("report_date"))
+    generated_at_text = clean_text(payload.get("generated_at"))
+    if anchor_session is None or report_date is None:
+        raise DataIntegrityError(f"structured report has invalid report/anchor date: {report_path}")
     try:
-        with urlopen(request, timeout=15) as response:
-            payload = response.read().decode("utf-8", "ignore")
-    except Exception as exc:
-        print(f"WARNING: cannot fetch previous Pages advice history: {exc}", file=sys.stderr)
+        generated_at = datetime.fromisoformat(generated_at_text)
+    except ValueError as exc:
+        raise DataIntegrityError(f"structured report has invalid generated_at: {report_path}") from exc
+    if generated_at.tzinfo is None:
+        raise DataIntegrityError(f"structured report generated_at lacks timezone: {report_path}")
+
+    # Official history is post-close only. Intraday/weekend runs may still
+    # produce reports, but they do not create a new recommendation event.
+    if report_date != anchor_session:
+        print(
+            "WARNING: structured report is not a same-session post-close recommendation; "
+            f"report_date={report_date} anchor_session={anchor_session}. No advice appended.",
+            file=sys.stderr,
+        )
         return []
 
     records: list[dict[str, Any]] = []
-    for line in payload.splitlines():
-        line = line.strip()
-        if not line:
+    for item in payload.get("results", []):
+        if not isinstance(item, dict) or item.get("success") is not True:
             continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
+        code = normalize_code(item.get("code"))
+        holding = holdings.get(code)
+        if holding is None:
             continue
-        if isinstance(item, dict):
-            records.append(item)
+        action_raw = str(item.get("action_raw") or "")
+        sentiment_raw = str(item.get("sentiment_raw") or "")
+        records.append(
+            public_advice_record(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "evaluation_version": EVALUATION_VERSION,
+                    "recommendation_id": f"official:{anchor_session.isoformat()}:{code}",
+                    "run_id": clean_text(payload.get("run_id")),
+                    "revision": 1,
+                    "official": True,
+                    "date": anchor_session.isoformat(),
+                    "report_date": report_date.isoformat(),
+                    "anchor_session": anchor_session.isoformat(),
+                    "anchor_precision": "exact_session",
+                    "generated_at": generated_at.astimezone(SHANGHAI_TZ).isoformat(timespec="seconds"),
+                    "market_data_as_of": clean_text(payload.get("market_data_as_of")),
+                    "code": code,
+                    "name": holding.name or clean_text(item.get("name")) or code,
+                    "type": REPORTABLE_TYPE,
+                    "accounts": list(holding.accounts),
+                    "action_raw": action_raw,
+                    "action_normalized": normalize_action(action_raw).value,
+                    "sentiment_raw": sentiment_raw,
+                    "sentiment_normalized": normalize_sentiment(sentiment_raw).value,
+                    "score": item.get("score"),
+                    "summary_raw": str(item.get("public_summary") or ""),
+                    "summary": compact_summary(item.get("public_summary")),
+                    "source_report": f"reports/{report_path.name}",
+                    "holding_snapshot_date": report_date.isoformat(),
+                    "is_current_holding_when_advised": True,
+                    "advice_close": None,
+                    "created_at": generated_at.astimezone(SHANGHAI_TZ).isoformat(timespec="seconds"),
+                }
+            )
+        )
     return records
 
 
-def load_history() -> list[dict[str, Any]]:
-    local_records: list[dict[str, Any]] = []
-    for path in (LOCAL_HISTORY_PATH, SITE_DATA_HISTORY_PATH):
-        local_records.extend(read_history_file(path))
-    if local_records:
-        return merge_history(local_records)
-    remote_records = fetch_pages_history()
-    return merge_history(remote_records)
+def read_history_file(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return read_jsonl_strict(path)
+
+
+def _history_bytes(records: Iterable[dict[str, Any]]) -> bytes:
+    return b"".join(
+        (json.dumps(public_advice_record(record), ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        for record in records
+    )
+
+
+def build_history_manifest(records: list[dict[str, Any]]) -> dict[str, Any]:
+    payload = _history_bytes(records)
+    last = records[-1] if records else {}
+    return {
+        "schema_version": 1,
+        "generated_at": now_iso(),
+        "count": len(records),
+        "sha256": sha256_bytes(payload),
+        "last_recommendation_id": last.get("recommendation_id"),
+        "last_date": last.get("date"),
+        "evaluation_version": EVALUATION_VERSION,
+    }
+
+
+def migration_input_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
+    old_distribution: dict[str, int] = {}
+    new_distribution = {action.value: 0 for action in ActionCode}
+    sentiment_counts = {sentiment.value: 0 for sentiment in SentimentCode}
+    reclassified = 0
+    group_for_action = {
+        ActionCode.BUY: "买入类",
+        ActionCode.INCREASE: "买入类",
+        ActionCode.SELL: "卖出类",
+        ActionCode.REDUCE: "卖出类",
+        ActionCode.HOLD: "持有/观望类",
+        ActionCode.HOLD_WATCH: "持有/观望类",
+        ActionCode.OBSERVE: "持有/观望类",
+        ActionCode.UNKNOWN: "unknown",
+    }
+    for record in records:
+        old_group = str(record.get("action_group") or "unknown")
+        old_distribution[old_group] = old_distribution.get(old_group, 0) + 1
+        action = normalize_action(record.get("action_raw", record.get("action")))
+        sentiment = normalize_sentiment(record.get("sentiment_raw", record.get("sentiment")))
+        new_distribution[action.value] = new_distribution.get(action.value, 0) + 1
+        sentiment_counts[sentiment.value] = sentiment_counts.get(sentiment.value, 0) + 1
+        if old_group != "unknown" and old_group != group_for_action[action]:
+            reclassified += 1
+    return {
+        "original_count": len(records),
+        "raw_records_preserved": len(records),
+        "old_action_group_distribution": old_distribution,
+        "new_action_distribution": new_distribution,
+        "new_sentiment_distribution": sentiment_counts,
+        "reclassified_count": reclassified,
+    }
+
+
+def _validate_history_manifest(
+    *,
+    records: list[dict[str, Any]],
+    raw_bytes: bytes,
+    manifest: dict[str, Any],
+    source: str,
+) -> None:
+    if int(manifest.get("count", -1)) != len(records):
+        raise DataIntegrityError(
+            f"history count mismatch for {source}: manifest={manifest.get('count')} actual={len(records)}"
+        )
+    expected_hash = str(manifest.get("sha256") or "").strip().lower()
+    actual_hash = sha256_bytes(raw_bytes)
+    if not expected_hash or expected_hash != actual_hash:
+        raise DataIntegrityError(
+            f"history sha256 mismatch for {source}: expected={expected_hash or 'missing'} actual={actual_hash}"
+        )
+
+
+def _read_local_history_with_contract(history_path: Path, manifest_path: Path) -> HistoryLoadResult | None:
+    if not history_path.exists():
+        return None
+    raw = history_path.read_bytes()
+    records = read_jsonl_strict_bytes(raw, source=str(history_path))
+    if manifest_path.exists():
+        manifest = read_json_strict(manifest_path)
+        if not isinstance(manifest, dict):
+            raise DataIntegrityError(f"invalid history manifest object: {manifest_path}")
+        _validate_history_manifest(records=records, raw_bytes=raw, manifest=manifest, source=str(history_path))
+        manifest = dict(manifest)
+        manifest["migration_input_stats"] = migration_input_stats(records)
+        return HistoryLoadResult(merge_history(records), "verified_local", str(history_path), manifest)
+
+    # Compatibility migration: an old local accuracy payload is accepted only
+    # when its declared total exactly matches the strict JSONL record count.
+    accuracy_path: Path | None = None
+    if history_path == LOCAL_HISTORY_PATH:
+        accuracy_path = LOCAL_ACCURACY_PATH
+    elif history_path == SITE_DATA_HISTORY_PATH:
+        accuracy_path = SITE_DATA_ACCURACY_PATH
+    if accuracy_path is not None and accuracy_path.exists():
+        accuracy = read_json_strict(accuracy_path)
+        declared = (
+            accuracy.get("summary_all_history", {}).get("total_advice")
+            if isinstance(accuracy, dict)
+            else None
+        )
+        if isinstance(declared, int) and declared == len(records) and records:
+            manifest = build_history_manifest(merge_history(records))
+            manifest["migration_input_stats"] = migration_input_stats(records)
+            return HistoryLoadResult(
+                merge_history(records),
+                "verified_legacy_local",
+                str(history_path),
+                manifest,
+            )
+    raise DataIntegrityError(
+        f"history manifest missing for {history_path}; refusing to overwrite unverified history"
+    )
+
+
+def _fetch_bytes(url: str) -> bytes:
+    request = Request(url, headers={"User-Agent": "daily-stock-analysis-advice-backtest"})
+    with urlopen(request, timeout=20) as response:
+        return response.read()
+
+
+def fetch_pages_history(
+    history_url: str = PAGES_HISTORY_URL,
+    manifest_url: str = PAGES_HISTORY_MANIFEST_URL,
+    accuracy_url: str = PAGES_ACCURACY_URL,
+) -> HistoryLoadResult:
+    try:
+        raw = _fetch_bytes(history_url)
+    except Exception as exc:
+        raise DataIntegrityError(f"cannot fetch previous Pages advice history: {type(exc).__name__}: {exc}") from exc
+    records = read_jsonl_strict_bytes(raw, source=history_url)
+    try:
+        manifest_payload = json.loads(_fetch_bytes(manifest_url).decode("utf-8-sig"))
+    except Exception as manifest_exc:
+        # One-time compatibility for the pre-manifest deployment. The previous
+        # public accuracy model is an independent count witness; it must match.
+        try:
+            accuracy = json.loads(_fetch_bytes(accuracy_url).decode("utf-8-sig"))
+            declared = accuracy.get("summary_all_history", {}).get("total_advice")
+        except Exception as accuracy_exc:
+            raise DataIntegrityError(
+                "previous history manifest is unavailable and legacy count witness could not be verified: "
+                f"manifest={type(manifest_exc).__name__}; accuracy={type(accuracy_exc).__name__}"
+            ) from accuracy_exc
+        if not records or not isinstance(declared, int) or declared != len(records):
+            raise DataIntegrityError(
+                "previous history manifest is unavailable and legacy count witness does not match: "
+                f"declared={declared!r} actual={len(records)}"
+            )
+        merged = merge_history(records)
+        manifest = build_history_manifest(merged)
+        manifest["migration_input_stats"] = migration_input_stats(records)
+        return HistoryLoadResult(
+            merged,
+            "verified_legacy_remote",
+            history_url,
+            manifest,
+        )
+
+    if not isinstance(manifest_payload, dict):
+        raise DataIntegrityError(f"invalid Pages history manifest object: {manifest_url}")
+    _validate_history_manifest(
+        records=records,
+        raw_bytes=raw,
+        manifest=manifest_payload,
+        source=history_url,
+    )
+    manifest_payload = dict(manifest_payload)
+    manifest_payload["migration_input_stats"] = migration_input_stats(records)
+    return HistoryLoadResult(merge_history(records), "verified_remote", history_url, manifest_payload)
+
+
+def load_history(*, allow_bootstrap_empty_history: bool = False) -> HistoryLoadResult:
+    candidates = (
+        (LOCAL_HISTORY_PATH, LOCAL_HISTORY_MANIFEST_PATH),
+        (SITE_DATA_HISTORY_PATH, SITE_DATA_HISTORY_MANIFEST_PATH),
+    )
+    for history_path, manifest_path in candidates:
+        local = _read_local_history_with_contract(history_path, manifest_path)
+        if local is not None:
+            return local
+    try:
+        return fetch_pages_history()
+    except DataIntegrityError:
+        if not allow_bootstrap_empty_history:
+            raise
+    manifest = build_history_manifest([])
+    return HistoryLoadResult([], "bootstrap_empty_explicit", "explicit_cli", manifest)
 
 
 def sanitize_history_record(record: dict[str, Any]) -> dict[str, Any]:
-    cleaned = {key: value for key, value in record.items() if key not in SENSITIVE_KEYS}
-    cleaned["schema_version"] = int(cleaned.get("schema_version") or SCHEMA_VERSION)
-    cleaned["code"] = normalize_code(cleaned.get("code"))
-    cleaned["type"] = clean_text(cleaned.get("type")) or REPORTABLE_TYPE
-    cleaned["name"] = clean_text(cleaned.get("name")) or cleaned["code"]
-    cleaned["account"] = clean_text(cleaned.get("account"))
-    cleaned["action"] = clean_text(cleaned.get("action")) or "unknown"
-    cleaned["sentiment"] = clean_text(cleaned.get("sentiment")) or "unknown"
-    cleaned["summary"] = clean_text(cleaned.get("summary"))[:240]
-    return cleaned
+    # Legacy action/sentiment are migrated byte-for-byte into explicit raw
+    # fields; only derived fields are recomputed by the current evaluator.
+    action_raw = record.get("action_raw", record.get("action", ""))
+    sentiment_raw = record.get("sentiment_raw", record.get("sentiment", ""))
+    account_values = record.get("accounts")
+    if not isinstance(account_values, list):
+        account_values = [record.get("account")] if record.get("account") else []
+    base = dict(record)
+    base["schema_version"] = SCHEMA_VERSION
+    base["evaluation_version"] = EVALUATION_VERSION
+    base["code"] = normalize_code(record.get("code"))
+    base["type"] = clean_text(record.get("type")) or REPORTABLE_TYPE
+    base["name"] = clean_text(record.get("name")) or base["code"]
+    base["accounts"] = sorted({clean_text(value) for value in account_values if clean_text(value)})
+    base["action_raw"] = str(action_raw or "")
+    base["sentiment_raw"] = str(sentiment_raw or "")
+    base["action_normalized"] = normalize_action(action_raw).value
+    base["sentiment_normalized"] = normalize_sentiment(sentiment_raw).value
+    base["summary_raw"] = str(record.get("summary_raw", record.get("summary", "")) or "")
+    base["summary"] = compact_summary(base["summary_raw"])
+    base["date"] = clean_text(record.get("date") or record.get("report_date"))
+    base["report_date"] = clean_text(record.get("report_date") or base["date"])
+    base["anchor_session"] = clean_text(record.get("anchor_session")) or base["date"]
+    if not record.get("anchor_precision"):
+        base["anchor_precision"] = "legacy_date_only"
+        base["anchor_assumption"] = (
+            "旧记录仅保留日报日期；以该日期不晚于当日的最近交易时段作为兼容锚点。"
+        )
+    base["recommendation_id"] = clean_text(record.get("recommendation_id")) or (
+        f"legacy:{base['date']}:{base['code']}"
+    )
+    base["run_id"] = clean_text(record.get("run_id")) or "legacy"
+    base["revision"] = int(record.get("revision") or 1)
+    base["official"] = bool(record.get("official", True))
+    return public_advice_record(base)
 
 
 def merge_history(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -491,10 +823,82 @@ def merge_history(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         code = normalize_code(cleaned.get("code"))
         if not date_text or not code:
             continue
+        if cleaned.get("type") != REPORTABLE_TYPE:
+            continue
         cleaned["date"] = date_text
         cleaned["code"] = code
-        merged[(date_text, code)] = cleaned
-    return sorted(merged.values(), key=lambda item: (item.get("date", ""), item.get("code", "")))
+        key = (date_text, code)
+        # One official post-close recommendation per date/security. Exact
+        # retries are idempotent; a conflicting same-day revision is rejected
+        # instead of silently replacing the official recommendation.
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = cleaned
+            continue
+        official_fields = (
+            "action_raw",
+            "sentiment_raw",
+            "score",
+            "summary_raw",
+            "anchor_session",
+        )
+        conflicts = [
+            field
+            for field in official_fields
+            if existing.get(field) != cleaned.get(field)
+        ]
+        if conflicts:
+            raise DataIntegrityError(
+                "conflicting same-day official recommendation: "
+                f"date={date_text} code={code} fields={conflicts}; "
+                "the first official post-close recommendation remains authoritative"
+            )
+    return sorted(
+        merged.values(),
+        key=lambda item: (item.get("date", ""), item.get("code", ""), item.get("recommendation_id", "")),
+    )
+
+
+def merge_new_official_records(
+    history: Iterable[dict[str, Any]],
+    new_records: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Keep the first official post-close recommendation for a security/session.
+
+    Stored history is validated strictly by ``merge_history``. A later workflow
+    run on the same session is a recovery run, not a silent recommendation
+    revision, so it cannot replace the previously published raw advice.
+    """
+
+    existing = merge_history(history)
+    by_key = {(str(item.get("date") or ""), normalize_code(item.get("code"))): item for item in existing}
+    added: list[dict[str, Any]] = []
+    exact_retries = 0
+    conflicting_retries = 0
+    official_fields = ("action_raw", "sentiment_raw", "score", "summary_raw", "anchor_session")
+
+    for raw_record in new_records:
+        record = sanitize_history_record(raw_record)
+        key = (str(record.get("date") or ""), normalize_code(record.get("code")))
+        previous = by_key.get(key)
+        if previous is None:
+            by_key[key] = record
+            added.append(record)
+            continue
+        if all(previous.get(field) == record.get(field) for field in official_fields):
+            exact_retries += 1
+        else:
+            conflicting_retries += 1
+
+    merged = sorted(
+        by_key.values(),
+        key=lambda item: (item.get("date", ""), item.get("code", ""), item.get("recommendation_id", "")),
+    )
+    return merged, {
+        "added": len(added),
+        "exact_retries_skipped": exact_retries,
+        "conflicting_retries_skipped": conflicting_retries,
+    }
 
 
 def dataframe_to_bars(df: Any) -> list[DailyBar]:
@@ -576,51 +980,26 @@ def parse_float(value: Any) -> float | None:
 
 
 def classify_advice(record: dict[str, Any]) -> str:
-    text = f"{record.get('action', '')} {record.get('sentiment', '')}"
-    if any(token in text for token in ("买入", "加仓", "看多", "强烈看多", "偏多")):
-        return "买入类"
-    if any(token in text for token in ("卖出", "减仓", "避险", "看空", "强烈看空", "偏空")):
-        return "卖出类"
-    if any(token in text for token in ("持有", "观望", "中性", "震荡", "等待")):
-        return "持有/观望类"
-    return "unknown"
+    return normalize_action(record.get("action_raw", record.get("action"))).value
 
 
-def evaluate_hit(group: str, period: str, return_value: float) -> tuple[bool | None, str]:
-    if group == "买入类":
-        return return_value > 0, "买入后下跌" if return_value <= 0 else ""
-    if group == "卖出类":
-        return return_value < 0, "卖出后上涨" if return_value >= 0 else ""
-    if group == "持有/观望类":
+def evaluate_direction(action: ActionCode, return_value: float) -> tuple[bool | None, str]:
+    if action in {ActionCode.BUY, ActionCode.INCREASE}:
+        return return_value > 0, "方向性买入/加仓后下跌" if return_value <= 0 else ""
+    if action in {ActionCode.SELL, ActionCode.REDUCE}:
+        return return_value < 0, "方向性卖出/减仓后上涨" if return_value >= 0 else ""
+    return None, ""
+
+
+def evaluate_sentiment(sentiment: SentimentCode, period: str, return_value: float) -> bool | None:
+    if sentiment == SentimentCode.BULLISH:
+        return return_value > 0
+    if sentiment == SentimentCode.BEARISH:
+        return return_value < 0
+    if sentiment == SentimentCode.NEUTRAL:
         band = HOLD_BAND[period]
-        if -band <= return_value <= band:
-            return True, ""
-        return False, "观望后大涨" if return_value > band else "观望后大跌"
-    return None, "unknown"
-
-
-def available_weekday_count_after(analysis_date: date, today: date) -> int:
-    if today <= analysis_date:
-        return 0
-    count = 0
-    current = analysis_date + timedelta(days=1)
-    while current <= today:
-        if current.weekday() < 5:
-            count += 1
-        current += timedelta(days=1)
-    return count
-
-
-def is_validation_window_pending(analysis_date: date, offset: int) -> bool:
-    """Return True when the T+N window has not plausibly arrived yet.
-
-    The exact T+N target is based on effective trading bars. When the market
-    data source has no bars yet, this weekday lower bound keeps same-day,
-    weekend, and near-future advice from being reported as missing data.
-    """
-
-    today = datetime.now(SHANGHAI_TZ).date()
-    return available_weekday_count_after(analysis_date, today) < offset
+        return -band <= return_value <= band
+    return None
 
 
 def bars_date_range_text(bars: list[DailyBar]) -> str:
@@ -664,29 +1043,123 @@ def price_diagnostic(
     return "；".join(parts)
 
 
-def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str, Any]:
-    result = dict(record)
-    result.pop("price_warning", None)
-    analysis_date = parse_date(result.get("date"))
-    group = classify_advice(result)
-    result["action_group"] = group
-    if analysis_date is None:
-        for period in PERIODS:
-            result[f"{period}_status"] = result.get(f"{period}_status") or "数据不足"
-            result[f"{period}_hit"] = None
-        return result
+def _legacy_anchor_session(analysis_date: date, calendar: SessionCalendar) -> date:
+    search_start = analysis_date - timedelta(days=45)
+    sessions = [session for session in calendar.sessions_between(search_start, analysis_date) if session <= analysis_date]
+    if not sessions:
+        raise SessionCalendarUnavailable(
+            f"no completed A-share session available for legacy advice date {analysis_date.isoformat()}"
+        )
+    return sessions[-1]
 
-    if all(
-        result.get(f"{period}_status") == "已验证"
-        and parse_float(result.get(f"{period}_close")) is not None
-        for period in PERIODS
-    ):
-        return result
+
+def _clear_derived_fields(result: dict[str, Any]) -> None:
+    legacy_suffixes = ("_hit", "_miss_reason")
+    current_suffixes = (
+        "_direction_hit",
+        "_direction_miss_reason",
+        "_sentiment_aligned",
+        "_observe_consistent",
+        "_observe_reason",
+        "_hold_drawdown_flag",
+    )
+    for period in PERIODS:
+        for suffix in (*legacy_suffixes, *current_suffixes):
+            result.pop(f"{period}{suffix}", None)
+
+
+def _apply_evaluation_semantics(
+    result: dict[str, Any],
+    *,
+    period: str,
+    return_value: float,
+    action: ActionCode,
+    sentiment: SentimentCode,
+) -> None:
+    direction_hit, direction_reason = evaluate_direction(action, return_value)
+    result[f"{period}_direction_hit"] = direction_hit
+    if direction_reason:
+        result[f"{period}_direction_miss_reason"] = direction_reason
+    result[f"{period}_sentiment_aligned"] = evaluate_sentiment(sentiment, period, return_value)
+    if action == ActionCode.OBSERVE:
+        band = HOLD_BAND[period]
+        consistent = -band <= return_value <= band
+        result[f"{period}_observe_consistent"] = consistent
+        if not consistent:
+            result[f"{period}_observe_reason"] = (
+                "未捕捉上涨机会" if return_value > band else "未识别下跌风险"
+            )
+    else:
+        result[f"{period}_observe_consistent"] = None
+    if action in {ActionCode.HOLD, ActionCode.HOLD_WATCH}:
+        result[f"{period}_hold_drawdown_flag"] = return_value < -HOLD_BAND[period]
+    else:
+        result[f"{period}_hold_drawdown_flag"] = None
+
+
+def evaluate_record(
+    record: dict[str, Any],
+    provider: PriceProvider,
+    *,
+    calendar: SessionCalendar | None = None,
+    current_time: datetime | None = None,
+) -> dict[str, Any]:
+    result = sanitize_history_record(record)
+    result.pop("price_warning", None)
+    _clear_derived_fields(result)
+    result["evaluation_version"] = EVALUATION_VERSION
+    analysis_date = parse_date(result.get("date"))
+    action = normalize_action(result.get("action_raw"))
+    sentiment = normalize_sentiment(result.get("sentiment_raw"))
+    result["action_normalized"] = action.value
+    result["sentiment_normalized"] = sentiment.value
+    if analysis_date is None:
+        result["failure_code"] = FailureCode.INVALID_RESPONSE.value
+        for period in PERIODS:
+            result[f"{period}_status"] = "数据不足"
+        return public_advice_record(result)
+
+    session_calendar = calendar or ExchangeSessionCalendar()
+    now = current_time or datetime.now(SHANGHAI_TZ)
+    if now.tzinfo is None:
+        raise ValueError("current_time must be timezone-aware")
+    through_session = session_calendar.completed_session_at(now)
+    explicit_anchor = parse_date(result.get("anchor_session"))
+    if result.get("anchor_precision") == "exact_session" and explicit_anchor:
+        anchor_session = explicit_anchor
+    else:
+        anchor_session = _legacy_anchor_session(analysis_date, session_calendar)
+        result["anchor_session"] = anchor_session.isoformat()
+        result["anchor_precision"] = "legacy_date_only"
+        result["anchor_assumption"] = (
+            "旧记录无精确生成时刻；使用日报日期不晚于当日的最近正式交易时段。"
+        )
 
     code = normalize_code(result.get("code"))
-    bars, error = provider.get_bars(code, analysis_date)
-    bars = sorted({bar.trade_date: bar for bar in bars if bar.close > 0}.values(), key=lambda bar: bar.trade_date)
-    if not bars:
+    cached_advice_close = parse_float(result.get("advice_close"))
+    target_closes_available = all(
+        parse_float(result.get(f"{period}_close")) is not None
+        and parse_date(result.get(f"{period}_date")) is not None
+        for period in PERIODS
+        if nth_session_after(session_calendar, anchor_session, PERIODS[period], through_session) is not None
+    )
+    needs_prices = cached_advice_close is None or cached_advice_close <= 0 or not target_closes_available
+    bars: list[DailyBar] = []
+    error: str | None = None
+    if needs_prices:
+        bars, error = provider.get_bars(code, anchor_session)
+        bars = sorted(
+            {bar.trade_date: bar for bar in bars if bar.close > 0}.values(),
+            key=lambda bar: bar.trade_date,
+        )
+    bar_by_date = {bar.trade_date: bar for bar in bars}
+
+    advice_close = cached_advice_close
+    if advice_close is None or advice_close <= 0:
+        anchor_bar = bar_by_date.get(anchor_session)
+        advice_close = anchor_bar.close if anchor_bar else None
+    if advice_close is None or advice_close <= 0:
+        result["failure_code"] = FailureCode.MARKET_DATA_MISSING.value
         result["price_warning"] = price_diagnostic(
             code=code,
             analysis_date=analysis_date,
@@ -694,86 +1167,73 @@ def evaluate_record(record: dict[str, Any], provider: PriceProvider) -> dict[str
             missing="advice_close",
             bars=bars,
             error=error,
+            advice_close_date=anchor_session,
         )
-        for period in PERIODS:
-            if result.get(f"{period}_status") == "已验证":
-                continue
-            result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, PERIODS[period]) else "数据不足"
-            result[f"{period}_hit"] = None
-            result.setdefault(f"{period}_close", None)
-            result.setdefault(f"{period}_return", None)
-        return result
-
-    advice_index: int | None = None
-    advice_bar: DailyBar | None = None
-    for index, bar in enumerate(bars):
-        if bar.trade_date <= analysis_date:
-            advice_index = index
-            advice_bar = bar
-        else:
-            break
-
-    advice_close = parse_float(result.get("advice_close"))
-    if (advice_close is None or advice_close <= 0) and advice_bar is not None:
-        advice_close = advice_bar.close
-
-    if advice_bar is None or advice_index is None or advice_close is None or advice_close <= 0:
-        result["price_warning"] = price_diagnostic(
-            code=code,
-            analysis_date=analysis_date,
-            period=None,
-            missing="advice_close",
-            bars=bars,
-            error=error,
-        )
-        for period in PERIODS:
-            if result.get(f"{period}_status") == "已验证":
-                continue
-            result[f"{period}_status"] = "等待验证" if is_validation_window_pending(analysis_date, PERIODS[period]) else "数据不足"
-            result[f"{period}_hit"] = None
-        return result
+        for period, offset in PERIODS.items():
+            target_session = nth_session_after(session_calendar, anchor_session, offset, through_session)
+            result[f"{period}_status"] = "等待验证" if target_session is None else "数据不足"
+            result[f"{period}_close"] = None
+            result[f"{period}_return"] = None
+        return public_advice_record(result)
 
     result["advice_close"] = round(advice_close, 4)
-    result["advice_close_date"] = advice_bar.trade_date.isoformat()
-    forward = bars[advice_index + 1 :]
+    result["advice_close_date"] = anchor_session.isoformat()
+    result["failure_code"] = FailureCode.NONE.value
     for period, offset in PERIODS.items():
-        if result.get(f"{period}_status") == "已验证" and parse_float(result.get(f"{period}_close")) is not None:
-            continue
-        if len(forward) < offset:
-            pending = is_validation_window_pending(advice_bar.trade_date, offset)
-            if not pending:
-                result["price_warning"] = price_diagnostic(
-                    code=code,
-                    analysis_date=analysis_date,
-                    period=period,
-                    missing="target_close",
-                    bars=bars,
-                    error=error,
-                    advice_close_date=advice_bar.trade_date,
-                )
-            result[f"{period}_status"] = "等待验证" if pending else "数据不足"
-            result[f"{period}_hit"] = None
-            result.setdefault(f"{period}_close", None)
-            result.setdefault(f"{period}_return", None)
+        target_session = nth_session_after(session_calendar, anchor_session, offset, through_session)
+        if target_session is None:
+            result[f"{period}_status"] = "等待验证"
+            result[f"{period}_close"] = None
+            result[f"{period}_date"] = None
+            result[f"{period}_return"] = None
             continue
 
-        target = forward[offset - 1]
-        return_value = (target.close - advice_close) / advice_close
-        hit, miss_reason = evaluate_hit(group, period, return_value)
+        existing_date = parse_date(result.get(f"{period}_date"))
+        existing_close = parse_float(result.get(f"{period}_close"))
+        if existing_date != target_session or existing_close is None or existing_close <= 0:
+            target_bar = bar_by_date.get(target_session)
+            target_close = target_bar.close if target_bar else None
+        else:
+            target_close = existing_close
+        if target_close is None or target_close <= 0:
+            result["failure_code"] = FailureCode.MARKET_DATA_MISSING.value
+            result["price_warning"] = price_diagnostic(
+                code=code,
+                analysis_date=analysis_date,
+                period=period,
+                missing="target_close",
+                bars=bars,
+                error=error,
+                advice_close_date=anchor_session,
+            )
+            result[f"{period}_status"] = "数据不足"
+            result[f"{period}_close"] = None
+            result[f"{period}_date"] = target_session.isoformat()
+            result[f"{period}_return"] = None
+            continue
+
+        return_value = (target_close - advice_close) / advice_close
         result[f"{period}_status"] = "已验证"
-        result[f"{period}_close"] = round(target.close, 4)
-        result[f"{period}_date"] = target.trade_date.isoformat()
+        result[f"{period}_close"] = round(target_close, 4)
+        result[f"{period}_date"] = target_session.isoformat()
         result[f"{period}_return"] = round(return_value, 6)
-        result[f"{period}_hit"] = hit
-        if miss_reason:
-            result[f"{period}_miss_reason"] = miss_reason
-    return result
+        _apply_evaluation_semantics(
+            result,
+            period=period,
+            return_value=return_value,
+            action=action,
+            sentiment=sentiment,
+        )
+    return public_advice_record(result)
 
 
 def evaluate_records(
     history: list[dict[str, Any]],
     provider: PriceProvider,
     current_codes: set[str],
+    *,
+    calendar: SessionCalendar | None = None,
+    current_time: datetime | None = None,
 ) -> list[dict[str, Any]]:
     evaluated = []
     ordered_history = sorted(
@@ -781,32 +1241,112 @@ def evaluate_records(
         key=lambda item: (str(item.get("date") or ""), normalize_code(item.get("code"))),
     )
     for record in ordered_history:
-        item = evaluate_record(record, provider)
+        item = evaluate_record(
+            record,
+            provider,
+            calendar=calendar,
+            current_time=current_time,
+        )
         item["is_current_holding_now"] = item.get("code") in current_codes
         evaluated.append(item)
     return sorted(evaluated, key=lambda item: (item.get("date", ""), item.get("code", "")))
 
 
-def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_status(records: list[dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {"total_advice": len(records)}
     for period in PERIODS:
-        evaluated = [r for r in records if r.get(f"{period}_status") == "已验证" and isinstance(r.get(f"{period}_hit"), bool)]
-        hit_count = sum(1 for r in evaluated if r.get(f"{period}_hit") is True)
+        evaluated = [r for r in records if r.get(f"{period}_status") == "已验证"]
         waiting = sum(1 for r in records if r.get(f"{period}_status") == "等待验证")
         insufficient = sum(1 for r in records if r.get(f"{period}_status") == "数据不足")
         summary[f"{period}_evaluated"] = len(evaluated)
-        summary[f"{period}_hit"] = hit_count
         summary[f"{period}_waiting"] = waiting
         summary[f"{period}_insufficient"] = insufficient
-        summary[f"{period}_hit_rate"] = round(hit_count / len(evaluated), 4) if evaluated else None
     return summary
 
 
-def group_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
-    groups = {"买入类": [], "卖出类": [], "持有/观望类": [], "unknown": []}
+def binary_metric_summary(records: list[dict[str, Any]], field_suffix: str) -> dict[str, Any]:
+    summary = summarize_status(records)
+    for period in PERIODS:
+        values = [
+            record.get(f"{period}_{field_suffix}")
+            for record in records
+            if record.get(f"{period}_status") == "已验证"
+            and isinstance(record.get(f"{period}_{field_suffix}"), bool)
+        ]
+        positive = sum(value is True for value in values)
+        summary[f"{period}_sample_size"] = len(values)
+        summary[f"{period}_positive"] = positive
+        summary[f"{period}_rate"] = round(positive / len(values), 4) if values else None
+    return summary
+
+
+def hold_result_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = summarize_status(records)
+    for period in PERIODS:
+        returns = [
+            float(record[f"{period}_return"])
+            for record in records
+            if record.get(f"{period}_status") == "已验证"
+            and parse_float(record.get(f"{period}_return")) is not None
+        ]
+        drawdowns = sum(value < -HOLD_BAND[period] for value in returns)
+        negatives = sum(value < 0 for value in returns)
+        summary[f"{period}_sample_size"] = len(returns)
+        summary[f"{period}_median_return"] = (
+            round(float(statistics.median(returns)), 6) if returns else None
+        )
+        summary[f"{period}_negative_rate"] = round(negatives / len(returns), 4) if returns else None
+        summary[f"{period}_material_drawdown_count"] = drawdowns
+        summary[f"{period}_material_drawdown_rate"] = (
+            round(drawdowns / len(returns), 4) if returns else None
+        )
+    return summary
+
+
+def action_distribution(records: list[dict[str, Any]]) -> dict[str, int]:
+    distribution = {action.value: 0 for action in ActionCode}
     for record in records:
-        groups.setdefault(str(record.get("action_group") or "unknown"), []).append(record)
-    return {group: summarize_records(items) for group, items in groups.items()}
+        action = normalize_action(record.get("action_raw"))
+        distribution[action.value] = distribution.get(action.value, 0) + 1
+    return distribution
+
+
+def sentiment_distribution(records: list[dict[str, Any]]) -> dict[str, int]:
+    distribution = {sentiment.value: 0 for sentiment in SentimentCode}
+    for record in records:
+        sentiment = normalize_sentiment(record.get("sentiment_raw"))
+        distribution[sentiment.value] = distribution.get(sentiment.value, 0) + 1
+    return distribution
+
+
+def build_metric_set(records: list[dict[str, Any]]) -> dict[str, Any]:
+    directional = [
+        record
+        for record in records
+        if normalize_action(record.get("action_raw"))
+        in {ActionCode.BUY, ActionCode.INCREASE, ActionCode.SELL, ActionCode.REDUCE}
+    ]
+    holds = [
+        record
+        for record in records
+        if normalize_action(record.get("action_raw")) in {ActionCode.HOLD, ActionCode.HOLD_WATCH}
+    ]
+    observes = [
+        record for record in records if normalize_action(record.get("action_raw")) == ActionCode.OBSERVE
+    ]
+    sentiments = [
+        record
+        for record in records
+        if normalize_sentiment(record.get("sentiment_raw")) != SentimentCode.UNKNOWN
+    ]
+    return {
+        "directional_action": binary_metric_summary(directional, "direction_hit"),
+        "sentiment_alignment": binary_metric_summary(sentiments, "sentiment_aligned"),
+        "hold_results": hold_result_summary(holds),
+        "observe_consistency": binary_metric_summary(observes, "observe_consistent"),
+        "action_distribution": action_distribution(records),
+        "sentiment_distribution": sentiment_distribution(records),
+    }
 
 
 def build_accuracy(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -814,17 +1354,25 @@ def build_accuracy(records: list[dict[str, Any]]) -> dict[str, Any]:
     miss_cases = []
     for record in sorted(records, key=lambda item: item.get("date", ""), reverse=True):
         for period in PERIODS:
-            if record.get(f"{period}_hit") is False:
+            action = normalize_action(record.get("action_raw"))
+            direction_miss = record.get(f"{period}_direction_hit") is False
+            observe_miss = record.get(f"{period}_observe_consistent") is False
+            if direction_miss or observe_miss:
                 item = {
                     "date": record.get("date"),
                     "code": record.get("code"),
                     "name": record.get("name"),
-                    "account": record.get("account"),
-                    "action": record.get("action"),
-                    "sentiment": record.get("sentiment"),
+                    "accounts": record.get("accounts", []),
+                    "action_raw": record.get("action_raw"),
+                    "action_normalized": action.value,
+                    "sentiment_raw": record.get("sentiment_raw"),
                     "period": period,
                     "return": record.get(f"{period}_return"),
-                    "miss_reason": record.get(f"{period}_miss_reason") or "未命中",
+                    "miss_reason": (
+                        record.get(f"{period}_direction_miss_reason")
+                        or record.get(f"{period}_observe_reason")
+                        or "未一致"
+                    ),
                     "is_current_holding_now": record.get("is_current_holding_now"),
                 }
                 miss_cases.append(item)
@@ -832,10 +1380,13 @@ def build_accuracy(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "updated_at": now_iso(),
-        "summary_all_history": summarize_records(records),
-        "summary_current_holdings": summarize_records(current_records),
-        "by_action_all_history": group_stats(records),
-        "by_action_current_holdings": group_stats(current_records),
+        "schema_version": 2,
+        "evaluation_version": EVALUATION_VERSION,
+        "neutral_band": dict(HOLD_BAND),
+        "summary_all_history": summarize_status(records),
+        "summary_current_holdings": summarize_status(current_records),
+        "metrics_all_history": build_metric_set(records),
+        "metrics_current_holdings": build_metric_set(current_records),
         "records": records,
         "recent_records": sorted(records, key=lambda item: (item.get("date", ""), item.get("code", "")), reverse=True)[:20],
         "miss_cases": miss_cases[:20],
@@ -881,259 +1432,18 @@ def format_return(value: Any) -> str:
 
 def status_text(record: dict[str, Any], period: str) -> str:
     status = str(record.get(f"{period}_status") or "等待验证")
-    hit = record.get(f"{period}_hit")
     if status != "已验证":
         return status
-    if hit is True:
-        return "命中"
-    if hit is False:
-        return str(record.get(f"{period}_miss_reason") or "未命中")
-    return "样本不足"
-
-
-def render_summary_card(title: str, summary: dict[str, Any]) -> str:
-    return f"""
-<article class="metric-card">
-  <h3>{escape(title)}</h3>
-  <p>已记录建议数量：<strong>{summary.get('total_advice', 0)}</strong></p>
-  <div class="metric-grid">
-    <div><span>T+1 已验证</span><strong>{summary.get('d1_evaluated', 0)}</strong><em>{format_rate(summary.get('d1_hit_rate'))}</em></div>
-    <div><span>T+5 已验证</span><strong>{summary.get('d5_evaluated', 0)}</strong><em>{format_rate(summary.get('d5_hit_rate'))}</em></div>
-    <div><span>T+20 已验证</span><strong>{summary.get('d20_evaluated', 0)}</strong><em>{format_rate(summary.get('d20_hit_rate'))}</em></div>
-  </div>
-</article>
-"""
-
-
-def render_record_card(record: dict[str, Any]) -> str:
-    current = "当前仍持有" if record.get("is_current_holding_now") else "已不在当前持仓"
-    score = record.get("score")
-    score_text = "unknown" if score is None else str(score)
-    price_warning = ""
-    if record.get("price_warning"):
-        price_warning = (
-            '<details class="diagnostic-details"><summary>价格诊断</summary>'
-            f'<p>{escape(str(record.get("price_warning")))}</p></details>'
-        )
-    return f"""
-<article class="record-card">
-  <div class="record-head">
-    <div><h4>{escape(str(record.get('name') or ''))}</h4><span class="record-code">{escape(str(record.get('code') or ''))}</span></div>
-    <span class="holding-state">{current}</span>
-  </div>
-  <p class="record-meta">{escape(str(record.get('date') or ''))} · {escape(str(record.get('account') or ''))}</p>
-  <p class="advice-line"><strong>{escape(str(record.get('action') or 'unknown'))}</strong><span>评分 {escape(score_text)}</span><span>{escape(str(record.get('sentiment') or 'unknown'))}</span></p>
-  <div class="period-grid">
-    <span><small>T+1</small><strong>{escape(status_text(record, 'd1'))}</strong><em>{escape(format_return(record.get('d1_return')))}</em></span>
-    <span><small>T+5</small><strong>{escape(status_text(record, 'd5'))}</strong><em>{escape(format_return(record.get('d5_return')))}</em></span>
-    <span><small>T+20</small><strong>{escape(status_text(record, 'd20'))}</strong><em>{escape(format_return(record.get('d20_return')))}</em></span>
-  </div>
-  {price_warning}
-</article>
-"""
-
-
-def render_period_stats(summary: dict[str, Any]) -> str:
-    labels = {"d1": "日维度 T+1", "d5": "周维度 T+5", "d20": "月维度 T+20"}
-    cards = []
-    for period, label in labels.items():
-        cards.append(
-            f"""
-<article class="small-card">
-  <h4>{label}</h4>
-  <p>已验证样本数：{summary.get(f'{period}_evaluated', 0)}</p>
-  <p>命中数：{summary.get(f'{period}_hit', 0)}</p>
-  <p>命中率：{format_rate(summary.get(f'{period}_hit_rate'))}</p>
-  <p>等待验证：{summary.get(f'{period}_waiting', 0)}</p>
-  <p>数据不足：{summary.get(f'{period}_insufficient', 0)}</p>
-</article>
-"""
-        )
-    return "".join(cards)
-
-
-def render_action_stats(by_action: dict[str, Any]) -> str:
-    cards = []
-    for group, summary in by_action.items():
-        cards.append(
-            f"""
-<article class="small-card">
-  <h4>{escape(group)}</h4>
-  <p>样本数：{summary.get('total_advice', 0)}</p>
-  <p>T+1：{format_rate(summary.get('d1_hit_rate'))}</p>
-  <p>T+5：{format_rate(summary.get('d5_hit_rate'))}</p>
-  <p>T+20：{format_rate(summary.get('d20_hit_rate'))}</p>
-</article>
-"""
-        )
-    return "".join(cards)
-
-
-def _latest_record_per_code(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    latest: dict[str, dict[str, Any]] = {}
-    for record in records:
-        code = str(record.get("code") or "")
-        previous = latest.get(code)
-        if previous is None or str(record.get("date") or "") >= str(previous.get("date") or ""):
-            latest[code] = record
-    return sorted(latest.values(), key=lambda item: (str(item.get("date") or ""), str(item.get("code") or "")), reverse=True)
-
-
-def render_html(accuracy: dict[str, Any]) -> str:
-    records = list(accuracy.get("records", []))
-    current_records = [record for record in records if record.get("is_current_holding_now")]
-    latest_current_records = _latest_record_per_code(current_records)
-    recent_records = list(accuracy.get("recent_records", []))
-    miss_cases = list(accuracy.get("miss_cases", []))
-
-    current_latest_html = "".join(render_record_card(record) for record in latest_current_records) or '<p class="muted">暂无当前持仓建议样本。</p>'
-    current_history_html = "".join(render_record_card(record) for record in current_records[::-1])
-    all_html = "".join(render_record_card(record) for record in records[::-1]) or '<p class="muted">暂无历史建议样本。</p>'
-    recent_html = "".join(render_record_card(record) for record in recent_records) or '<p class="muted">暂无最近建议。</p>'
-    miss_html = "".join(render_record_card(record) for record in miss_cases) or '<p class="muted">暂无已验证未命中样本。</p>'
-    current_history_details = ""
-    if current_history_html:
-        current_history_details = f"""
-<details class="collection-details">
-  <summary><span>查看当前持仓全部历史建议</span><span class="summary-count">{len(current_records)} 条</span></summary>
-  <div class="collection-body"><div class="record-grid">{current_history_html}</div></div>
-</details>
-"""
-
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI 建议准确性回测</title>
-  <style>
-    :root {{ color-scheme:light; --border:#dbe3ed; --border-strong:#c8d3e0; --muted:#637086; --bg:#f3f6fa; --card:#fff; --text:#182235; --accent:#075fca; --soft:#f7f9fc; }}
-    * {{ box-sizing:border-box; }}
-    html {{ min-width:0; background:var(--bg); }}
-    body {{ min-width:0; margin:0; color:var(--text); background:var(--bg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; line-height:1.68; overflow-wrap:anywhere; overflow-x:hidden; }}
-    main {{ width:100%; max-width:1120px; min-width:0; margin:0 auto; padding:24px 20px 48px; }}
-    a {{ color:var(--accent); text-decoration:none; }}
-    a:hover {{ text-decoration:underline; }}
-    .page-nav {{ margin-bottom:16px; padding:0 2px 12px; border-bottom:1px solid var(--border); font-size:14px; }}
-    .hero {{ padding:24px; margin:0 0 20px; background:var(--card); border:1px solid var(--border); border-radius:8px; box-shadow:0 8px 24px rgba(24,34,53,.05); }}
-    .hero-kicker {{ display:block; margin-bottom:6px; color:var(--accent); font-size:13px; font-weight:700; }}
-    .hero h1 {{ margin:0; font-size:30px; line-height:1.28; }}
-    .hero-copy {{ max-width:760px; margin:10px 0 0; color:var(--muted); }}
-    .meta-row {{ display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:14px; color:var(--muted); }}
-    .overview-grid,.card-grid,.record-grid {{ display:grid; gap:12px; min-width:0; }}
-    .overview-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
-    .card-grid {{ grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr)); }}
-    .record-grid {{ grid-template-columns:repeat(auto-fit,minmax(min(100%,330px),1fr)); }}
-    .panel,.metric-card,.record-card,.small-card {{ min-width:0; background:var(--card); border:1px solid var(--border); border-radius:8px; }}
-    .panel {{ padding:20px; margin:0 0 16px; }}
-    .metric-card,.small-card {{ padding:18px; margin:0; }}
-    .record-card {{ padding:16px; margin:0; }}
-    h2 {{ margin:0 0 4px; font-size:21px; }}
-    h3,h4 {{ margin:0; }}
-    .section-intro {{ margin:0 0 14px; color:var(--muted); font-size:14px; }}
-    .muted,.record-meta {{ color:var(--muted); }}
-    .metric-card > p {{ margin:8px 0 12px; }}
-    .metric-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }}
-    .metric-grid div {{ min-width:0; padding:11px; background:var(--soft); border:1px solid #e7ecf3; border-radius:6px; }}
-    .metric-grid span,.metric-grid em {{ display:block; color:var(--muted); font-size:13px; font-style:normal; }}
-    .metric-grid strong {{ display:block; margin:3px 0; font-size:23px; font-variant-numeric:tabular-nums; }}
-    .small-card p {{ margin:4px 0; }}
-    .record-head {{ display:flex; align-items:start; justify-content:space-between; gap:10px; }}
-    .record-head h4 {{ display:inline; font-size:17px; }}
-    .record-code {{ margin-left:7px; color:var(--muted); font-size:13px; font-variant-numeric:tabular-nums; }}
-    .holding-state {{ flex:0 0 auto; padding:3px 8px; color:#075fca; background:#eaf2ff; border-radius:999px; font-size:12px; font-weight:650; }}
-    .record-meta {{ margin:7px 0; font-size:13px; }}
-    .advice-line {{ display:flex; flex-wrap:wrap; gap:6px 10px; margin:9px 0; }}
-    .advice-line strong {{ color:var(--accent); }}
-    .period-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; }}
-    .period-grid > span {{ min-width:0; padding:8px; background:var(--soft); border:1px solid #e7ecf3; border-radius:6px; }}
-    .period-grid small,.period-grid strong,.period-grid em {{ display:block; min-width:0; }}
-    .period-grid small,.period-grid em {{ color:var(--muted); font-size:12px; font-style:normal; }}
-    .period-grid strong {{ margin:2px 0; font-size:13px; }}
-    .diagnostic-details {{ margin-top:10px; border-top:1px solid var(--border); }}
-    .diagnostic-details summary {{ padding-top:9px; color:var(--muted); cursor:pointer; font-size:13px; }}
-    .diagnostic-details p {{ margin:7px 0 0; color:var(--muted); font-size:13px; }}
-    .collection-details {{ margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--card); overflow:hidden; }}
-    .collection-details > summary {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; cursor:pointer; background:var(--soft); font-weight:700; }}
-    .summary-count {{ color:var(--muted); font-size:13px; font-weight:600; }}
-    .collection-body {{ padding:14px; }}
-    footer {{ margin-top:24px; padding-top:16px; color:var(--muted); border-top:1px solid var(--border); font-size:14px; }}
-    @media (max-width:640px) {{
-      main {{ padding:12px 12px 36px; }}
-      .hero {{ padding:18px; }}
-      .hero h1 {{ font-size:25px; }}
-      .overview-grid,.card-grid,.record-grid,.metric-grid,.period-grid {{ grid-template-columns:1fr; }}
-      .panel,.metric-card,.small-card,.record-card {{ padding:14px; }}
-      .collection-body {{ padding:10px; }}
-      .record-head {{ display:block; }}
-      .holding-state {{ display:inline-flex; margin-top:7px; }}
-    }}
-  </style>
-</head>
-<body>
-<main>
-  <nav class="page-nav"><a href="index.html">返回首页</a></nav>
-  <header class="hero">
-    <span class="hero-kicker">历史建议规则回测</span>
-    <h1>AI 建议准确性回测</h1>
-    <p class="hero-copy">只使用已生成建议、当前持仓快照与后续真实行情，不调用 Gemini 或任何 LLM。</p>
-    <div class="meta-row">
-      <span>更新时间：{escape(str(accuracy.get('updated_at') or now_iso()))}</span>
-      <span>最新读取日报：{escape(str(accuracy.get('latest_report_date') or '暂无'))}</span>
-      <span>{escape(str(accuracy.get('new_advice_message') or '本次无新增可回测建议。'))}</span>
-    </div>
-  </header>
-
-  <section class="overview-grid">
-    {render_summary_card("全部历史建议", accuracy.get("summary_all_history", {}))}
-    {render_summary_card("当前持仓建议", accuracy.get("summary_current_holdings", {}))}
-  </section>
-
-  <section class="panel">
-    <h2>分周期统计</h2>
-    <p class="section-intro">分别观察日、周、月三个验证窗口。</p>
-    <div class="card-grid">{render_period_stats(accuracy.get("summary_all_history", {}))}</div>
-  </section>
-
-  <section class="panel">
-    <h2>按建议类型统计</h2>
-    <p class="section-intro">买入类、卖出类与持有观望类使用各自可解释的命中规则。</p>
-    <div class="card-grid">{render_action_stats(accuracy.get("by_action_all_history", {}))}</div>
-  </section>
-
-  <section class="panel">
-    <h2>当前持仓建议回看</h2>
-    <p class="section-intro">默认展示每只当前持仓最近一条建议；完整历史仍保留在折叠区。</p>
-    <div class="record-grid">{current_latest_html}</div>
-    {current_history_details}
-  </section>
-
-  <details class="collection-details">
-    <summary><span>历史全部建议回测</span><span class="summary-count">{len(records)} 条</span></summary>
-    <div class="collection-body"><div class="record-grid">{all_html}</div></div>
-  </details>
-
-  <section class="panel">
-    <h2>最近建议回看</h2>
-    <p class="section-intro">最近 20 条建议及其验证进度。</p>
-    <div class="record-grid">{recent_html}</div>
-  </section>
-
-  <details class="collection-details">
-    <summary><span>最近错误案例</span><span class="summary-count">{len(miss_cases)} 条</span></summary>
-    <div class="collection-body"><div class="record-grid">{miss_html}</div></div>
-  </details>
-
-  <section class="panel">
-    <h2>数据状态说明</h2>
-    <p>后续第 N 个有效交易日尚未出现时显示“等待验证”；行情源无法返回建议日或目标交易日收盘价时显示“数据不足”。样本不足时不显示误导性的 0% 命中率。</p>
-  </section>
-
-  <footer>{escape(DISCLAIMER)}</footer>
-</main>
-</body>
-</html>
-"""
+    action = normalize_action(record.get("action_raw"))
+    if action in {ActionCode.BUY, ActionCode.INCREASE, ActionCode.SELL, ActionCode.REDUCE}:
+        hit = record.get(f"{period}_direction_hit")
+        return "方向命中" if hit is True else str(record.get(f"{period}_direction_miss_reason") or "方向未命中")
+    if action == ActionCode.OBSERVE:
+        consistent = record.get(f"{period}_observe_consistent")
+        return "区间一致" if consistent is True else str(record.get(f"{period}_observe_reason") or "区间不一致")
+    if action in {ActionCode.HOLD, ActionCode.HOLD_WATCH}:
+        return "出现明显回撤" if record.get(f"{period}_hold_drawdown_flag") else "已验证"
+    return "已验证"
 
 
 def markdown_summary_line(summary: dict[str, Any], label: str) -> list[str]:
@@ -1141,9 +1451,9 @@ def markdown_summary_line(summary: dict[str, Any], label: str) -> list[str]:
         f"### {label}",
         "",
         f"- 已记录建议数量：{summary.get('total_advice', 0)}",
-        f"- T+1 已验证：{summary.get('d1_evaluated', 0)}，命中率：{format_rate(summary.get('d1_hit_rate'))}",
-        f"- T+5 已验证：{summary.get('d5_evaluated', 0)}，命中率：{format_rate(summary.get('d5_hit_rate'))}",
-        f"- T+20 已验证：{summary.get('d20_evaluated', 0)}，命中率：{format_rate(summary.get('d20_hit_rate'))}",
+        f"- T+1：已验证 {summary.get('d1_evaluated', 0)}，等待 {summary.get('d1_waiting', 0)}，数据不足 {summary.get('d1_insufficient', 0)}",
+        f"- T+5：已验证 {summary.get('d5_evaluated', 0)}，等待 {summary.get('d5_waiting', 0)}，数据不足 {summary.get('d5_insufficient', 0)}",
+        f"- T+20：已验证 {summary.get('d20_evaluated', 0)}，等待 {summary.get('d20_waiting', 0)}，数据不足 {summary.get('d20_insufficient', 0)}",
         "",
     ]
 
@@ -1168,9 +1478,29 @@ def render_markdown(accuracy: dict[str, Any], report_date: str) -> str:
     lines.extend(markdown_summary_line(accuracy.get("summary_all_history", {}), "全部历史建议"))
     lines.extend(markdown_summary_line(accuracy.get("summary_current_holdings", {}), "当前持仓建议"))
 
-    lines.extend(["## 按建议类型统计", ""])
-    for group, summary in accuracy.get("by_action_all_history", {}).items():
-        lines.append(f"- {group}：样本 {summary.get('total_advice', 0)}，T+1 {format_rate(summary.get('d1_hit_rate'))}，T+5 {format_rate(summary.get('d5_hit_rate'))}，T+20 {format_rate(summary.get('d20_hit_rate'))}")
+    lines.extend(["## 分语义统计", ""])
+    metric_labels = {
+        "directional_action": "方向性动作命中率",
+        "sentiment_alignment": "情绪方向一致率",
+        "hold_results": "持有结果",
+        "observe_consistency": "观望区间一致率",
+    }
+    for key, label in metric_labels.items():
+        summary = accuracy.get("metrics_all_history", {}).get(key, {})
+        if key == "hold_results":
+            lines.append(
+                f"- {label}：样本 {summary.get('total_advice', 0)}；"
+                f"T+1 中位收益 {format_return(summary.get('d1_median_return'))}（n={summary.get('d1_sample_size', 0)}），"
+                f"T+5 中位收益 {format_return(summary.get('d5_median_return'))}（n={summary.get('d5_sample_size', 0)}），"
+                f"T+20 中位收益 {format_return(summary.get('d20_median_return'))}（n={summary.get('d20_sample_size', 0)}）"
+            )
+        else:
+            lines.append(
+                f"- {label}：样本 {summary.get('total_advice', 0)}；"
+                f"T+1 {format_rate(summary.get('d1_rate'))}（n={summary.get('d1_sample_size', 0)}），"
+                f"T+5 {format_rate(summary.get('d5_rate'))}（n={summary.get('d5_sample_size', 0)}），"
+                f"T+20 {format_rate(summary.get('d20_rate'))}（n={summary.get('d20_sample_size', 0)}）"
+            )
     lines.append("")
 
     lines.extend(["## 当前持仓建议回看", ""])
@@ -1178,7 +1508,7 @@ def render_markdown(accuracy: dict[str, Any], report_date: str) -> str:
     if not current:
         lines.append("暂无当前持仓建议样本。")
     for record in current:
-        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
+        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action_raw')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
     lines.append("")
 
     lines.extend(["## 最近建议回看", ""])
@@ -1186,14 +1516,14 @@ def render_markdown(accuracy: dict[str, Any], report_date: str) -> str:
     if not recent_records:
         lines.append("暂无最近建议样本。")
     for record in recent_records:
-        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action')} / {record.get('sentiment')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
+        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action_raw')} / {record.get('sentiment_raw')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
     lines.append("")
 
     lines.extend(["## 历史全部建议回测", ""])
     if not records:
         lines.append("暂无历史建议样本。")
     for record in records:
-        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action')} / {record.get('sentiment')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
+        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action_raw')} / {record.get('sentiment_raw')}，T+1 {status_text(record, 'd1')}，T+5 {status_text(record, 'd5')}，T+20 {status_text(record, 'd20')}")
     lines.append("")
 
     lines.extend(["## 最近错误案例", ""])
@@ -1201,13 +1531,13 @@ def render_markdown(accuracy: dict[str, Any], report_date: str) -> str:
     if not miss_cases:
         lines.append("暂无已验证未命中样本。")
     for record in miss_cases[:20]:
-        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action')}，{record.get('period')} {record.get('miss_reason')}，收益率 {format_return(record.get('return'))}")
+        lines.append(f"- {record.get('date')} {record.get('name')}({record.get('code')})：{record.get('action_raw')}，{record.get('period')} {record.get('miss_reason')}，收益率 {format_return(record.get('return'))}")
     lines.append("")
 
     lines.extend([
         "## 数据不足说明",
         "",
-        "- T+1 / T+5 / T+20 使用建议日之后第 N 个有收盘价的交易日。",
+        "- T+1 / T+5 / T+20 使用建议锚点之后第 N 个正式 A 股交易时段。",
         "- 尚未到达验证窗口时显示“等待验证”。",
         "- 行情数据源缺少建议日或后续收盘价时显示“数据不足”。",
         "",
@@ -1218,42 +1548,20 @@ def render_markdown(accuracy: dict[str, Any], report_date: str) -> str:
 
 
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    write_jsonl_atomic(path, [public_advice_record(record) for record in records])
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def ensure_index_entry() -> None:
-    index_path = SITE_DIR / "index.html"
-    link_html = '<li>AI 建议准确性回测：<a href="advice_backtest.html">AI 建议准确性回测</a></li>'
-    if not index_path.exists():
-        SITE_DIR.mkdir(parents=True, exist_ok=True)
-        index_path.write_text(
-            f"<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>每日持仓复盘</title><body><main><h1>每日持仓复盘</h1><ul>{link_html}</ul></main></body></html>",
-            encoding="utf-8",
-        )
-        return
-
-    html = index_path.read_text(encoding="utf-8", errors="ignore")
-    if "advice_backtest.html" in html:
-        return
-    marker = "</ul>"
-    if marker in html:
-        html = html.replace(marker, f"{link_html}{marker}", 1)
-    else:
-        html = html.replace("</main>", f"<section class=\"panel\"><h2>AI 建议准确性回测</h2><ul>{link_html}</ul></section></main>", 1)
-    index_path.write_text(html, encoding="utf-8")
+    write_json_atomic(path, payload)
 
 
 def write_outputs(history: list[dict[str, Any]], accuracy: dict[str, Any], report_date: str) -> None:
-    write_jsonl(LOCAL_HISTORY_PATH, history)
-    write_jsonl(SITE_DATA_HISTORY_PATH, history)
+    public_history = [public_advice_record(record) for record in history]
+    manifest = build_history_manifest(public_history)
+    write_jsonl(LOCAL_HISTORY_PATH, public_history)
+    write_jsonl(SITE_DATA_HISTORY_PATH, public_history)
+    write_json(LOCAL_HISTORY_MANIFEST_PATH, manifest)
+    write_json(SITE_DATA_HISTORY_MANIFEST_PATH, manifest)
     write_json(LOCAL_ACCURACY_PATH, accuracy)
     write_json(SITE_DATA_ACCURACY_PATH, accuracy)
 
@@ -1261,114 +1569,64 @@ def write_outputs(history: list[dict[str, Any]], accuracy: dict[str, Any], repor
     markdown_path = REPORTS_DIR / f"advice_accuracy_{report_date.replace('-', '')}.md"
     markdown_path.write_text(render_markdown(accuracy, report_date), encoding="utf-8")
 
-    SITE_DIR.mkdir(parents=True, exist_ok=True)
-    (SITE_DIR / "advice_backtest.html").write_text(render_html(accuracy), encoding="utf-8")
-    ensure_index_entry()
-
     print(f"Advice history written: {LOCAL_HISTORY_PATH.relative_to(ROOT_DIR)}")
     print(f"Advice accuracy written: {LOCAL_ACCURACY_PATH.relative_to(ROOT_DIR)}")
-    print(f"Advice backtest page written: {(SITE_DIR / 'advice_backtest.html').relative_to(ROOT_DIR)}")
+    print("Advice HTML is owned by scripts/build_pages_report.py and was not written here.")
     print(f"Advice markdown report written: {markdown_path.relative_to(ROOT_DIR)}")
 
 
-def make_test_bars(base_date: date, base_close: float, moves: list[float]) -> list[DailyBar]:
-    bars = [DailyBar(base_date, base_close)]
-    current = base_date
-    for move in moves:
-        current += timedelta(days=1)
-        bars.append(DailyBar(current, round(base_close * (1 + move), 4)))
-    return bars
-
-
-def setup_test_fixture() -> MockPriceProvider:
-    for path in (REPORTS_DIR, DATA_DIR, SITE_DIR, ROOT_DIR / "site_data"):
-        path.mkdir(parents=True, exist_ok=True)
-
-    snapshot = {
-        "generated_at": "2099-01-10 18:00:00",
-        "source_url": "test",
-        "accounts": {
-            "测试账户A": {
-                "stock": [
-                    {"account": "测试账户A", "type": "stock", "name": "买入上涨", "code": "111111"},
-                    {"account": "测试账户A", "type": "stock", "name": "新买入股票", "code": "999999"},
-                ],
-                "lof": [{"account": "测试账户A", "type": "lof", "name": "测试ETF", "code": "333333"}],
-                "otc": [],
-            },
-            "测试账户B": {
-                "stock": [
-                    {"account": "测试账户B", "type": "stock", "name": "卖出下跌", "code": "222222"},
-                    {"account": "测试账户B", "type": "stock", "name": "等待验证", "code": "777777"},
-                    {"account": "测试账户B", "type": "stock", "name": "数据不足", "code": "888888"},
-                    {"account": "测试账户B", "type": "stock", "name": "分析失败", "code": "101010"},
-                ],
-                "lof": [],
-                "otc": [{"account": "测试账户B", "type": "otc", "name": "测试场外基金", "code": "121212"}],
-            },
-        },
-    }
-    (ROOT_DIR / "site_data" / "holdings_snapshot.json").write_text(
-        json.dumps(snapshot, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    old_history = [
-        {"schema_version": 1, "date": "2099-01-01", "code": "444444", "name": "已卖出买入后下跌", "type": "stock", "account": "旧账户", "action": "买入", "score": 80, "sentiment": "看多", "summary": "买入后下跌", "source_report": "reports/report_20990101.md", "holding_snapshot_date": "2099-01-01", "is_current_holding_when_advised": True, "created_at": now_iso()},
-        {"schema_version": 1, "date": "2099-01-01", "code": "555555", "name": "卖出后上涨", "type": "stock", "account": "旧账户", "action": "卖出", "score": 20, "sentiment": "看空", "summary": "卖出后上涨", "source_report": "reports/report_20990101.md", "holding_snapshot_date": "2099-01-01", "is_current_holding_when_advised": True, "created_at": now_iso()},
-        {"schema_version": 1, "date": "2099-01-01", "code": "666666", "name": "观望后震荡", "type": "stock", "account": "旧账户", "action": "观望", "score": 50, "sentiment": "震荡", "summary": "观望后震荡", "source_report": "reports/report_20990101.md", "holding_snapshot_date": "2099-01-01", "is_current_holding_when_advised": True, "created_at": now_iso()},
-        {"schema_version": 1, "date": "2099-01-02", "code": "666666", "name": "观望后大涨", "type": "stock", "account": "旧账户", "action": "观望", "score": 50, "sentiment": "震荡", "summary": "观望后大涨", "source_report": "reports/report_20990102.md", "holding_snapshot_date": "2099-01-02", "is_current_holding_when_advised": True, "created_at": now_iso()},
-    ]
-    write_jsonl(LOCAL_HISTORY_PATH, old_history)
-
-    report = """# 2099-01-10 股票日报
-
-## 分析结果摘要
-
-- 买入上涨（111111） A股个股：买入｜评分 88｜强烈看多
-- 卖出下跌(222222)：卖出 | 评分 20 | 强烈看空
-- 新买入股票（999999） A股个股：持有｜评分 55｜震荡
-- 等待验证（777777） A股个股：观望｜评分 50｜中性
-- 数据不足（888888） A股个股：买入｜评分 70｜看多
-- 分析失败（101010） A股个股：分析失败：Gemini 模型服务暂不可用，本标的未完成分析。
-- 测试ETF（333333） LOF/ETF：已纳入账户级组合复盘
-
-## LOF/ETF 组合复盘
-
-### 测试账户A
-
-#### 组合观察
-
-- 这部分不能进入建议回测。
-"""
-    (REPORTS_DIR / "report_20990110.md").write_text(report, encoding="utf-8")
-    (SITE_DIR / "index.html").write_text(
-        '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><body><main><h1>每日持仓复盘</h1><ul></ul></main></body></html>',
-        encoding="utf-8",
-    )
-
-    base = date(2099, 1, 10)
-    old = date(2099, 1, 1)
-    bars = {
-        "111111": make_test_bars(base, 10.0, [0.02, 0.01, 0.03, 0.04, 0.06, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.2, 0.21, 0.22]),
-        "222222": make_test_bars(base, 10.0, [-0.02, -0.03, -0.04, -0.05, -0.06, -0.07, -0.08, -0.09, -0.1, -0.11, -0.12, -0.13, -0.14, -0.15, -0.16, -0.17, -0.18, -0.19, -0.2, -0.21]),
-        "999999": make_test_bars(base, 10.0, [0.01, 0.02, 0.01, -0.01, 0.0]),
-        "777777": make_test_bars(base, 10.0, [0.01]),
-        "444444": make_test_bars(old, 10.0, [-0.02, -0.02, -0.02, -0.03, -0.04, -0.05, -0.06, -0.07, -0.08, -0.09, -0.1, -0.11, -0.12, -0.13, -0.14, -0.15, -0.16, -0.17, -0.18, -0.19]),
-        "555555": make_test_bars(old, 10.0, [0.02, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.2]),
-        "666666": make_test_bars(old, 10.0, [0.01, 0.02, -0.01, 0.0, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17]),
-    }
-    return MockPriceProvider(bars)
-
-
-def run_backtest(provider: PriceProvider | None = None) -> dict[str, Any]:
+def run_backtest(
+    provider: PriceProvider | None = None,
+    *,
+    calendar: SessionCalendar | None = None,
+    current_time: datetime | None = None,
+    allow_bootstrap_empty_history: bool = False,
+    report_path: Path | None = None,
+) -> dict[str, Any]:
     holdings = load_current_stock_holdings()
-    report_path = latest_stock_report()
-    new_records = extract_advice_from_report(report_path, holdings) if report_path else []
-    history = merge_history([*load_history(), *new_records])
+    explicit_report = report_path.resolve() if report_path is not None else None
+    if explicit_report is not None and not explicit_report.exists():
+        raise DataIntegrityError(f"explicit stock report does not exist: {explicit_report}")
+    structured_path = (
+        explicit_report
+        if explicit_report is not None and explicit_report.suffix.lower() == ".json"
+        else latest_structured_stock_report()
+    )
+    legacy_path = (
+        explicit_report
+        if explicit_report is not None and explicit_report.suffix.lower() == ".md"
+        else latest_stock_report()
+    )
+    report_path = structured_path or legacy_path
+    if structured_path:
+        new_records = extract_advice_from_structured_report(structured_path, holdings)
+    elif legacy_path:
+        print(
+            "WARNING: using legacy Markdown advice adapter; new runs must produce report_YYYYMMDD.json",
+            file=sys.stderr,
+        )
+        new_records = extract_advice_from_report(legacy_path, holdings)
+    else:
+        new_records = []
+    history_source = load_history(allow_bootstrap_empty_history=allow_bootstrap_empty_history)
+    history, official_merge = merge_new_official_records(history_source.records, new_records)
+    if official_merge["conflicting_retries_skipped"]:
+        print(
+            "WARNING: skipped conflicting same-session recommendation retries; "
+            "the first official post-close recommendation remains authoritative: "
+            f"count={official_merge['conflicting_retries_skipped']}",
+            file=sys.stderr,
+        )
     current_codes = set(holdings)
     price_provider = provider or DataFetcherPriceProvider()
-    evaluated = evaluate_records(history, price_provider, current_codes)
+    session_calendar = calendar or ExchangeSessionCalendar()
+    evaluated = evaluate_records(
+        history,
+        price_provider,
+        current_codes,
+        calendar=session_calendar,
+        current_time=current_time,
+    )
     if isinstance(price_provider, DataFetcherPriceProvider):
         print(
             "Price history requests: "
@@ -1379,154 +1637,204 @@ def run_backtest(provider: PriceProvider | None = None) -> dict[str, Any]:
         evaluated,
         latest_report_date=report_date if report_path else None,
         latest_report_name=report_path.name if report_path else None,
-        new_advice_count=len(new_records),
+        new_advice_count=official_merge["added"],
     )
+    accuracy["official_recommendation_policy"] = {
+        "policy": "first_successful_post_close_per_session_security",
+        **official_merge,
+    }
+    accuracy["history_source_status"] = history_source.status
+    accuracy["history_source"] = history_source.source
+    accuracy["previous_history_count"] = len(history_source.records)
+    accuracy["history_manifest"] = {
+        "count": history_source.manifest.get("count"),
+        "sha256": history_source.manifest.get("sha256"),
+        "evaluation_version": history_source.manifest.get("evaluation_version"),
+    }
+    input_stats = dict(history_source.manifest.get("migration_input_stats") or {})
+    current_distribution = action_distribution(evaluated)
+    accuracy["migration_stats"] = {
+        **input_stats,
+        "records_before": len(history_source.records),
+        "records_after": len(evaluated),
+        "raw_records_changed": 0,
+        "new_action_distribution": current_distribution,
+        "new_sentiment_distribution": sentiment_distribution(evaluated),
+        "evaluation_version": EVALUATION_VERSION,
+        "verified_samples": {
+            period: sum(record.get(f"{period}_status") == "已验证" for record in evaluated)
+            for period in PERIODS
+        },
+        "directional_samples": sum(
+            normalize_action(record.get("action_raw"))
+            in {ActionCode.BUY, ActionCode.INCREASE, ActionCode.SELL, ActionCode.REDUCE}
+            for record in evaluated
+        ),
+        "hold_samples": sum(
+            normalize_action(record.get("action_raw")) in {ActionCode.HOLD, ActionCode.HOLD_WATCH}
+            for record in evaluated
+        ),
+        "observe_samples": sum(
+            normalize_action(record.get("action_raw")) == ActionCode.OBSERVE
+            for record in evaluated
+        ),
+    }
     write_outputs(evaluated, accuracy, report_date)
     return accuracy
 
 
-def assert_test_results(accuracy: dict[str, Any]) -> None:
-    records = accuracy.get("records", [])
-    codes = {record.get("code") for record in records}
-    hold_observe = parse_advice_line("贵研铂业（600459） A股个股：持有观察｜评分 59｜强烈看多")
-    assert hold_observe and hold_observe[0] == "600459" and hold_observe[2] == "持有观察"
-    watch = parse_advice_line("株冶集团（600961） A股个股：观望｜评分 45｜震荡")
-    assert watch and watch[0] == "600961" and watch[2] == "观望"
-    assert "333333" not in codes, "LOF/ETF must not enter advice backtest"
-    assert "121212" not in codes, "OTC must not enter advice backtest"
-    assert "101010" not in codes, "failed stock analysis must not enter advice backtest"
-    assert "999999" in codes, "new stock holding should enter advice history"
-    assert "444444" in codes, "sold stock historical advice should remain"
-    assert len([r for r in records if r.get("code") == "666666"]) == 2, "different dates for same code must be kept"
-    assert any(r.get("code") == "777777" and r.get("d5_status") == "等待验证" for r in records)
-    assert any(r.get("code") == "888888" and r.get("d1_status") == "等待验证" for r in records)
-    assert accuracy["summary_all_history"]["total_advice"] >= 9
-    assert "买入类" in accuracy["by_action_all_history"]
-    assert accuracy["recent_records"]
-    assert accuracy["miss_cases"]
-    assert (SITE_DIR / "advice_backtest.html").exists()
-    assert (REPORTS_DIR / "advice_accuracy_20990110.md").exists()
-    assert (SITE_DIR / "index.html").read_text(encoding="utf-8").find("advice_backtest.html") != -1
-    assert "2099-01-10" in (SITE_DIR / "advice_backtest.html").read_text(encoding="utf-8")
+def run_contract_self_test() -> None:
+    action_cases = {
+        "持有": ActionCode.HOLD,
+        "持有观察": ActionCode.HOLD_WATCH,
+        "观望": ActionCode.OBSERVE,
+        "不建议买入": ActionCode.OBSERVE,
+        "暂不卖出": ActionCode.HOLD,
+        "不宜追涨": ActionCode.OBSERVE,
+        "买入": ActionCode.BUY,
+        "加仓": ActionCode.INCREASE,
+        "卖出": ActionCode.SELL,
+        "减仓": ActionCode.REDUCE,
+        "": ActionCode.UNKNOWN,
+        "无法识别": ActionCode.UNKNOWN,
+    }
+    for raw, expected in action_cases.items():
+        assert normalize_action(raw) == expected, (raw, normalize_action(raw), expected)
+    assert normalize_action("观望") == ActionCode.OBSERVE
+    assert normalize_sentiment("强烈看多") == SentimentCode.BULLISH
+    assert normalize_action("持有") == ActionCode.HOLD
+    assert normalize_sentiment("偏空") == SentimentCode.BEARISH
 
-    today = datetime.now(SHANGHAI_TZ).date()
-    fresh = evaluate_record(
-        {"date": today.isoformat(), "code": "101010", "action": "买入", "sentiment": "看多"},
-        MockErrorPriceProvider(),
-    )
-    assert all(fresh.get(f"{period}_status") == "等待验证" for period in PERIODS), "same-day advice must wait for validation"
-
-    old_date = today - timedelta(days=10)
-    old_missing = evaluate_record(
-        {"date": old_date.isoformat(), "code": "202020", "action": "买入", "sentiment": "看多"},
-        MockErrorPriceProvider(),
-    )
-    assert old_missing.get("d1_status") == "数据不足", "past advice with missing market data must be insufficient"
-
-    old_verified = evaluate_record(
-        {"date": old_date.isoformat(), "code": "303030", "action": "买入", "sentiment": "看多"},
-        MockPriceProvider({"303030": make_test_bars(old_date, 10.0, [0.01])}),
-    )
-    assert old_verified.get("d1_status") == "已验证", "past advice with target close must be evaluated"
-    assert old_verified.get("advice_close") == 10.0, "missing advice_close must be backfilled from historical bars"
-    assert old_verified.get("d1_close") == 10.1
-    assert old_verified.get("advice_close_date") == old_date.isoformat()
-
-    june18 = date(2026, 6, 18)
-    june18_verified = evaluate_record(
-        {"date": june18.isoformat(), "code": "600961", "action": "观望", "sentiment": "震荡"},
-        MockPriceProvider({"600961": [DailyBar(june18, 10.0), DailyBar(date(2026, 6, 19), 10.2)]}),
-    )
-    assert june18_verified.get("d1_status") == "已验证"
-    assert june18_verified.get("advice_close_date") == "2026-06-18"
-    assert june18_verified.get("d1_date") == "2026-06-19"
-    assert june18_verified.get("d1_close") == 10.2
-
-    days_until_sunday = (6 - today.weekday()) % 7 or 7
-    weekend_date = today + timedelta(days=days_until_sunday)
-    prior_friday = weekend_date - timedelta(days=2)
-    weekend_waiting = evaluate_record(
-        {"date": weekend_date.isoformat(), "code": "600961", "action": "观望", "sentiment": "震荡"},
-        MockPriceProvider({"600961": [DailyBar(prior_friday, 10.0)]}),
-    )
-    assert weekend_waiting.get("advice_close_date") == prior_friday.isoformat()
-    assert weekend_waiting.get("d1_status") == "等待验证"
-
-    assert "sh.600961" in DataFetcherPriceProvider._code_variants("600961")
-    assert "sz.000651" in DataFetcherPriceProvider._code_variants("000651")
-
-    missing_start = evaluate_record(
-        {"date": old_date.isoformat(), "code": "505050", "action": "买入", "sentiment": "看多"},
-        MockPriceProvider({"505050": [DailyBar(old_date + timedelta(days=1), 10.2)]}),
-    )
-    assert missing_start.get("d1_status") == "数据不足", "missing advice-day close after window arrived must be insufficient"
-
-    missing_target = evaluate_record(
-        {"date": old_date.isoformat(), "code": "606060", "action": "买入", "sentiment": "看多"},
-        MockPriceProvider({"606060": [DailyBar(old_date, 10.0)]}),
-    )
-    assert missing_target.get("d1_status") == "数据不足", "missing target close after window arrived must be insufficient"
-
-    existing_verified = evaluate_record(
+    sessions = [
+        date(2026, 9, 28),
+        date(2026, 9, 29),
+        date(2026, 9, 30),
+        date(2026, 10, 9),
+        date(2026, 10, 12),
+        date(2026, 10, 13),
+        date(2026, 10, 14),
+        date(2026, 10, 15),
+        date(2026, 10, 16),
+    ]
+    calendar = StaticSessionCalendar(sessions)
+    anchor = date(2026, 9, 30)
+    bars = [DailyBar(anchor, 10.0), DailyBar(date(2026, 10, 9), 10.5)]
+    provider = MockPriceProvider({"600000": bars})
+    waiting = evaluate_record(
         {
-            "date": old_date.isoformat(),
-            "code": "707070",
-            "action": "买入",
-            "sentiment": "看多",
+            "date": anchor.isoformat(),
+            "anchor_session": anchor.isoformat(),
+            "anchor_precision": "exact_session",
+            "code": "600000",
+            "type": "stock",
+            "action_raw": "观望",
+            "sentiment_raw": "看多",
+        },
+        provider,
+        calendar=calendar,
+        current_time=datetime(2026, 10, 8, 20, tzinfo=SHANGHAI_TZ),
+    )
+    assert waiting["d1_status"] == "等待验证"
+    verified = evaluate_record(
+        waiting,
+        provider,
+        calendar=calendar,
+        current_time=datetime(2026, 10, 9, 20, tzinfo=SHANGHAI_TZ),
+    )
+    assert verified["d1_status"] == "已验证"
+    assert verified["d1_observe_consistent"] is False
+    assert verified["d1_sentiment_aligned"] is True
+    assert "d1_direction_hit" in verified and verified["d1_direction_hit"] is None
+
+    migrated = evaluate_record(
+        {
+            "date": anchor.isoformat(),
+            "anchor_session": anchor.isoformat(),
+            "anchor_precision": "exact_session",
+            "code": "600001",
+            "type": "stock",
+            "action": "持有",
+            "sentiment": "看空",
             "advice_close": 10.0,
             "d1_status": "已验证",
-            "d1_close": 10.3,
-            "d1_return": 0.03,
+            "d1_date": "2026-10-09",
+            "d1_close": 9.5,
+            "d1_return": -0.05,
             "d1_hit": True,
+            "evaluation_version": "1",
         },
         MockErrorPriceProvider(),
+        calendar=calendar,
+        current_time=datetime(2026, 10, 9, 20, tzinfo=SHANGHAI_TZ),
     )
-    assert existing_verified.get("d1_status") == "已验证" and existing_verified.get("d1_close") == 10.3
+    assert migrated["action_normalized"] == ActionCode.HOLD.value
+    assert "d1_hit" not in migrated
+    assert migrated["d1_hold_drawdown_flag"] is True
+    assert migrated["d1_sentiment_aligned"] is True
+    assert migrated["evaluation_version"] == EVALUATION_VERSION
 
-    short_suspend = evaluate_record(
-        {"date": today.isoformat(), "code": "404040", "action": "观望", "sentiment": "震荡"},
-        MockPriceProvider({"404040": [DailyBar(today, 10.0)]}),
-    )
-    assert short_suspend.get("d1_status") == "等待验证", "not enough future effective trading bars must wait"
+    first = {"date": "2026-10-09", "code": "600002", "type": "stock", "action": "观望"}
+    exact_retry = dict(first)
+    merged = merge_history([first, exact_retry])
+    assert len(merged) == 1 and merged[0]["action_raw"] == "观望"
 
-    class TinyFrame:
-        empty = False
-        columns = ["日期", "收盘价"]
+    conflicting_retry = {
+        "date": "2026-10-09",
+        "code": "600002",
+        "type": "stock",
+        "action": "买入",
+    }
+    try:
+        merge_history([first, conflicting_retry])
+    except DataIntegrityError as exc:
+        assert "conflicting same-day official recommendation" in str(exc)
+    else:
+        raise AssertionError("conflicting same-day recommendations must fail closed")
 
-        def iterrows(self):
-            yield 0, {"日期": old_date.isoformat(), "收盘价": "10.5"}
+    merged, retry_stats = merge_new_official_records([first], [conflicting_retry])
+    assert merged[0]["action_raw"] == "观望"
+    assert retry_stats == {
+        "added": 0,
+        "exact_retries_skipped": 0,
+        "conflicting_retries_skipped": 1,
+    }
 
-    bars = dataframe_to_bars(TinyFrame())
-    assert bars and bars[0].trade_date == old_date and bars[0].close == 10.5
-
-    class EnglishFrame:
-        empty = False
-        columns = ["datetime", "Close"]
-
-        def iterrows(self):
-            yield 0, {"datetime": old_date.isoformat(), "Close": "11.5"}
-
-    english_bars = dataframe_to_bars(EnglishFrame())
-    assert english_bars and english_bars[0].trade_date == old_date and english_bars[0].close == 11.5
+    try:
+        read_jsonl_strict_bytes(b'{"ok": 1}\n{broken}\n', source="self-test")
+    except DataIntegrityError as exc:
+        assert ":2:" in str(exc)
+    else:
+        raise AssertionError("corrupted JSONL must fail closed")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Update AI advice backtest outputs without calling any LLM.")
     parser.add_argument("--test-mode", action="store_true", help="Create deterministic mock data and validate the module.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--allow-bootstrap-empty-history",
+        action="store_true",
+        help="Explicitly initialize an empty history when no trusted previous history exists.",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="Explicit current-run report_YYYYMMDD.json (CI must pass this instead of guessing latest)",
+    )
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     if args.test_mode:
-        provider = setup_test_fixture()
-        accuracy = run_backtest(provider=provider)
-        assert_test_results(accuracy)
+        run_contract_self_test()
         print("advice backtest test mode passed")
         return 0
 
     try:
-        run_backtest()
+        run_backtest(
+            allow_bootstrap_empty_history=args.allow_bootstrap_empty_history,
+            report_path=args.report,
+        )
     except Exception as exc:
         print(f"ERROR: advice backtest update failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

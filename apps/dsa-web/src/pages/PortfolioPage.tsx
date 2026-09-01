@@ -314,15 +314,18 @@ const PortfolioPage: React.FC = () => {
   }, [eventPage, loadEventsPage, loadSnapshotAndRisk]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initialize persisted portfolio account data
     void loadAccounts();
     void loadBrokers();
   }, [loadAccounts, loadBrokers]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initialize the server-computed snapshot and risk view
     void loadSnapshotAndRisk();
   }, [loadSnapshotAndRisk]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initialize persisted portfolio events
     void loadEvents();
   }, [loadEvents]);
 
@@ -331,16 +334,19 @@ const PortfolioPage: React.FC = () => {
       viewKey: refreshViewKey,
       requestId: refreshContextRef.current.requestId + 1,
     };
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- cancel UI state tied to the previous portfolio scope
     setFxRefreshing(false);
     setFxRefreshFeedback(null);
   }, [refreshViewKey]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- filter changes reset pagination to its first page
     setEventPage(1);
   }, [eventType, queryAccountId, eventDateFrom, eventDateTo, eventSymbol, eventSide, eventDirection, eventActionType]);
 
   useEffect(() => {
     if (!writeBlocked) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clear a warning once a writable account is selected
       setWriteWarning(null);
     }
   }, [writeBlocked]);

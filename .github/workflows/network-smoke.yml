@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -26,9 +26,7 @@ jobs:
 
       - name: 📦 Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
+          python -m pip install -r .github/requirements-ci.lock
 
       - name: 🌐 Run pytest network smoke (non-blocking)
         continue-on-error: true

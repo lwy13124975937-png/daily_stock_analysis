@@ -691,13 +691,16 @@ def slice_at_max_bytes(text: str, max_bytes: int) -> tuple[str, str]:
     if len(encoded) <= max_bytes:
         return text, ""
 
-    # 从最大字节数开始向前查找，找到完整的 UTF-8 字符边界
-    truncated = encoded[:max_bytes]
-    while truncated and (truncated[-1] & 0xC0) == 0x80:
-        truncated = truncated[:-1]
-
-    truncated = truncated.decode('utf-8', errors='ignore')
-    return truncated, text[len(truncated):]
+    # Strictly locate the last complete UTF-8 boundary.  Invalid bytes must
+    # never be silently discarded because that would hide damaged content.
+    cut = max_bytes
+    while cut > 0:
+        try:
+            truncated = encoded[:cut].decode("utf-8")
+            return truncated, text[len(truncated):]
+        except UnicodeDecodeError as exc:
+            cut = exc.start
+    return "", text
 
 
 def _format_feishu_markdown_unprotected(content: str) -> str:

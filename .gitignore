@@ -56,7 +56,10 @@ env/
 /data/
 logs/
 reports/
-site/
+!src/reports/
+!src/reports/**
+src/reports/__pycache__/
+/site/
 *.db
 *.sqlite
 *.sqlite3
@@ -80,6 +83,9 @@ verify_*.py
 .claude/*
 !.claude/skills/
 !.claude/skills/**
+
+# local system-audit review bundle
+/external_review_bundle/
 
 # ignore static files
 static/

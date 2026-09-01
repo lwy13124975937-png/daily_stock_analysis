@@ -52,6 +52,7 @@ export const ReportNews: React.FC<ReportNewsProps> = ({ recordId, limit = 8, lan
   }, [recordId, limit]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- clear stale remote data before loading another record
     setItems([]);
     setError(null);
 

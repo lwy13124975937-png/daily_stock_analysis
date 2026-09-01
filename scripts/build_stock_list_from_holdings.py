@@ -7,14 +7,31 @@ and writes a sanitized snapshot for the static Pages builder.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 import base64
+import hashlib
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+
+
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.reports.contracts import HOLDINGS_SCHEMA_VERSION, write_json_atomic  # noqa: E402
+from src.reports.public_holdings import (  # noqa: E402
+    ANALYZED_TYPES,
+    SNAPSHOT_TYPES,
+    build_public_holdings_snapshot,
+    normalize_code,
+    normalize_holding_type,
+    stock_items_from_snapshot,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -31,27 +48,6 @@ DEFAULT_HOLDINGS_API_URL = (
     "https://api.github.com/repos/"
     "lwy13124975937-png/stock-dashboard/contents/holdings_data.json?ref=main"
 )
-ANALYZED_TYPES = {"stock"}
-SNAPSHOT_TYPES = ("stock", "lof", "otc")
-TYPE_ALIASES = {
-    "stock": "stock",
-    "a股": "stock",
-    "a股个股": "stock",
-    "lof": "lof",
-    "etf": "lof",
-    "lof/etf": "lof",
-    "场内基金": "lof",
-    "场内基金/etf/lof": "lof",
-    "场内基金/ETF/LOF": "lof",
-    "otc": "otc",
-    "fund": "otc",
-    "场外基金": "otc",
-}
-TYPE_LABELS = {
-    "stock": "A股个股",
-    "lof": "场内基金/ETF/LOF",
-    "otc": "场外基金",
-}
 
 
 def _is_enabled(record: dict) -> bool:
@@ -59,10 +55,7 @@ def _is_enabled(record: dict) -> bool:
 
 
 def _normalize_code(value: object) -> str:
-    code = str(value or "").strip()
-    if code.isdigit() and 0 < len(code) <= 6:
-        return code.zfill(6)
-    return code
+    return normalize_code(value)
 
 
 def _clean_text(value: object) -> str:
@@ -70,9 +63,7 @@ def _clean_text(value: object) -> str:
 
 
 def _normalize_type(value: object) -> str:
-    raw = _clean_text(value)
-    lowered = raw.lower()
-    return TYPE_ALIASES.get(lowered) or TYPE_ALIASES.get(raw) or lowered
+    return normalize_holding_type(value)
 
 
 def _auth_token() -> str:
@@ -119,6 +110,13 @@ def _download_json(url: str) -> dict:
         charset = response.headers.get_content_charset() or "utf-8"
         payload = json.loads(response.read().decode(charset))
         return _decode_github_contents_payload(payload)
+
+
+def _safe_url_for_log(url: str) -> str:
+    parsed = urlsplit(str(url or ""))
+    if parsed.scheme not in {"http", "https"}:
+        return "configured holdings endpoint"
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def _load_json_from_env() -> tuple[dict, str] | None:
@@ -172,7 +170,9 @@ def _load_holdings_data() -> tuple[dict, str]:
         try:
             return _download_json(url), url
         except Exception as exc:
-            attempts.append(f"- failed holdings data {url}: {type(exc).__name__}: {exc}")
+            attempts.append(
+                f"- failed holdings data {_safe_url_for_log(url)}: {type(exc).__name__}: {exc}"
+            )
 
     raise RuntimeError(
         "unable to load holdings data; attempted sources:\n" + "\n".join(attempts)
@@ -190,89 +190,28 @@ def _append_unique_code(codes: list[str], seen: set[str], code: str) -> None:
 
 
 def build_holdings_snapshot(data: dict, source_url: str) -> tuple[dict, dict[str, list[str]], list[str]]:
-    accounts: dict[str, dict[str, list[dict[str, str]]]] = {}
+    snapshot, _warnings = build_public_holdings_snapshot(data, source_url)
     type_codes: dict[str, list[str]] = {asset_type: [] for asset_type in SNAPSHOT_TYPES}
     seen_by_type: dict[str, set[str]] = {asset_type: set() for asset_type in SNAPSHOT_TYPES}
     stock_list: list[str] = []
     seen_analysis_codes: set[str] = set()
-
-    holdings = data.get("holdings", [])
-    if not isinstance(holdings, list):
-        holdings = []
-
-    for record in holdings:
-        if not isinstance(record, dict) or not _is_enabled(record):
-            continue
-
-        asset_type = _normalize_type(record.get("type"))
-        if asset_type not in SNAPSHOT_TYPES:
-            continue
-
-        code = _normalize_code(record.get("code"))
-        name = _clean_text(record.get("name"))
-        account = _clean_text(record.get("account")) or "未分组账户"
-        if not code:
-            continue
-
-        public_item = {
-            "account": account,
-            "type": asset_type,
-            "name": name,
-            "code": code,
-        }
-        accounts.setdefault(account, _empty_account())[asset_type].append(public_item)
-        _append_unique_code(type_codes[asset_type], seen_by_type[asset_type], code)
-
-        if asset_type in ANALYZED_TYPES:
-            _append_unique_code(stock_list, seen_analysis_codes, code)
-
-    snapshot = {
-        "generated_at": datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-        "source_url": source_url,
-        "accounts": accounts,
-        "type_labels": TYPE_LABELS,
-    }
+    for groups in snapshot["accounts"].values():
+        for asset_type in SNAPSHOT_TYPES:
+            for item in groups[asset_type]:
+                code = item["code"]
+                _append_unique_code(type_codes[asset_type], seen_by_type[asset_type], code)
+                if asset_type in ANALYZED_TYPES:
+                    _append_unique_code(stock_list, seen_analysis_codes, code)
     return snapshot, type_codes, stock_list
 
 
 def write_snapshot(snapshot: dict) -> None:
-    SITE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SNAPSHOT_PATH.write_text(
-        json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(SNAPSHOT_PATH, snapshot)
     print(f"Holdings snapshot written: {SNAPSHOT_PATH.relative_to(ROOT_DIR)}")
 
 
 def _stock_items_from_snapshot(snapshot: dict) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
-    seen: set[str] = set()
-    accounts = snapshot.get("accounts", {}) if isinstance(snapshot, dict) else {}
-    if not isinstance(accounts, dict):
-        return items
-
-    for account_name, groups in accounts.items():
-        if not isinstance(groups, dict):
-            continue
-        stocks = groups.get("stock", [])
-        if not isinstance(stocks, list):
-            continue
-        for holding in stocks:
-            if not isinstance(holding, dict):
-                continue
-            code = _normalize_code(holding.get("code"))
-            if not code or code in seen:
-                continue
-            seen.add(code)
-            items.append(
-                {
-                    "code": code,
-                    "name": _clean_text(holding.get("name")) or code,
-                    "type": "stock",
-                    "account": _clean_text(holding.get("account") or account_name),
-                }
-            )
-    return items
+    return stock_items_from_snapshot(snapshot)
 
 
 def _stock_items_from_codes(stock_list: str) -> list[dict[str, str]]:
@@ -290,14 +229,15 @@ def _stock_items_from_codes(stock_list: str) -> list[dict[str, str]]:
 def write_current_stock_list(stock_items: list[dict[str, str]], source: str) -> None:
     SITE_DATA_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
-        "generated_at": datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-        "source": source,
+        "schema_version": HOLDINGS_SCHEMA_VERSION,
+        "generated_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+        "source_kind": source,
+        "source_fingerprint": hashlib.sha256(
+            json.dumps(stock_items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
         "stocks": stock_items,
     }
-    CURRENT_STOCK_LIST_PATH.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(CURRENT_STOCK_LIST_PATH, payload)
     print(f"Current stock list written: {CURRENT_STOCK_LIST_PATH.relative_to(ROOT_DIR)}")
 
 
@@ -313,15 +253,14 @@ def _set_stock_list(value: str, source: str, stock_items: list[dict[str, str]] |
     stock_list = value.strip()
     write_current_stock_list(stock_items or _stock_items_from_codes(stock_list), source)
     _write_github_env("STOCK_LIST", stock_list)
-    print(f"STOCK_LIST={stock_list}")
-    print(f"STOCK_LIST source: {source}")
+    count = len([item for item in stock_list.split(",") if item.strip()])
+    fingerprint = hashlib.sha256(stock_list.encode("utf-8")).hexdigest()[:12]
+    print(f"STOCK_LIST count={count}, fingerprint={fingerprint}, source={source}")
     return stock_list
 
 
 def _print_type_codes(label: str, codes: list[str]) -> None:
-    joined = ",".join(codes) if codes else "(none)"
     print(f"{label}数量: {len(codes)}")
-    print(f"{label}代码: {joined}")
 
 
 def build_stock_list() -> str:
@@ -354,6 +293,9 @@ def build_stock_list() -> str:
     _print_type_codes("A股逐只分析", type_codes["stock"])
     _print_type_codes("LOF/ETF 组合复盘", type_codes["lof"])
     _print_type_codes("场外基金清单", type_codes["otc"])
+    warning_count = len(snapshot.get("validation_warnings") or [])
+    if warning_count:
+        print(f"Holdings validation warnings: count={warning_count}", file=sys.stderr)
 
     if not stock_list:
         print("ERROR: no enabled stock holdings found in holdings data.", file=sys.stderr)
@@ -362,7 +304,11 @@ def build_stock_list() -> str:
     return _set_stock_list(",".join(stock_list), "holdings", stock_items)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Build the current A-share analysis list and sanitized full holdings snapshot",
+    )
+    parser.parse_args(argv)
     stock_list = build_stock_list()
     return 0 if stock_list else 1
 

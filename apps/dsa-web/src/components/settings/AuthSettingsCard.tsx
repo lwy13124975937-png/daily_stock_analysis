@@ -46,6 +46,7 @@ export const AuthSettingsCard: React.FC = () => {
   }, [setupState, desiredEnabled]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- mirror externally refreshed authentication status
     setDesiredEnabled(authEnabled);
   }, [authEnabled]);
 

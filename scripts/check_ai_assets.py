@@ -44,14 +44,39 @@ def ensure_file_exists(path: Path, description: str) -> None:
         fail(f"{description} is missing: {path.relative_to(ROOT)}")
 
 
+def _git_index_mode(path: Path) -> str | None:
+    try:
+        relative = path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return None
+    result = subprocess.run(
+        ["git", "ls-files", "-s", "--", relative],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    line = result.stdout.strip()
+    if not line:
+        return None
+    return line.split(maxsplit=1)[0]
+
+
 def ensure_symlink() -> None:
     ensure_file_exists(AGENTS, "canonical AGENTS.md")
     if not CLAUDE.exists():
         fail("CLAUDE.md is missing")
-    if not CLAUDE.is_symlink():
+
+    if CLAUDE.is_symlink():
+        target = Path(CLAUDE.readlink())
+    elif _git_index_mode(CLAUDE) == "120000":
+        # Git for Windows with core.symlinks=false materializes a tracked
+        # symlink as a plain file containing the link target. The index mode
+        # remains authoritative; a normal 100644 file is never accepted.
+        target = Path(CLAUDE.read_text(encoding="utf-8"))
+    else:
         fail("CLAUDE.md must be a symlink to AGENTS.md")
 
-    target = Path(CLAUDE.readlink())
     if target != Path("AGENTS.md"):
         fail(f"CLAUDE.md must point to AGENTS.md, found: {target}")
 

@@ -36,7 +36,7 @@ def _has_tushare_token() -> bool:
         from dotenv import load_dotenv  # type: ignore
     except ImportError:
         if env_path.is_file():
-            for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
                 key, sep, value = line.partition("=")
                 if sep and key.strip() == "TUSHARE_TOKEN" and value.strip().strip("'\""):
                     return True

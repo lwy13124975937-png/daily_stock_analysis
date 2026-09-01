@@ -176,6 +176,7 @@ const HomePage: React.FC = () => {
 
   useEffect(() => {
     if (selectedStrategyId && !analysisSkills.some((skill) => skill.id === selectedStrategyId)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- invalidate a selection removed by refreshed server data
       setSelectedStrategyId('');
     }
   }, [analysisSkills, selectedStrategyId]);

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createParsedApiError, getParsedApiError, type ParsedApiError } from '../api/error';
 import { systemConfigApi, SystemConfigConflictError, SystemConfigValidationError } from '../api/systemConfig';
 import type {
@@ -97,9 +97,12 @@ export function useSystemConfig() {
     for (const item of serverItems) {
       map[item.key] = item;
     }
-    serverItemByKeyRef.current = map;
     return map;
   }, [serverItems]);
+
+  useEffect(() => {
+    serverItemByKeyRef.current = serverItemByKey;
+  }, [serverItemByKey]);
 
   const categories = useMemo<SystemConfigCategorySchema[]>(() => {
     // Infer tabs from loaded config item schema metadata.

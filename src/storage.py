@@ -2246,7 +2246,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         with self.session_scope() as session:
             stmt = select(ConversationMessage).filter(
                 ConversationMessage.session_id == session_id
-            ).order_by(ConversationMessage.created_at.desc()).limit(limit)
+            ).order_by(ConversationMessage.id.desc()).limit(limit)
             messages = session.execute(stmt).scalars().all()
 
             # 倒序返回，保证时间顺序
@@ -2263,12 +2263,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         ConversationMessage.role.in_(["user", "assistant"]),
                     )
                 )
-                .order_by(ConversationMessage.created_at, ConversationMessage.id)
+                .order_by(ConversationMessage.id)
             )
             if limit is not None:
                 stmt = (
                     stmt.order_by(None)
-                    .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+                    .order_by(ConversationMessage.id.desc())
                     .limit(limit)
                 )
             messages = session.execute(stmt).scalars().all()
@@ -2557,7 +2557,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             stmt = (
                 select(ConversationMessage)
                 .where(ConversationMessage.session_id == session_id)
-                .order_by(ConversationMessage.created_at)
+                .order_by(ConversationMessage.id)
                 .limit(limit)
             )
             messages = session.execute(stmt).scalars().all()

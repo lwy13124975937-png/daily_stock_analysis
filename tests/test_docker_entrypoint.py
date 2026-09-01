@@ -1,17 +1,26 @@
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _require_posix_shell() -> str:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("POSIX sh is required for docker entrypoint checks")
+    return shell
+
+
 def test_docker_entrypoint_has_valid_shell_syntax() -> None:
     subprocess.run(
-        ["sh", "-n", str(REPO_ROOT / "docker" / "entrypoint.sh")],
+        [_require_posix_shell(), "-n", str(REPO_ROOT / "docker" / "entrypoint.sh")],
         check=True,
     )
 
@@ -27,10 +36,13 @@ def test_dockerfile_uses_entrypoint_to_drop_privileges() -> None:
 def test_dockerfile_bundles_default_alphasift_adapter() -> None:
     dockerfile = (REPO_ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
     requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    lock = (REPO_ROOT / "docker" / "requirements.lock").read_text(encoding="utf-8")
 
     assert "git \\" in dockerfile
     assert "git+https://github.com/ZhuLinsen/alphasift.git@1a0ed8c99b3615c0cb1076e6029827ffc6de2344#egg=alphasift" in requirements
-    assert "pip install --no-cache-dir -r requirements.txt" in dockerfile
+    assert "git+https://github.com/ZhuLinsen/alphasift.git@1a0ed8c99b3615c0cb1076e6029827ffc6de2344#egg=alphasift" in lock
+    assert "COPY requirements.txt docker/requirements.lock ./" in dockerfile
+    assert "pip install --no-cache-dir -r requirements.lock" in dockerfile
     assert "import alphasift.dsa_adapter" in dockerfile
 
 
@@ -142,14 +154,15 @@ def _run_entrypoint_with_fake_tools(
     gosu_write_exit: int,
     chown_exit: int,
 ) -> subprocess.CompletedProcess[str]:
+    shell = _require_posix_shell()
     env = os.environ.copy()
-    env["PATH"] = f"{fakebin}:{env['PATH']}"
+    env["PATH"] = f"{fakebin}{os.pathsep}{env['PATH']}"
     env["FAKE_LOG_DIR"] = str(log_dir)
     env["GOSU_WRITE_EXIT"] = str(gosu_write_exit)
     env["CHOWN_EXIT"] = str(chown_exit)
 
     return subprocess.run(
-        ["sh", str(REPO_ROOT / "docker" / "entrypoint.sh"), "true"],
+        [shell, str(REPO_ROOT / "docker" / "entrypoint.sh"), "true"],
         check=True,
         capture_output=True,
         text=True,

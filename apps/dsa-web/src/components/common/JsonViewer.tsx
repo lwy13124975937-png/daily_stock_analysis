@@ -31,40 +31,6 @@ export const JsonViewer: React.FC<JsonViewerProps> = ({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // 简单的语法高亮
-  const highlightJson = (json: string): React.ReactNode => {
-    return json.split('\n').map((line, index) => {
-      // 高亮 key
-      let highlighted = line.replace(
-        /"([^"]+)":/g,
-        '<span class="text-cyan-400">"$1"</span>:'
-      );
-      // 高亮字符串值
-      highlighted = highlighted.replace(
-        /: "([^"]*)"/g,
-        ': <span class="text-emerald-400">"$1"</span>'
-      );
-      // 高亮数字
-      highlighted = highlighted.replace(
-        /: (-?\d+\.?\d*)/g,
-        ': <span class="text-amber-400">$1</span>'
-      );
-      // 高亮布尔值和 null
-      highlighted = highlighted.replace(
-        /: (true|false|null)/g,
-        ': <span class="text-purple-400">$1</span>'
-      );
-
-      return (
-        <div
-          key={index}
-          className="leading-relaxed"
-          dangerouslySetInnerHTML={{ __html: highlighted }}
-        />
-      );
-    });
-  };
-
   return (
     <div className={`relative ${className}`}>
       {/* 复制按钮 */}
@@ -84,7 +50,7 @@ export const JsonViewer: React.FC<JsonViewerProps> = ({
         style={{ maxHeight }}
       >
         <pre className="whitespace-pre-wrap break-words">
-          {highlightJson(jsonString)}
+          {jsonString}
         </pre>
       </div>
     </div>

@@ -25,6 +25,22 @@ from src.services.run_diagnostics import (
 from src.enums import ReportType
 
 
+class _NoHoldingsSnapshotTestCase(unittest.TestCase):
+    def setUp(self):
+        # Notification routing is the unit under test. Keep repository-local
+        # holdings fixtures from changing the aggregate report payload or
+        # entering the portfolio-review LLM throttle path.
+        self._snapshot_patch = patch.object(
+            StockAnalysisPipeline,
+            "_load_holdings_snapshot",
+            return_value={},
+        )
+        self._snapshot_patch.start()
+
+    def tearDown(self):
+        self._snapshot_patch.stop()
+
+
 class _FakeNotifier:
     def __init__(self):
         self._markdown_to_image_channels = {"email"}
@@ -52,7 +68,7 @@ class _FakeNotifier:
         return "report:" + ",".join(r.code for r in results)
 
 
-class TestPipelineEmailGroupImageRouting(unittest.TestCase):
+class TestPipelineEmailGroupImageRouting(_NoHoldingsSnapshotTestCase):
     def _build_pipeline(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
         pipeline.notifier = _FakeNotifier()
@@ -157,7 +173,7 @@ class _FakeWechatNotifier:
         self.send_to_wechat = MagicMock(return_value=True)
 
 
-class TestPipelineWechatOnlyImageRouting(unittest.TestCase):
+class TestPipelineWechatOnlyImageRouting(_NoHoldingsSnapshotTestCase):
     def test_send_notifications_wechat_only_converts_legacy_dashboard_for_image(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
         pipeline.notifier = _FakeWechatNotifier()
@@ -238,7 +254,7 @@ class _FakeRoutedNotifier:
         return "report:" + ",".join(r.code for r in results)
 
 
-class TestPipelineReportRouteFiltering(unittest.TestCase):
+class TestPipelineReportRouteFiltering(_NoHoldingsSnapshotTestCase):
     def test_send_notifications_applies_report_route_before_channel_iteration(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
         pipeline.notifier = _FakeRoutedNotifier([NotificationChannel.TELEGRAM])

@@ -128,6 +128,7 @@ const ChatPage: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initialize the chat watchlist from the API
     void loadWatchlist();
   }, [loadWatchlist]);
 
@@ -226,6 +227,7 @@ const ChatPage: React.FC = () => {
     const shouldAutoScroll = shouldStickToBottomRef.current;
     if (!shouldAutoScroll) {
       if (messages.length > 0 || progressSteps.length > 0 || loading) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- reflect external scroll position after content changes
         setShowJumpToBottom(true);
       }
       return;
@@ -412,6 +414,7 @@ const ChatPage: React.FC = () => {
     }
 
     const hydrationToken = ++followUpHydrationTokenRef.current;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate an explicit follow-up URL into the composer
     setInput(buildFollowUpPrompt(stock, name));
     setActiveStockCode(stock);
     followUpContextRef.current = {

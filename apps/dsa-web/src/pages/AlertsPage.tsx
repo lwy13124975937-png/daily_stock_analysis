@@ -191,11 +191,13 @@ const AlertsPage: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- load persisted alert rules on mount
     void loadRules();
   }, [loadRules]);
 
   useEffect(() => {
     if (!rulesLoaded) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate dependent alert data after rules load
     void loadTriggers();
     void loadNotifications();
   }, [loadNotifications, loadTriggers, rulesLoaded]);

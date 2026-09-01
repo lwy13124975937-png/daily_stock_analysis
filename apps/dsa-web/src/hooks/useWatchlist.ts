@@ -44,6 +44,7 @@ export function useWatchlist(): UseWatchlistReturn {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initialize the hook from the persisted watchlist
     setIsLoading(true);
     void refresh().finally(() => {
       if (mountedRef.current) {

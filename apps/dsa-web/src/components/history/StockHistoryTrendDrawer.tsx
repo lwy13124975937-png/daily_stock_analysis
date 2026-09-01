@@ -180,6 +180,7 @@ export const StockHistoryTrendDrawer: React.FC<StockHistoryTrendDrawerProps> = (
   );
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset selection when the external record changes
     setSelectedRecordId(currentRecordId);
   }, [currentRecordId]);
 

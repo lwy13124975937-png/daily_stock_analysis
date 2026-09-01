@@ -28,7 +28,7 @@ mark the block as ``partial`` when only some fields are populated.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -143,7 +143,21 @@ class YfinanceFundamentalAdapter:
     market-agnostic.
     """
 
-    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+    def get_fundamental_bundle(
+        self,
+        stock_code: str,
+        *,
+        as_of: date | datetime | str | None = None,
+    ) -> Dict[str, Any]:
+        if as_of is None:
+            as_of_date = datetime.now(timezone.utc).date()
+        elif isinstance(as_of, datetime):
+            as_of_date = as_of.date()
+        elif isinstance(as_of, date):
+            as_of_date = as_of
+        else:
+            as_of_date = date.fromisoformat(str(as_of))
+
         result: Dict[str, Any] = {
             "status": "not_supported",
             "growth": {},
@@ -276,7 +290,8 @@ class YfinanceFundamentalAdapter:
         if div_series is not None and not div_series.empty:
             try:
                 # Index is timezone-aware (ex-dividend date)
-                cutoff = pd.Timestamp.now(tz=div_series.index.tz) - pd.Timedelta(days=365)
+                anchor = pd.Timestamp(as_of_date).tz_localize(div_series.index.tz)
+                cutoff = anchor - pd.Timedelta(days=365)
                 for ts, value in div_series.items():
                     per_share = _safe_float(value)
                     if per_share is None or per_share <= 0:
@@ -299,7 +314,7 @@ class YfinanceFundamentalAdapter:
                         event_ts = pd.Timestamp(item["event_date"]).tz_localize(div_series.index.tz)
                     except Exception:
                         continue
-                    if event_ts >= cutoff:
+                    if cutoff < event_ts <= anchor:
                         ttm_events.append(item)
             except Exception as exc:
                 result["errors"].append(f"dividend_window:{type(exc).__name__}")
@@ -319,7 +334,7 @@ class YfinanceFundamentalAdapter:
                 "ttm_cash_dividend_per_share": round(ttm_cash, 6) if ttm_cash is not None else None,
                 "coverage": "cash_dividend_pre_tax",
                 "currency": dividend_currency,
-                "as_of": datetime.now(timezone.utc).date().isoformat(),
+                "as_of": as_of_date.isoformat(),
             }
 
             # Yield: prefer recomputing from TTM cash / latest price so the

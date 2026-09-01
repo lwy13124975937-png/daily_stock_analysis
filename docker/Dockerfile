@@ -13,8 +13,10 @@ RUN npm ci
 COPY apps/dsa-web/ ./
 RUN npm run build
 
-# Pin to bookworm: wkhtmltopdf was removed from Debian testing (2025)
-FROM python:3.11-slim-bookworm
+# Ubuntu 24.04 supplies glibc 2.39 (required by the pinned Longbridge SDK)
+# and packages wkhtmltopdf. Container dependencies use the dedicated
+# Python 3.12 / manylinux_2_39 lock.
+FROM ubuntu:24.04
 
 # 设置工作目录
 WORKDIR /app
@@ -25,26 +27,31 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 安装系统依赖（wkhtmltopdf 含 wkhtmltoimage，用于 Markdown 转图片 Issue #289）
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-venv \
+    ca-certificates \
     gcc \
     curl \
     git \
     gosu \
     wkhtmltopdf \
     fontconfig \
-    libjpeg62-turbo \
     libxrender1 \
     libxext6 \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 # 创建非 root 用户 (UID 1000)
 RUN groupadd -g 1000 dsa && \
     useradd -u 1000 -g dsa -m dsa
 
 # 复制依赖文件
-COPY requirements.txt .
+COPY requirements.txt docker/requirements.lock ./
 
 # 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.lock
 
 # 复制应用代码
 COPY *.py ./

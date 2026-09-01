@@ -69,14 +69,6 @@ class TestYfinanceFundamentalAdapter(unittest.TestCase):
             "trailingAnnualDividendRate": 1.04,
             "dividendYield": 0.36,
         }
-        income_df = pd.DataFrame(
-            {
-                pd.Timestamp("2026-03-31"): {"Total Revenue": 1.11e11, "Net Income": 2.95e10},
-                pd.Timestamp("2025-12-31"): {"Total Revenue": 1.24e11, "Net Income": 3.62e10},
-                pd.Timestamp("2025-09-30"): {"Total Revenue": 9.49e10, "Net Income": 2.49e10},
-                pd.Timestamp("2025-06-30"): {"Total Revenue": 9.40e10, "Net Income": 2.34e10},
-            }
-        )
         # Need at least 5 columns to trigger statement-derived YoY.
         income_df_with_yoy = pd.DataFrame(
             {
@@ -104,7 +96,10 @@ class TestYfinanceFundamentalAdapter(unittest.TestCase):
         ticker = _build_mock_ticker(info, income_df_with_yoy, cashflow_df, dividends)
 
         with patch("yfinance.Ticker", return_value=ticker):
-            bundle = YfinanceFundamentalAdapter().get_fundamental_bundle("AAPL")
+            bundle = YfinanceFundamentalAdapter().get_fundamental_bundle(
+                "AAPL",
+                as_of="2026-08-10",
+            )
 
         self.assertEqual(bundle["status"], "partial")
         growth = bundle["growth"]
@@ -127,6 +122,7 @@ class TestYfinanceFundamentalAdapter(unittest.TestCase):
         self.assertAlmostEqual(div["ttm_dividend_yield_pct"], 0.5, places=2)
         self.assertEqual(div["currency"], "USD")
         self.assertEqual(div["events"][0]["ex_dividend_date"], "2026-05-11")
+        self.assertEqual(div["as_of"], "2026-08-10")
 
         self.assertEqual(
             bundle["belong_boards"],
