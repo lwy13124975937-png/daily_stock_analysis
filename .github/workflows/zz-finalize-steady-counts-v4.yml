@@ -81,6 +81,7 @@ jobs:
 
           expected = {
               'api/v1/schemas/steady_income.py',
+              'docs/CHANGELOG.md',
               'scripts/build_steady_income_report.py',
               'src/services/steady_income_contracts.py',
               'src/services/steady_income_service.py',
