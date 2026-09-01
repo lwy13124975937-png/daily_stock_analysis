@@ -1,5 +1,7 @@
 # Changelog
 
+> 2026-09-01 audit closeout: steady-income schema v6 separates `deep_requested_count`, `deep_attempted_count`, `deep_completed_count`, and `unevaluated_count`. The default 240 budget is a validated fixed shortlist, not exhaustive or statistically optimal, and it does not guarantee recall of every qualified prefilter candidate.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),

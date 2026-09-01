@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
 
-STEADY_INCOME_SCHEMA_VERSION = 5
+STEADY_INCOME_SCHEMA_VERSION = 6
 STEADY_INCOME_MODEL_VERSION = "steady-income-risk-v5"
 STEADY_INCOME_RULESET_VERSION = "4.0.0"
 STEADY_INCOME_EVALUATOR_VERSION = "5.0.0"
@@ -58,6 +58,58 @@ class SteadyDataStatus(str, Enum):
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     SOURCE_SCHEMA_CHANGED = "source_schema_changed"
     VALID_ZERO = "valid_zero"
+
+
+def summarize_deep_evaluation_counts(
+    *,
+    prefilter_count: int,
+    requested_count: int,
+    terminal_distribution: Mapping[str, Any],
+) -> dict[str, int]:
+    # attempted = reached exactly one terminal status; completed = qualified/rejected only.
+    prefilter = int(prefilter_count)
+    requested = int(requested_count)
+    if prefilter < 0 or requested < 0:
+        raise ValueError("steady-income counts cannot be negative")
+    if requested > prefilter:
+        raise ValueError("deep_requested_count cannot exceed prefilter_count")
+
+    terminal = {
+        status.value: int(terminal_distribution.get(status.value) or 0)
+        for status in SteadyTerminalStatus
+    }
+    if any(value < 0 for value in terminal.values()):
+        raise ValueError("terminal status counts cannot be negative")
+
+    attempted = sum(terminal.values())
+    if attempted > requested:
+        raise ValueError("deep_attempted_count cannot exceed deep_requested_count")
+    if attempted > prefilter:
+        raise ValueError("deep_attempted_count cannot exceed prefilter_count")
+
+    qualified = terminal[SteadyTerminalStatus.EVALUATED_QUALIFIED.value]
+    rejected = terminal[SteadyTerminalStatus.EVALUATED_REJECTED.value]
+    completed = qualified + rejected
+    return {
+        "deep_requested_count": requested,
+        "deep_attempted_count": attempted,
+        "deep_completed_count": completed,
+        # Compatibility alias. New consumers must use deep_completed_count.
+        "deep_evaluated_count": completed,
+        "qualified_count": qualified,
+        "rejected_count": rejected,
+        "insufficient_evidence_count": terminal[
+            SteadyTerminalStatus.INSUFFICIENT_EVIDENCE.value
+        ],
+        "unsupported_sector_count": terminal[
+            SteadyTerminalStatus.UNSUPPORTED_SECTOR_MODEL.value
+        ],
+        "provider_failure_count": terminal[
+            SteadyTerminalStatus.PROVIDER_FAILURE.value
+        ],
+        "internal_error_count": terminal[SteadyTerminalStatus.INTERNAL_ERROR.value],
+        "unevaluated_count": prefilter - attempted,
+    }
 
 
 def normalize_industry(value: Any) -> str:

@@ -33,6 +33,7 @@ from src.services.steady_income_contracts import (
     SteadyTerminalStatus,
     public_risk_label,
     resolve_sector_model,
+    summarize_deep_evaluation_counts,
 )
 
 
@@ -946,6 +947,8 @@ class SteadyIncomeService:
                                 "risks": ["评估失败，未纳入稳健收益候选"],
                                 "data_status": "数据不足",
                                 "failure_code": "unknown_internal",
+                                "terminal_status": SteadyTerminalStatus.INTERNAL_ERROR.value,
+                                "evidence_issues": ["internal_evaluation_error"],
                                 "evidence": {},
                                 "data_notes": [f"{type(exc).__name__}"],
                             }
@@ -960,6 +963,15 @@ class SteadyIncomeService:
         )
         qualified = [item for item in results if item.get("qualified")]
         excluded = [item for item in results if not item.get("qualified")]
+        terminal_distribution = {
+            status.value: sum(1 for item in results if item.get("terminal_status") == status.value)
+            for status in SteadyTerminalStatus
+        }
+        count_summary = summarize_deep_evaluation_counts(
+            prefilter_count=len(positions),
+            requested_count=len(positions),
+            terminal_distribution=terminal_distribution,
+        )
         response = {
             "schema_version": STEADY_INCOME_SCHEMA_VERSION,
             "model_version": STEADY_INCOME_MODEL_VERSION,
@@ -981,12 +993,12 @@ class SteadyIncomeService:
             "selection_mode": "portfolio",
             "universe_count": len(results),
             "prefilter_count": len(results),
-            "deep_budget": len(results),
-            "deep_evaluated_count": len(results),
-            "unevaluated_count": 0,
-            "is_exhaustive": True,
-            "evaluated_count": len(results),
+            "deep_budget": len(positions),
+            **count_summary,
+            "is_exhaustive": count_summary["unevaluated_count"] == 0,
+            "evaluated_count": count_summary["deep_completed_count"],
             "qualified_count": len(qualified),
+            "terminal_status_distribution": terminal_distribution,
             "candidates": qualified,
             "excluded": excluded,
             "warnings": warnings,

@@ -13,6 +13,7 @@ import pandas as pd
 
 from src.site.builder import _render_index, _render_steady
 from src.site.validator import _check_steady
+from src.services.steady_income_contracts import summarize_deep_evaluation_counts
 from scripts.build_steady_income_report import (
     MAX_DEEP_EVALUATIONS,
     PublicMarketSource,
@@ -546,6 +547,36 @@ class SteadyIncomePagesTests(unittest.TestCase):
         self.assertEqual(len(evidence["events"]), 1)
         self.assertEqual(evidence["ttm_cash_dividend_per_share"], 1.2)
 
+    def test_deep240_count_contract_distinguishes_attempted_completed_and_unevaluated(self) -> None:
+        counts = summarize_deep_evaluation_counts(
+            prefilter_count=662,
+            requested_count=240,
+            terminal_distribution={
+                "evaluated_qualified": 25,
+                "evaluated_rejected": 206,
+                "insufficient_evidence": 9,
+                "unsupported_sector_model": 0,
+                "provider_failure": 0,
+                "internal_error": 0,
+            },
+        )
+        self.assertEqual(counts["deep_requested_count"], 240)
+        self.assertEqual(counts["deep_attempted_count"], 240)
+        self.assertEqual(counts["deep_completed_count"], 231)
+        self.assertEqual(counts["deep_evaluated_count"], 231)
+        self.assertEqual(counts["insufficient_evidence_count"], 9)
+        self.assertEqual(counts["unevaluated_count"], 422)
+        self.assertEqual(
+            counts["deep_attempted_count"],
+            counts["qualified_count"] + counts["rejected_count"]
+            + counts["insufficient_evidence_count"] + counts["unsupported_sector_count"]
+            + counts["provider_failure_count"] + counts["internal_error_count"],
+        )
+        self.assertEqual(
+            counts["deep_completed_count"],
+            counts["qualified_count"] + counts["rejected_count"],
+        )
+
     def test_dataset_evaluates_whole_market_seeds_not_current_holdings(self) -> None:
         manager = FakeDataManager()
         source = FakeMarketSource()
@@ -557,10 +588,14 @@ class SteadyIncomePagesTests(unittest.TestCase):
         self.assertEqual(set(manager.history_codes), {"600001", "000002"})
         self.assertEqual(set(source.deep_codes), {"600001", "000002"})
         self.assertEqual(source.fiscal_years, [2025])
-        self.assertEqual(payload["schema_version"], 5)
+        self.assertEqual(payload["schema_version"], 6)
         self.assertEqual(payload["universe"]["market"], "沪深A股")
         self.assertIn("覆盖全部沪深 A 股", payload["methodology"]["scope"])
         self.assertNotIn("当前持仓", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(payload["deep_requested_count"], 2)
+        self.assertEqual(payload["deep_attempted_count"], 2)
+        self.assertEqual(payload["deep_completed_count"], 2)
+        self.assertEqual(payload["deep_evaluated_count"], 2)
         self.assertEqual(payload["evaluated_count"], 2)
         self.assertEqual(payload["qualified_count"], 2)
         self.assertEqual(MAX_DEEP_EVALUATIONS, 240)
@@ -587,7 +622,13 @@ class SteadyIncomePagesTests(unittest.TestCase):
         ).build(as_of=date(2026, 8, 26))
         stats = payload["screening_stats"]
         terminal = stats["terminal_status_distribution"]
-        self.assertEqual(sum(terminal.values()), stats["deep_requested_count"])
+        self.assertEqual(sum(terminal.values()), stats["deep_attempted_count"])
+        self.assertGreaterEqual(stats["deep_requested_count"], stats["deep_attempted_count"])
+        self.assertEqual(
+            stats["deep_completed_count"],
+            terminal["evaluated_qualified"] + terminal["evaluated_rejected"],
+        )
+        self.assertEqual(stats["deep_evaluated_count"], stats["deep_completed_count"])
         self.assertEqual(
             stats["success_count"],
             terminal["evaluated_qualified"] + terminal["evaluated_rejected"],
@@ -612,6 +653,8 @@ class SteadyIncomePagesTests(unittest.TestCase):
             "provider_failure": 0,
             "internal_error": 0,
         }
+        payload["screening_stats"]["rejected_count"] = 2
+        payload["rejected_count"] = 2
         payload["screening_stats"]["completed_evaluation_count"] = 2
         payload["screening_stats"]["success_count"] = 2
         payload["screening_stats"]["prefilter_eligible_count"] = 3
@@ -634,11 +677,20 @@ class SteadyIncomePagesTests(unittest.TestCase):
             "provider_failure": 1,
             "internal_error": 0,
         }
+        payload["screening_stats"]["rejected_count"] = 1
+        payload["screening_stats"]["provider_failure_count"] = 1
+        payload["rejected_count"] = 1
+        payload["provider_failure_count"] = 1
+        payload["screening_stats"]["deep_completed_count"] = 1
+        payload["screening_stats"]["deep_evaluated_count"] = 1
         payload["screening_stats"]["completed_evaluation_count"] = 1
         payload["screening_stats"]["success_count"] = 1
+        payload["deep_completed_count"] = 1
+        payload["deep_evaluated_count"] = 1
+        payload["evaluated_count"] = 1
         payload["data_status"] = "degraded"
         html = _render_steady(payload, build_id="fixture-build")
-        self.assertIn("仅完成 1/2", html)
+        self.assertIn("仅完成完整规则判断 1/2", html)
         self.assertNotIn("合法的零候选结果", html)
 
         payload["screening_stats"]["terminal_status_distribution"] = {
@@ -649,8 +701,17 @@ class SteadyIncomePagesTests(unittest.TestCase):
             "provider_failure": 2,
             "internal_error": 0,
         }
+        payload["screening_stats"]["rejected_count"] = 0
+        payload["screening_stats"]["provider_failure_count"] = 2
+        payload["rejected_count"] = 0
+        payload["provider_failure_count"] = 2
+        payload["screening_stats"]["deep_completed_count"] = 0
+        payload["screening_stats"]["deep_evaluated_count"] = 0
         payload["screening_stats"]["completed_evaluation_count"] = 0
         payload["screening_stats"]["success_count"] = 0
+        payload["deep_completed_count"] = 0
+        payload["deep_evaluated_count"] = 0
+        payload["evaluated_count"] = 0
         payload["data_status"] = "provider_unavailable"
         html = _render_steady(payload, build_id="fixture-build")
         self.assertIn("数据源异常未能完成", html)

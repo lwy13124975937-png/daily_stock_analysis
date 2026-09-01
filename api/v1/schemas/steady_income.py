@@ -107,11 +107,20 @@ class SteadyIncomeResponse(BaseModel):
     universe_count: int = 0
     prefilter_count: int = 0
     deep_budget: int = 0
-    deep_evaluated_count: int = 0
+    deep_requested_count: int = 0
+    deep_attempted_count: int = 0
+    deep_completed_count: int = 0
+    deep_evaluated_count: int = Field(0, description="Deprecated alias of deep_completed_count")
     unevaluated_count: int = 0
     is_exhaustive: bool = True
-    evaluated_count: int
+    evaluated_count: int = Field(0, description="Deprecated alias of deep_completed_count")
     qualified_count: int
+    rejected_count: int = 0
+    insufficient_evidence_count: int = 0
+    unsupported_sector_count: int = 0
+    provider_failure_count: int = 0
+    internal_error_count: int = 0
+    terminal_status_distribution: Dict[str, int] = Field(default_factory=dict)
     candidates: List[SteadyIncomeCandidate] = Field(default_factory=list)
     excluded: List[SteadyIncomeCandidate] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)

@@ -54,6 +54,7 @@ from src.services.steady_income_contracts import (  # noqa: E402
     SteadyIncomeProviderUnavailable,
     SteadyIncomeSchemaError,
     public_risk_label,
+    summarize_deep_evaluation_counts,
     resolve_sector_model,
 )
 from src.services.stock_index_remote_service import (  # noqa: E402
@@ -65,6 +66,8 @@ from src.services.stock_index_remote_service import (  # noqa: E402
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_OUTPUT_PATH = ROOT_DIR / "site_data" / "steady_income.json"
 MAX_WORKERS = 4
+# Real-provider validated fixed-shortlist budget. It is not statistically
+# optimal, exhaustive, or guaranteed to recall every qualified prefilter candidate.
 MAX_DEEP_EVALUATIONS = 240
 SELECTION_MODE_FIXED_SHORTLIST = "fixed_shortlist"
 SELECTION_MODE_EXHAUSTIVE = "exhaustive"
@@ -1344,10 +1347,13 @@ class SteadyIncomeDatasetBuilder:
         terminal_distribution = Counter(
             {status: int(terminal_distribution.get(status, 0)) for status in _TERMINAL_STATUSES}
         )
-        completed_count = (
-            terminal_distribution[SteadyTerminalStatus.EVALUATED_QUALIFIED.value]
-            + terminal_distribution[SteadyTerminalStatus.EVALUATED_REJECTED.value]
+        prefilter_count = int(stats.get("prefilter_eligible_count") or 0)
+        count_summary = summarize_deep_evaluation_counts(
+            prefilter_count=prefilter_count,
+            requested_count=len(seeds),
+            terminal_distribution=terminal_distribution,
         )
+        completed_count = count_summary["deep_completed_count"]
         evidence_funnel = {
             evidence_type: {
                 "complete": sum(
@@ -1377,26 +1383,12 @@ class SteadyIncomeDatasetBuilder:
         ]
         stats.update(
             {
-                "deep_requested_count": len(results),
-                "deep_evaluated_count": len(results),
+                **count_summary,
                 "completed_evaluation_count": completed_count,
-                "qualified_count": len(candidates),
-                "evaluated_rejected_count": terminal_distribution[
-                    SteadyTerminalStatus.EVALUATED_REJECTED.value
-                ],
-                "data_insufficient_count": terminal_distribution[
-                    SteadyTerminalStatus.INSUFFICIENT_EVIDENCE.value
-                ],
+                "evaluated_rejected_count": count_summary["rejected_count"],
+                "data_insufficient_count": count_summary["insufficient_evidence_count"],
                 "success_count": completed_count,
-                "provider_failure_count": terminal_distribution[
-                    SteadyTerminalStatus.PROVIDER_FAILURE.value
-                ],
-                "unsupported_sector_model_count": terminal_distribution[
-                    SteadyTerminalStatus.UNSUPPORTED_SECTOR_MODEL.value
-                ],
-                "internal_error_count": terminal_distribution[
-                    SteadyTerminalStatus.INTERNAL_ERROR.value
-                ],
+                "unsupported_sector_model_count": count_summary["unsupported_sector_count"],
                 "terminal_status_distribution": dict(terminal_distribution),
                 "evidence_funnel": evidence_funnel,
                 "provider_failure_by_operation": dict(
@@ -1415,11 +1407,19 @@ class SteadyIncomeDatasetBuilder:
                     )
                 ),
                 "deep_failure_rate": (
-                    round((len(results) - completed_count) / len(results), 4)
-                    if results
+                    round(
+                        (count_summary["deep_attempted_count"] - completed_count)
+                        / count_summary["deep_attempted_count"],
+                        4,
+                    )
+                    if count_summary["deep_attempted_count"]
                     else None
                 ),
-                "deep_success_rate": round(completed_count / len(results), 4) if results else None,
+                "deep_success_rate": (
+                    round(completed_count / count_summary["deep_attempted_count"], 4)
+                    if count_summary["deep_attempted_count"]
+                    else None
+                ),
                 "data_insufficient_by_reason": dict(
                     sorted(Counter(str(item.get("failure_code") or "unknown") for item in excluded).items())
                 ),
@@ -1428,22 +1428,28 @@ class SteadyIncomeDatasetBuilder:
                 ),
             }
         )
-        if not seeds:
+        deep_attempted_count = count_summary["deep_attempted_count"]
+        unevaluated_count = count_summary["unevaluated_count"]
+        if prefilter_count == 0:
             data_status = "valid_zero"
-        elif completed_count == len(results) and not candidates:
-            data_status = "valid_zero"
-        elif completed_count == 0 and terminal_distribution[
-            SteadyTerminalStatus.PROVIDER_FAILURE.value
-        ] == len(results):
-            data_status = "provider_unavailable"
-        elif completed_count < len(results):
+        elif deep_attempted_count == 0:
             data_status = "degraded"
+        elif (
+            completed_count == 0
+            and count_summary["provider_failure_count"] == deep_attempted_count
+        ):
+            data_status = "provider_unavailable"
+        elif completed_count < deep_attempted_count:
+            data_status = "degraded"
+        elif not candidates:
+            data_status = "valid_zero"
         else:
             data_status = "complete"
-        prefilter_count = int(stats.get("prefilter_eligible_count") or 0)
-        deep_evaluated_count = len(results)
-        unevaluated_count = max(prefilter_count - deep_evaluated_count, 0)
-        is_exhaustive = unevaluated_count == 0
+
+        is_exhaustive = (
+            unevaluated_count == 0
+            and deep_attempted_count == prefilter_count
+        )
         selection_mode = (
             SELECTION_MODE_EXHAUSTIVE if is_exhaustive else SELECTION_MODE_FIXED_SHORTLIST
         )
@@ -1451,7 +1457,6 @@ class SteadyIncomeDatasetBuilder:
             {
                 "selection_mode": selection_mode,
                 "deep_budget": self.max_deep_evaluations,
-                "unevaluated_count": unevaluated_count,
                 "is_exhaustive": is_exhaustive,
             }
         )
@@ -1471,7 +1476,15 @@ class SteadyIncomeDatasetBuilder:
             "universe_count": len(universe),
             "prefilter_count": prefilter_count,
             "deep_budget": self.max_deep_evaluations,
-            "deep_evaluated_count": deep_evaluated_count,
+            "deep_requested_count": count_summary["deep_requested_count"],
+            "deep_attempted_count": count_summary["deep_attempted_count"],
+            "deep_completed_count": count_summary["deep_completed_count"],
+            "deep_evaluated_count": count_summary["deep_evaluated_count"],
+            "rejected_count": count_summary["rejected_count"],
+            "insufficient_evidence_count": count_summary["insufficient_evidence_count"],
+            "unsupported_sector_count": count_summary["unsupported_sector_count"],
+            "provider_failure_count": count_summary["provider_failure_count"],
+            "internal_error_count": count_summary["internal_error_count"],
             "unevaluated_count": unevaluated_count,
             "is_exhaustive": is_exhaustive,
             "source": "沪深全市场股票索引 + 公开分红/行情/财务数据",
@@ -1483,14 +1496,14 @@ class SteadyIncomeDatasetBuilder:
             },
             "dividend_plan_periods": plan_periods,
             "screening_stats": stats,
-            "evaluated_count": len(results),
+            "evaluated_count": completed_count,
             "qualified_count": len(candidates),
             "candidates": candidates,
             "excluded": excluded,
             "methodology": {
                 "priority": "风险硬门槛优先，规则分仅对证据完整且可比较的低风险候选生成",
-                "scope": "覆盖全部沪深 A 股；全市场先做分红与盈利预筛，再对高质量种子做深度风险评估",
-                "preselection": "全市场轻量筛选后按行业分层进入可配置深评预算；页面明确展示各阶段数量",
+                "scope": "覆盖全部沪深 A 股进行轻量预筛；只对固定 shortlist 预算内候选做深度风险评估",
+                "preselection": "固定 shortlist 预算经过真实 Provider 路径验证，但不是统计最优阈值、不是全量穷举，也不保证召回全部合格证券",
                 "income": "仅按已实施且除权除息日不晚于评估日的现金分红计算 TTM 股息率",
                 "replay": "按交易日历验证完整年度覆盖后进行历史复权价格回放，不宣称无泄漏总回报",
                 "limitations": "不预测未来分红；金融行业无专用监管证据、披露时点不明或数据不足时不纳入候选",
@@ -1550,7 +1563,8 @@ def main(argv: list[str] | None = None) -> int:
         "Steady-income market dataset written: "
         f"{args.output} (universe={stats['universe_count']}, "
         f"prefilter={stats['prefilter_eligible_count']}, "
-        f"deep={stats['deep_requested_count']}, completed={stats['completed_evaluation_count']}, "
+        f"requested={stats['deep_requested_count']}, attempted={stats['deep_attempted_count']}, "
+        f"completed={stats['deep_completed_count']}, "
         f"qualified={payload['qualified_count']})"
     )
     for item in list(payload.get("candidates") or []) + list(payload.get("excluded") or []):

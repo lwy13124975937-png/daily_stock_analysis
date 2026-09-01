@@ -28,6 +28,7 @@ from src.reports.contracts import (
 )
 from src.reports.public_holdings import TYPE_LABELS, normalize_code
 from src.reports.structured_stock_report import validate_structured_stock_report
+from src.services.steady_income_contracts import summarize_deep_evaluation_counts
 from src.site.layout import SITE_CSS, document
 from src.site.security import safe_link, sanitize_html
 
@@ -564,67 +565,70 @@ def _render_steady_item(item: Mapping[str, Any], *, compact: bool = False) -> st
 
 def _validate_steady(payload: Mapping[str, Any]) -> None:
     for key in (
-        "schema_version",
-        "model_version",
-        "evaluator_version",
-        "ruleset_version",
-        "sector_model_version",
-        "evidence_version",
-        "price_model_version",
-        "as_of",
-        "data_status",
-        "selection_mode",
+        "schema_version", "model_version", "evaluator_version", "ruleset_version",
+        "sector_model_version", "evidence_version", "price_model_version", "as_of",
+        "data_status", "selection_mode",
     ):
         if not payload.get(key):
             raise ValueError(f"steady-income payload missing {key}")
     stats = payload.get("screening_stats")
     if not isinstance(stats, Mapping):
         raise ValueError("steady-income screening_stats missing")
+
     universe = int(stats.get("universe_count") or 0)
     prefilter = int(stats.get("prefilter_eligible_count") or 0)
-    deep = int(payload.get("deep_evaluated_count") or payload.get("evaluated_count") or 0)
-    unevaluated = int(payload.get("unevaluated_count") or 0)
+    requested = int(payload.get("deep_requested_count") or 0)
+    attempted = int(payload.get("deep_attempted_count") or 0)
+    completed = int(payload.get("deep_completed_count") or 0)
     qualified = int(payload.get("qualified_count") or 0)
-    if not (universe >= prefilter >= deep >= qualified >= 0):
+    if not (universe >= prefilter >= requested >= attempted >= completed >= qualified >= 0):
         raise ValueError("steady-income screening counts are inconsistent")
-    if unevaluated != prefilter - deep:
-        raise ValueError("steady-income unevaluated_count mismatch")
-    is_exhaustive = bool(payload.get("is_exhaustive"))
-    if is_exhaustive != (unevaluated == 0):
-        raise ValueError("steady-income is_exhaustive mismatch")
-    selection_mode = str(payload.get("selection_mode") or "")
-    if selection_mode not in {"fixed_shortlist", "adaptive_shortlist", "exhaustive"}:
-        raise ValueError("steady-income selection_mode is invalid")
-    if selection_mode == "exhaustive" and not is_exhaustive:
-        raise ValueError("steady-income exhaustive mode leaves candidates unevaluated")
+
+    terminal = stats.get("terminal_status_distribution")
+    if not isinstance(terminal, Mapping):
+        raise ValueError("steady-income terminal_status_distribution missing")
+    expected = summarize_deep_evaluation_counts(
+        prefilter_count=prefilter,
+        requested_count=requested,
+        terminal_distribution=terminal,
+    )
+    for key in (
+        "deep_requested_count", "deep_attempted_count", "deep_completed_count",
+        "deep_evaluated_count", "qualified_count", "rejected_count",
+        "insufficient_evidence_count", "unsupported_sector_count",
+        "provider_failure_count", "internal_error_count", "unevaluated_count",
+    ):
+        if int(payload.get(key) or 0) != expected[key]:
+            raise ValueError(f"steady-income {key} mismatch")
+        if key in stats and int(stats.get(key) or 0) != expected[key]:
+            raise ValueError(f"steady-income screening_stats.{key} mismatch")
+
+    if int(stats.get("completed_evaluation_count") or 0) != completed:
+        raise ValueError("steady-income completed evaluation count is inconsistent")
+    if int(stats.get("success_count") or 0) != completed:
+        raise ValueError("steady-income success_count must mean completed evaluation")
+    if int(payload.get("evaluated_count") or 0) != completed:
+        raise ValueError("steady-income evaluated_count must alias deep_completed_count")
     if int(payload.get("universe_count") or 0) != universe:
         raise ValueError("steady-income universe_count mismatch")
     if int(payload.get("prefilter_count") or 0) != prefilter:
         raise ValueError("steady-income prefilter_count mismatch")
+
+    unevaluated = expected["unevaluated_count"]
+    is_exhaustive = bool(payload.get("is_exhaustive"))
+    selection_mode = str(payload.get("selection_mode") or "")
+    if selection_mode not in {"fixed_shortlist", "adaptive_shortlist", "exhaustive"}:
+        raise ValueError("steady-income selection_mode is invalid")
+    if is_exhaustive and unevaluated != 0:
+        raise ValueError("steady-income exhaustive result has unevaluated candidates")
+    if selection_mode == "exhaustive" and not is_exhaustive:
+        raise ValueError("steady-income exhaustive mode is not marked exhaustive")
+    if selection_mode in {"fixed_shortlist", "adaptive_shortlist"} and is_exhaustive:
+        raise ValueError("steady-income shortlist cannot be marked exhaustive")
+
     candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
     if len(candidates) != qualified:
         raise ValueError("steady-income qualified_count mismatch")
-    terminal = stats.get("terminal_status_distribution")
-    if not isinstance(terminal, Mapping):
-        raise ValueError("steady-income terminal_status_distribution missing")
-    terminal_total = sum(int(terminal.get(key) or 0) for key in (
-        "evaluated_qualified",
-        "evaluated_rejected",
-        "insufficient_evidence",
-        "unsupported_sector_model",
-        "provider_failure",
-        "internal_error",
-    ))
-    requested = int(stats.get("deep_requested_count") or 0)
-    completed = int(stats.get("completed_evaluation_count") or 0)
-    if terminal_total != requested or requested != deep:
-        raise ValueError("steady-income terminal status counts are inconsistent")
-    if completed != int(terminal.get("evaluated_qualified") or 0) + int(
-        terminal.get("evaluated_rejected") or 0
-    ):
-        raise ValueError("steady-income completed evaluation count is inconsistent")
-    if int(stats.get("success_count") or 0) != completed:
-        raise ValueError("steady-income success_count must mean completed evaluation")
     for item in candidates:
         if not isinstance(item, Mapping) or not item.get("qualified"):
             raise ValueError("steady-income candidate bypasses qualification contract")
@@ -641,37 +645,46 @@ def _render_steady(payload: Mapping[str, Any], *, build_id: str) -> str:
     candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
     excluded = payload.get("excluded") if isinstance(payload.get("excluded"), list) else []
     data_status = str(payload.get("data_status") or "")
-    requested = int(stats.get("deep_requested_count") or payload.get("evaluated_count") or 0)
-    completed = int(stats.get("completed_evaluation_count") or 0)
+    requested = int(payload.get("deep_requested_count") or 0)
+    attempted = int(payload.get("deep_attempted_count") or 0)
+    completed = int(payload.get("deep_completed_count") or 0)
+    insufficient = int(payload.get("insufficient_evidence_count") or 0)
     unevaluated = int(payload.get("unevaluated_count") or 0)
+    qualified_count = int(payload.get("qualified_count") or 0)
     is_exhaustive = bool(payload.get("is_exhaustive"))
     selection_mode = str(payload.get("selection_mode") or "")
     shortlist_scope = (
         "全部预筛候选"
         if is_exhaustive
-        else f"固定 shortlist（已深评 {requested}，未深评 {unevaluated}）"
+        else f"固定 shortlist（尝试深评 {attempted}，完成判断 {completed}，未深评 {unevaluated}）"
     )
     candidate_html = "".join(_render_steady_item(item) for item in candidates if isinstance(item, Mapping))
     if not candidate_html:
         if data_status == "valid_zero":
             candidate_html = (
-                f'<div class="note"><strong>本次已深度评估的 {requested} 个候选中没有满足全部硬条件的标的。</strong>'
-                f'<p>{"全部预筛候选均已评估。" if is_exhaustive else f"仍有 {unevaluated} 个预筛候选未做深度评估，不能据此宣称全市场无合格标的。"}</p></div>'
+                f'<div class="note"><strong>本次尝试深度评估的 {attempted} 个候选中没有满足全部硬条件的标的。</strong>'
+                f'<p>其中 {completed} 只完成完整规则判断。'
+                f'{"全部预筛候选均已进入深度评估。" if is_exhaustive else f"仍有 {unevaluated} 个预筛候选未做深度评估，不能据此宣称全市场无合格标的。"}</p></div>'
             )
         elif data_status == "provider_unavailable":
             candidate_html = '<div class="note"><strong>本次深度评估因数据源异常未能完成。</strong><p>当前不能得出“无合格标的”的结论，请等待数据源恢复后重新评估。</p></div>'
         else:
-            candidate_html = f'<div class="note"><strong>本次深度评估仅完成 {completed}/{requested}。</strong><p>结果处于降级状态，不能据此宣称全量筛选没有合格标的。</p></div>'
+            candidate_html = (
+                f'<div class="note"><strong>本次深度评估仅完成完整规则判断 {completed}/{attempted}。</strong>'
+                f'<p>证据不足 {insufficient} 只；结果处于降级状态，不能据此宣称全量筛选没有合格标的。</p></div>'
+            )
     excluded_html = "".join(_render_steady_item(item, compact=True) for item in excluded if isinstance(item, Mapping))
     funnel = "".join(
         f'<div class="metric"><strong>{int(value)}</strong><span>{escape(label)}</span></div>'
         for label, value in (
             ("全市场覆盖", stats.get("universe_count") or 0),
             ("基础预筛", stats.get("prefilter_eligible_count") or 0),
-            ("请求深度评估", requested),
-            ("完成深度评估", completed),
-            ("未深度评估", unevaluated),
-            ("规则合格", payload.get("qualified_count") or 0),
+            ("计划深评", requested),
+            ("已尝试深评", attempted),
+            ("完整规则判断", completed),
+            ("证据不足", insufficient),
+            ("未进入深评", unevaluated),
+            ("规则合格", qualified_count),
         )
     )
     rejected = stats.get("rejected_by_reason") if isinstance(stats.get("rejected_by_reason"), Mapping) else {}
@@ -681,9 +694,9 @@ def _render_steady(payload: Mapping[str, Any], *, build_id: str) -> str:
 <header class="hero"><span class="kicker">沪深全市场预筛 · {escape(shortlist_scope)}</span><h1>稳健收益</h1>
 <p class="lead">先排除证据不足、高波动和分红不可验证的标的，再在可比较的普通企业集合中排序。金融行业没有可靠专用证据时直接标为数据不足。</p>
 <div class="meta"><span>基准日：{escape(str(payload.get('as_of') or ''))}</span><span>规则版本：{escape(str(payload.get('ruleset_version') or ''))}</span><span>模型版本：{escape(str(payload.get('model_version') or ''))}</span></div><div class="metrics">{funnel}</div></header>
-<section class="section"><h2>{"全预筛集合规则低风险候选" if is_exhaustive else "已深度评估 shortlist 中的规则低风险候选"}</h2><div class="steady-list">{candidate_html}</div></section>
+<section class="section"><h2>{"全预筛集合规则低风险候选" if is_exhaustive else "已完成规则判断 shortlist 中的规则低风险候选"}</h2><div class="steady-list">{candidate_html}</div></section>
 <details class="collection"><summary>查看排除/数据不足标的（{len(excluded)}）</summary><div class="details-body"><ul class="compact-list">{excluded_html or '<li>无</li>'}</ul></div></details>
-<section class="panel"><h2>筛选漏斗说明</h2><p>{escape(str(methodology.get('priority') or '风险硬门槛优先，规则排序仅在可比较集合内进行。'))}</p><p>选择模式：{escape(selection_mode)}。全部证券先做基础预筛；本次深度评估预算为 {int(payload.get('deep_budget') or payload.get('evaluated_count') or 0)}，实际评估 {requested}，未评估 {unevaluated}，is_exhaustive={str(is_exhaustive).lower()}。</p><p>主要排除原因：{escape(rejection_text)}</p><p>历史行情口径：{escape(str(methodology.get('replay') or methodology.get('history') or '历史复权价格回放'))}</p></section>
+<section class="panel"><h2>筛选漏斗说明</h2><p>{escape(str(methodology.get('priority') or '风险硬门槛优先，规则排序仅在可比较集合内进行。'))}</p><p>选择模式：{escape(selection_mode)}。本次固定深评预算为 {int(payload.get('deep_budget') or 0)}，计划 {requested}，实际启动 {attempted}，完成完整规则判断 {completed}，证据不足 {insufficient}，未深评 {unevaluated}，is_exhaustive={str(is_exhaustive).lower()}。</p><p>主要排除原因：{escape(rejection_text)}</p><p>历史行情口径：{escape(str(methodology.get('replay') or methodology.get('history') or '历史复权价格回放'))}</p></section>
 <footer class="footer">规则筛选不保证本金或收益，不构成投资建议。</footer>"""
     return document("稳健收益", body, build_id=build_id)
 

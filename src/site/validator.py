@@ -221,10 +221,9 @@ def _check_steady(payload: Mapping[str, Any], html: str) -> list[str]:
         if f"未深评 {unevaluated}" not in html or "is_exhaustive=false" not in html:
             errors.append("steady-income shortlist scope is not visible")
     if payload.get("data_status") == "degraded":
-        stats = payload.get("screening_stats") if isinstance(payload.get("screening_stats"), Mapping) else {}
-        requested = int(stats.get("deep_requested_count") or 0)
-        completed = int(stats.get("completed_evaluation_count") or 0)
-        if completed < requested and f"仅完成 {completed}/{requested}" not in html:
+        attempted = int(payload.get("deep_attempted_count") or 0)
+        completed = int(payload.get("deep_completed_count") or 0)
+        if completed < attempted and f"仅完成完整规则判断 {completed}/{attempted}" not in html:
             errors.append("steady-income degraded completion ratio is not visible")
     as_of_raw = payload.get("as_of")
     try:

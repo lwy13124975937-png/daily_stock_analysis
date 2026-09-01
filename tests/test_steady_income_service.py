@@ -456,8 +456,14 @@ class SteadyIncomeServiceTests(unittest.TestCase):
         )
         response = service.evaluate_portfolio(refresh=True)
 
+        self.assertEqual(response["deep_requested_count"], 1)
+        self.assertEqual(response["deep_attempted_count"], 1)
+        self.assertEqual(response["deep_completed_count"], 1)
+        self.assertEqual(response["deep_evaluated_count"], 1)
         self.assertEqual(response["evaluated_count"], 1)
         self.assertEqual(response["qualified_count"], 1)
+        self.assertEqual(response["unevaluated_count"], 0)
+        self.assertTrue(response["is_exhaustive"])
         serialized = str(response)
         for forbidden in ("quantity", "avg_cost", "market_value_base", "unrealized_pnl"):
             self.assertNotIn(forbidden, serialized)
@@ -561,6 +567,9 @@ class SteadyIncomeServiceTests(unittest.TestCase):
 
         response = service.evaluate_portfolio(refresh=True)
 
+        self.assertEqual(response["deep_requested_count"], 3)
+        self.assertEqual(response["deep_attempted_count"], 3)
+        self.assertEqual(response["deep_completed_count"], 3)
         self.assertEqual(response["evaluated_count"], 3)
         self.assertEqual(manager.max_active, 1)
         self.assertEqual(response["selection_mode"], "portfolio")
@@ -619,6 +628,9 @@ class SteadyIncomeServiceTests(unittest.TestCase):
             "evaluator_version",
             "sector_model_version",
             "data_status",
+            "deep_requested_count",
+            "deep_attempted_count",
+            "deep_completed_count",
         ):
             self.assertIn(key, body)
         self.assertIn("evidence", body["candidates"][0])
