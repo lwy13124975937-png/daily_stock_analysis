@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable
 from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo
@@ -71,7 +71,12 @@ def public_source_descriptor(source: str, payload: Any) -> dict[str, Any]:
         kind = "environment_secret"
         label = "protected holdings input"
     elif raw:
-        kind = "local_file" if Path(raw).is_absolute() or raw.startswith((".", "..")) else "configured_input"
+        is_local_path = (
+            Path(raw).is_absolute()
+            or PureWindowsPath(raw).is_absolute()
+            or raw.startswith((".", ".."))
+        )
+        kind = "local_file" if is_local_path else "configured_input"
         label = "local holdings input" if kind == "local_file" else "configured holdings input"
     else:
         kind = "unknown"
