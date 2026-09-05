@@ -12,6 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_REPORTS_DIR = ROOT_DIR / "reports"
 DEFAULT_LOGS_DIR = ROOT_DIR / "logs"
 MIN_REPORT_BYTES = 500
+NON_TRADING_SKIP_MARKER = "今日所有相关市场均为非交易日，跳过执行"
 SUCCESS_SUMMARY_RE = re.compile(
     r"(?:成功|success)\s*[:：=]\s*(\d+)\s*[,，]\s*(?:失败|fail(?:ed|ure)?|failed)\s*[:：=]\s*(\d+)",
     re.IGNORECASE,
@@ -39,6 +40,17 @@ def _latest_log(logs_dir: Path) -> Path | None:
     return None
 
 
+def _analysis_intentionally_skipped(logs_dir: Path) -> bool:
+    log_path = _latest_log(logs_dir)
+    if log_path is None:
+        return False
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return NON_TRADING_SKIP_MARKER in text
+
+
 def _last_success_summary(log_path: Path) -> tuple[int, int] | None:
     try:
         text = log_path.read_text(encoding="utf-8", errors="ignore")
@@ -53,6 +65,10 @@ def _last_success_summary(log_path: Path) -> tuple[int, int] | None:
 
 
 def validate_report(reports_dir: Path, logs_dir: Path, min_bytes: int = MIN_REPORT_BYTES) -> int:
+    if _analysis_intentionally_skipped(logs_dir):
+        print("OK: analysis intentionally skipped because all relevant markets were closed")
+        return 0
+
     latest = _latest_report(reports_dir)
     if latest is None:
         print(f"ERROR: no report_*.md found under {reports_dir}", file=sys.stderr)
